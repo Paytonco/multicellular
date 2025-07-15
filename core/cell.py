@@ -1,11 +1,12 @@
-# cell.py
+# core/cell.py
 
 import numpy as np
 
 
 class Cell:
     """
-    Represents a rod-shaped bacterial cell with cylindrical body and spherical end caps.
+    Represents a rod-shaped bacterial cell with
+    cylindrical body and spherical end caps.
     """
 
     def __init__(
@@ -31,7 +32,9 @@ class Cell:
         self.age = 0.0
         self.alive = True
         self.rng = rng or np.random.default_rng()
-        self.chemical_state = {}
+
+        # Default initial concentrations: all zero if network exists
+        self.concentrations = {s: 0.0 for s in network.species} if network else {}
 
     def compute_volume(self):
         """Compute volume of cylindrical rod with hemispherical caps."""
@@ -40,11 +43,17 @@ class Cell:
         return cylinder_volume + cap_volume
 
     def grow(self, dt, growth_rate=0.5):
-        """Grow in length and update internal chemical network."""
-        if self.network:
-            self.network.simulate(self.chemical_state, dt, self.compute_volume())
-        self.length += growth_rate * dt  # Linear growth in length
+        """Increase length linearly and age the cell."""
+        self.length += growth_rate * dt
         self.age += dt
+
+    def step(self, dt):
+        """Advance cell internal state (chemical + growth)."""
+        if self.network:
+            self.concentrations = self.network.simulate_step(
+                self.concentrations, dt, self.compute_volume()
+            )
+        self.grow(dt)
 
     def ready_to_divide(self, threshold_length=4.0):
         """Check if cell should divide based on length threshold."""
@@ -71,7 +80,6 @@ class Cell:
             network=self.network.clone() if self.network else None,
             rng=self.rng,
         )
-
         daughter2 = Cell(
             id=None,
             position=pos2,
@@ -82,6 +90,9 @@ class Cell:
             network=self.network.clone() if self.network else None,
             rng=self.rng,
         )
+
+        daughter1.concentrations = self.concentrations.copy()
+        daughter2.concentrations = self.concentrations.copy()
 
         return daughter1, daughter2
 
@@ -99,7 +110,7 @@ class Cell:
     def _normalize(self, v):
         """Ensure orientation is a unit vector."""
         norm = np.linalg.norm(v)
-        return v / norm if norm != 0 else np.array([1.0, 0.0])  # Default to x-axis
+        return v / norm if norm != 0 else np.array([1.0, 0.0])
 
     def to_dict(self):
         return {
@@ -112,5 +123,5 @@ class Cell:
             "species": self.species,
             "age": self.age,
             "alive": self.alive,
-            "chemical_state": self.chemical_state.copy(),
+            "concentrations": self.concentrations.copy(),
         }
