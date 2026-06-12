@@ -3,8 +3,8 @@
 import numpy as np
 import pytest
 
-from core.cell import Cell
-from core.reactions import Reaction, ReactionNetwork
+from multicellular.core.cell import Cell
+from multicellular.core.reactions import Reaction, ReactionNetwork
 
 
 def test_mass_action_rate():

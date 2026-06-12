@@ -1,8 +1,6 @@
 # test_cell.py
 
-import numpy as np
-
-from core.cell import Cell
+from multicellular.core.cell import Cell
 
 
 def test_basic_cell_behavior():
