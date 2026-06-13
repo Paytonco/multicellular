@@ -5,6 +5,6 @@ setup(
     version="0.1.0",
     package_dir={"": "src"},
     packages=find_packages(where="src"),
-    install_requires=["numpy"],
+    install_requires=["numpy", "pandas"],
     python_requires=">=3.11",
 )

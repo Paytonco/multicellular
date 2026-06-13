@@ -8,9 +8,10 @@ intended to grow, divide, move, and interact within a shared environment.
 ## Status
 
 This package is under active development. Core building blocks for individual
-cells and chemical reaction networks are implemented and tested; the
-multi-cell colony, spatial environment, simulation loop, SBML import, and
-visualization are not yet implemented (see [Unimplemented / stubs](#unimplemented--stubs)).
+cells, chemical reaction networks, a basic environment/field container, a
+basic colony, and a basic simulation loop are implemented and tested; SBML
+import and visualization are not yet implemented (see
+[Unimplemented / stubs](#unimplemented--stubs)).
 
 ## Installation
 
@@ -125,20 +126,91 @@ Each daughter's concentration for that species is then `x / daughter_volume`
 (or `(n - x) / daughter_volume`). The `low_copy` designation itself is
 inherited by both daughters.
 
+### `Environment` and `Field`
+
+`Environment` represents the shared extracellular space as a collection of
+named `Field`s - matrices of values over a shared grid (e.g. chemical
+concentrations, temperature, surface roughness). Reaction-diffusion dynamics
+are not implemented yet; for now `Environment` is just a validated container.
+
+```python
+import numpy as np
+from multicellular import Environment, Field
+
+glucose = Field("glucose", np.ones((10, 10)))
+env = Environment(shape=(10, 10), fields=[glucose])
+
+env.get_field("glucose")
+```
+
+Every `Field` added to an `Environment` must have a `values` matrix matching
+the environment's `shape`; adding a mismatched field raises `ValueError`.
+
+`Environment.BOUNDS` is currently hardcoded to `(100.0, 100.0)`, representing
+a 100um x 100um square that cells will interact within (this will be made
+configurable later). A field's grid `shape` is independent of `BOUNDS` and
+may cover an area larger than the simulation bounds. `env.in_bounds(position)`
+checks whether a 2D position (e.g. a cell's center of mass) falls within
+`[0, BOUNDS[0]] x [0, BOUNDS[1]]`.
+
+### `Colony`
+
+A `Colony` is a collection of `Cell`s living in an `Environment`:
+
+```python
+from multicellular import Cell, Colony, Environment
+
+env = Environment(shape=(10, 10))
+cells = [Cell(id=0, position=[10.0, 10.0], orientation=[1.0, 0.0])]
+
+colony = Colony(cells, env)
+colony.step(dt=0.1)  # steps every cell, then enforces environment bounds
+```
+
+`colony.step(dt)` calls `cell.step(dt)` for every cell, then checks each
+living cell's center of mass against `environment.in_bounds(...)` (any cell
+that has left the bounds is killed via `cell.kill()`), and finally replaces
+any cell with `cell.ready_to_divide() == True` with its two daughter cells
+(each daughter is assigned a new, unique `id`). `colony.living_cells` returns
+the cells that are still alive.
+
+Dead cells (`cell.alive == False`) are inert: `Cell.step` and
+`Cell.apply_force` are no-ops for them, so dead cells no longer grow, run
+their reaction network, or move in response to forces. Dead cells also never
+divide.
+
+### `Simulation`
+
+`Simulation` steps a `Colony` from `t=0` to `t=t_max` in increments of `dt`,
+recording every cell's position, orientation, length, alive status, and
+chemical concentrations at every timestep:
+
+```python
+from multicellular import Cell, Colony, Environment, Simulation
+
+env = Environment(shape=(10, 10))
+cell = Cell(id=0, position=[50.0, 50.0], orientation=[1.0, 0.0])
+colony = Colony([cell], env)
+
+sim = Simulation(colony, dt=0.1, t_max=10.0)
+df = sim.run()  # pandas DataFrame, one row per cell per recorded timestep
+```
+
+`sim.run()` records the initial state, then repeatedly calls `colony.step(dt)`
+and records the new state of every cell remaining in the colony - including
+any new daughter cells produced by division - until `t_max` is reached. The
+returned DataFrame has columns `time`, `cell_id`, `alive`, `position_x`,
+`position_y`, `orientation_x`, `orientation_y`, `length`, plus one column per
+chemical species seen in any cell's `concentrations` (missing values are
+`NaN` for cells/species that don't have that entry). The same data is also
+available via `sim.history` (a list of per-cell-per-timestep dicts) and
+`sim.to_dataframe()`.
+
 ## Unimplemented / stubs
 
 These pieces exist as placeholders (empty classes/functions or
 `NotImplementedError`) and are not yet usable:
 
-- **`multicellular.Colony`** (`core/colony.py`) - intended to manage a
-  collection of `Cell` objects (spatial layout, neighbor interactions,
-  population-level bookkeeping). Currently an empty class.
-- **`multicellular.Environment`** (`core/environment.py`) - intended to model
-  the shared extracellular space (e.g. diffusible chemical fields cells can
-  read from / secrete into). Currently an empty class.
-- **`multicellular.Simulation`** (`core/simulation.py`) - intended to
-  orchestrate a `Colony` and `Environment` over time (the main simulation
-  loop). Currently an empty class.
 - **`ReactionNetwork.simulate_step`** with `simulation_method="SSA"` or
   `"CLE"` - raises `NotImplementedError`. Only `"ODE"` (forward Euler) is
   implemented.
@@ -153,8 +225,7 @@ These pieces exist as placeholders (empty classes/functions or
   to let a cell read from / write to an `Environment`.
 - **`examples/toggle_switch_demo.py`** and
   **`examples/quorum_sensing_demo.py`** - empty placeholder scripts, intended
-  as end-to-end demos of a genetic toggle switch and a quorum-sensing circuit
-  once `Colony`/`Environment`/`Simulation` exist.
+  as end-to-end demos of a genetic toggle switch and a quorum-sensing circuit.
 
 ## Running tests
 
@@ -169,8 +240,11 @@ Run a specific test file:
 ```bash
 pytest tests/test_cell.py        # Cell geometry, growth, and division
 pytest tests/test_reactions.py   # Reaction rate laws, stoichiometry, ODE stepping, Cell + ReactionNetwork integration
+pytest tests/test_environment.py # Environment/Field construction and validation
+pytest tests/test_colony.py      # Colony bounds enforcement, division, and dead-cell behavior
+pytest tests/test_simulation.py  # Simulation loop and DataFrame export
 pytest tests/test_dummy.py       # trivial sanity check
 ```
 
-`tests/test_colony.py` and `tests/test_rections.py` are currently empty
-placeholders (no tests to run yet).
+`tests/test_rections.py` is currently an empty placeholder (no tests to run
+yet).

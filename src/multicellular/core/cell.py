@@ -78,7 +78,9 @@ class Cell:
         self.age += dt
 
     def step(self, dt):
-        """Advance cell internal state (chemical + growth)."""
+        """Advance cell internal state (chemical + growth). No-op if dead."""
+        if not self.alive:
+            return
         if self.network:
             self.concentrations = self.network.simulate_step(
                 self.concentrations, dt, self.compute_volume()
@@ -160,7 +162,9 @@ class Cell:
         return daughter1, daughter2
 
     def apply_force(self, force_vector, dt):
-        """Move the cell based on external forces."""
+        """Move the cell based on external forces. No-op if dead."""
+        if not self.alive:
+            return
         self.position += force_vector * dt
 
     def interact_with_environment(self, environment):
