@@ -9,6 +9,10 @@ class Cell:
     cylindrical body and spherical end caps.
     """
 
+    # Above this copy number, partition by sampling from the Gaussian
+    # approximation to Binomial(n, 1/2) (CLT) instead of the binomial itself.
+    LOW_COPY_GAUSSIAN_THRESHOLD = 35
+
     def __init__(
         self,
         id,
@@ -33,6 +37,13 @@ class Cell:
         self.alive = True
         self.rng = rng or np.random.default_rng()
 
+        # Chemical species (by name, from self.concentrations) whose copy
+        # number should be partitioned stochastically at division rather
+        # than split deterministically by concentration. Use this for
+        # low-copy molecules (e.g. plasmids) where stochastic partitioning
+        # matters. Designate a species as low-copy via set_concentration().
+        self.low_copy_species = set()
+
         # Default initial concentrations: all zero if network exists
         self.concentrations = {s: 0.0 for s in network.species} if network else {}
 
@@ -41,6 +52,25 @@ class Cell:
         cylinder_volume = np.pi * self.radius**2 * self.length
         cap_volume = (4 / 3) * np.pi * self.radius**3
         return cylinder_volume + cap_volume
+
+    def copy_number(self, chemical_species):
+        """Number of molecules of a chemical species currently in the cell."""
+        return self.concentrations.get(chemical_species, 0.0) * self.compute_volume()
+
+    def set_concentration(self, chemical_species, value, low_copy=False):
+        """
+        Initialize/set the concentration of a chemical species.
+
+        If low_copy is True, the species is designated to have its copy
+        number partitioned stochastically (binomial, or its Gaussian
+        approximation for large copy numbers) between daughter cells at
+        division, rather than having its concentration conserved.
+        """
+        self.concentrations[chemical_species] = value
+        if low_copy:
+            self.low_copy_species.add(chemical_species)
+        else:
+            self.low_copy_species.discard(chemical_species)
 
     def grow(self, dt, growth_rate=0.5):
         """Increase length linearly and age the cell."""
@@ -58,6 +88,23 @@ class Cell:
     def ready_to_divide(self, threshold_length=4.0):
         """Check if cell should divide based on length threshold."""
         return self.length >= threshold_length
+
+    def _partition_copies(self, n):
+        """
+        Draw the number of copies (of n total) inherited by one daughter
+        cell, with the other daughter receiving the remaining n - x.
+
+        For small n, sample directly from Binomial(n, 1/2). For large n,
+        sample from its Gaussian approximation (CLT) instead, which is
+        much cheaper and statistically indistinguishable. Either way, the
+        result is rounded to a whole number and clamped to [0, n] so that
+        copy number is conserved exactly.
+        """
+        if n <= self.LOW_COPY_GAUSSIAN_THRESHOLD:
+            return int(self.rng.binomial(n, 0.5))
+
+        x = self.rng.normal(loc=n / 2.0, scale=np.sqrt(n) / 2.0)
+        return int(np.clip(round(x), 0, n))
 
     def divide(self):
         """Split into two daughter cells along the longitudinal axis."""
@@ -91,8 +138,24 @@ class Cell:
             rng=self.rng,
         )
 
-        daughter1.concentrations = self.concentrations.copy()
-        daughter2.concentrations = self.concentrations.copy()
+        daughter1.low_copy_species = set(self.low_copy_species)
+        daughter2.low_copy_species = set(self.low_copy_species)
+
+        daughter_volume = daughter1.compute_volume()
+        conc1 = {}
+        conc2 = {}
+        for chemical_species, conc in self.concentrations.items():
+            if chemical_species in self.low_copy_species:
+                n = int(round(self.copy_number(chemical_species)))
+                x = self._partition_copies(n)
+                conc1[chemical_species] = x / daughter_volume
+                conc2[chemical_species] = (n - x) / daughter_volume
+            else:
+                conc1[chemical_species] = conc
+                conc2[chemical_species] = conc
+
+        daughter1.concentrations = conc1
+        daughter2.concentrations = conc2
 
         return daughter1, daughter2
 

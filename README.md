@@ -95,8 +95,35 @@ print(cell.concentrations)
 ```
 
 When a cell divides, each daughter receives its own cloned copy of the
-reaction network (`network.clone()`) along with a copy of the parent's
-concentrations.
+reaction network (`network.clone()`). For most species, concentration is
+conserved across division (each daughter inherits the parent's
+concentration, which conserves total copy number since each daughter has
+half the parent's volume).
+
+### Low-copy species
+
+Some species — e.g. low-copy plasmids — should not simply have their
+concentration copied to both daughters; instead, their *copy number* should
+be split stochastically between daughters. Use `set_concentration` with
+`low_copy=True` to designate a species this way when initializing it:
+
+```python
+cell.set_concentration("plasmid", value, low_copy=True)
+```
+
+At division, the parent's copy number `n` for that species (`concentration *
+volume`, rounded to the nearest whole number) is split so that one daughter
+gets `x` copies and the other gets `n - x`, conserving total copy number
+exactly:
+
+- If `n <= Cell.LOW_COPY_GAUSSIAN_THRESHOLD` (35), `x ~ Binomial(n, 1/2)`.
+- If `n > 35`, `x` is instead drawn from the Gaussian approximation to that
+  binomial (CLT), `x ~ Normal(n/2, sqrt(n)/2)`, then rounded and clamped to
+  `[0, n]`.
+
+Each daughter's concentration for that species is then `x / daughter_volume`
+(or `(n - x) / daughter_volume`). The `low_copy` designation itself is
+inherited by both daughters.
 
 ## Unimplemented / stubs
 
