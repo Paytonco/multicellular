@@ -2,6 +2,10 @@
 
 import numpy as np
 
+# Diffusivity of water at 37°C in m²/s (physiological temperature).
+WATER_DIFFUSIVITY_37C = 3.0e-9  # m²/s
+WATER_VISCOSITY_37C = 6.9e-4  # Pa·s
+
 
 class Field:
     """
@@ -36,8 +40,18 @@ class Environment:
     # Fields may have values outside of these bounds.
     BOUNDS = (100.0, 100.0)
 
-    def __init__(self, shape, fields=None):
+    def __init__(self, shape, diffusivity=None, eta=None, fields=None):
         self.shape = tuple(shape)
+        self.diffusivity = (
+            np.full(self.shape, WATER_DIFFUSIVITY_37C)
+            if diffusivity is None
+            else np.asarray(diffusivity, dtype=float)
+        )
+        self.eta = (
+            np.full(self.shape, WATER_VISCOSITY_37C)
+            if eta is None
+            else np.asarray(eta, dtype=float)
+        )
         self.fields = {}
         for field in fields or []:
             self.add_field(field)

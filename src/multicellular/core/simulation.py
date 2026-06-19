@@ -29,6 +29,7 @@ class Simulation:
                 "orientation_x": cell.orientation[0],
                 "orientation_y": cell.orientation[1],
                 "length": cell.length,
+                "radius": cell.radius,
             }
             record.update(cell.concentrations)
             self.history.append(record)

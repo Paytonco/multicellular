@@ -167,6 +167,17 @@ class Cell:
             return
         self.position += force_vector * dt
 
+    def apply_torque(self, omega, dt):
+        """Rotate the cell by omega * dt radians. No-op if dead."""
+        if not self.alive:
+            return
+        angle = omega * dt
+        cos_a, sin_a = np.cos(angle), np.sin(angle)
+        x, y = self.orientation
+        self.orientation = self._normalize(
+            np.array([cos_a * x - sin_a * y, sin_a * x + cos_a * y])
+        )
+
     def interact_with_environment(self, environment):
         """Placeholder for environment interaction logic."""
         pass
