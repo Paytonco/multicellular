@@ -24,7 +24,8 @@ pip install -e .
 ```
 
 This installs the `multicellular` package (from `src/multicellular`) in
-editable mode, along with its only current dependency, `numpy`.
+editable mode, along with its dependencies: `numpy`, `pandas`, and
+`matplotlib`.
 
 ## Usage
 
@@ -146,6 +147,35 @@ env.get_field("glucose")
 Every `Field` added to an `Environment` must have a `values` matrix matching
 the environment's `shape`; adding a mismatched field raises `ValueError`.
 
+`Environment` also holds two spatial fields that describe the physical
+properties of the medium, each a 2D numpy array of the same `shape` as the
+grid:
+
+- **`diffusivity`** (m²/s): local solute diffusivity. Defaults to a constant
+  matrix filled with the diffusivity of water at 37°C (3.0 × 10⁻⁹ m²/s).
+- **`eta`** (Pa·s): local dynamic viscosity. Defaults to a constant matrix
+  filled with the viscosity of water at 37°C (6.9 × 10⁻⁴ Pa·s).
+
+Both can be provided as spatially-varying arrays to model heterogeneous media.
+`Colony` reads these fields at each cell's position to set the local drag for
+Brownian motion (see [`Colony`](#colony) below).
+
+```python
+import numpy as np
+from multicellular import Environment
+
+# Defaults: uniform water at 37°C
+env = Environment(shape=(10, 10))
+
+# Spatially-varying viscosity (e.g. a gel region in the upper half)
+eta = np.full((10, 10), 6.9e-4)
+eta[:5, :] = 5e-3  # more viscous upper half
+env = Environment(shape=(10, 10), eta=eta)
+
+# Both fields can be set independently
+env = Environment(shape=(10, 10), diffusivity=D, eta=eta)
+```
+
 `Environment.BOUNDS` is currently hardcoded to `(100.0, 100.0)`, representing
 a 100um x 100um square that cells will interact within (this will be made
 configurable later). A field's grid `shape` is independent of `BOUNDS` and
@@ -164,20 +194,61 @@ env = Environment(shape=(10, 10))
 cells = [Cell(id=0, position=[10.0, 10.0], orientation=[1.0, 0.0])]
 
 colony = Colony(cells, env)
-colony.step(dt=0.1)  # steps every cell, then enforces environment bounds
+colony.step(dt=0.1)  # steps every cell, applies Brownian motion, enforces bounds
 ```
 
-`colony.step(dt)` calls `cell.step(dt)` for every cell, then checks each
-living cell's center of mass against `environment.in_bounds(...)` (any cell
-that has left the bounds is killed via `cell.kill()`), and finally replaces
-any cell with `cell.ready_to_divide() == True` with its two daughter cells
-(each daughter is assigned a new, unique `id`). `colony.living_cells` returns
-the cells that are still alive.
+`colony.step(dt)` performs the following operations in order:
 
-Dead cells (`cell.alive == False`) are inert: `Cell.step` and
-`Cell.apply_force` are no-ops for them, so dead cells no longer grow, run
-their reaction network, or move in response to forces. Dead cells also never
-divide.
+1. **Internal step** — calls `cell.step(dt)` for every cell (chemistry + growth).
+2. **Bounds enforcement** — kills any living cell whose center of mass lies
+   outside `environment.BOUNDS`.
+3. **Brownian motion** — applies an overdamped-Langevin random kick to every
+   surviving living cell (see below).
+4. **Division** — replaces any cell with `cell.ready_to_divide() == True` with
+   its two daughter cells, each assigned a new unique `id`.
+
+`colony.living_cells` returns the cells that are still alive.
+
+#### Brownian motion
+
+Each timestep, `Colony` applies anisotropic Brownian displacements to every
+living cell, consistent with the overdamped Langevin SDE. The local viscosity
+`η` and diffusivity `D` are sampled from `environment.eta` and
+`environment.diffusivity` at the cell's grid position (nearest-grid-point
+lookup). The effective local viscosity is then:
+
+```
+η_local = η × (D_water_37C / D_field)
+```
+
+This Stokes-Einstein scaling means that a region with lower diffusivity is
+treated as more viscous, and vice versa.
+
+Translational and rotational drag coefficients are computed from `η_local` and
+the cell's geometry using slender-body theory for a thin rod of total length
+`L_eff = length + 2 × radius`:
+
+```
+γ_∥  = 2π η_local L_eff / ln(L_eff / radius)      (parallel to long axis)
+γ_⊥  = 4π η_local L_eff / ln(L_eff / radius)      (perpendicular)
+γ_rot = π η_local L_eff³ / (3 ln(L_eff / radius)) (rotation)
+```
+
+Diffusion coefficients follow from the Einstein relation (`D = k_BT / γ`),
+and the Brownian displacements are drawn as:
+
+```
+Δr = √(2 D_∥ dt) ξ_∥ û  +  √(2 D_⊥ dt) ξ_⊥ û_⊥     (position, μm)
+Δθ = √(2 D_rot dt) ξ_rot                               (orientation, rad)
+```
+
+where `û` is the cell's orientation unit vector, `û_⊥` is perpendicular to
+it, and `ξ_∥`, `ξ_⊥`, `ξ_rot` are independent standard-normal draws from the
+cell's own RNG. The position update is in μm and `dt` is in seconds.
+
+Dead cells (`cell.alive == False`) are inert: `Cell.step`, `Cell.apply_force`,
+and `Cell.apply_torque` are all no-ops for them, and `Colony` skips Brownian
+motion for dead cells. Dead cells also never divide.
 
 ### `Simulation`
 
@@ -200,11 +271,37 @@ df = sim.run()  # pandas DataFrame, one row per cell per recorded timestep
 and records the new state of every cell remaining in the colony - including
 any new daughter cells produced by division - until `t_max` is reached. The
 returned DataFrame has columns `time`, `cell_id`, `alive`, `position_x`,
-`position_y`, `orientation_x`, `orientation_y`, `length`, plus one column per
-chemical species seen in any cell's `concentrations` (missing values are
-`NaN` for cells/species that don't have that entry). The same data is also
-available via `sim.history` (a list of per-cell-per-timestep dicts) and
-`sim.to_dataframe()`.
+`position_y`, `orientation_x`, `orientation_y`, `length`, `radius`, plus one
+column per chemical species seen in any cell's `concentrations` (missing
+values are `NaN` for cells/species that don't have that entry). The same data
+is also available via `sim.history` (a list of per-cell-per-timestep dicts)
+and `sim.to_dataframe()`.
+
+### `visualize`
+
+`visualize(simulation, red=None, green=None, blue=None, interval=200)` shows
+a 2D animation of a (already-`run()`) `Simulation` in a pop-up matplotlib
+window:
+
+```python
+from multicellular import visualize
+
+visualize(sim, red="A", green="B", interval=200)
+```
+
+- Each cell is drawn as its rod shape (cylinder + hemispherical caps) using
+  its recorded `position`, `orientation`, `length`, and `radius`.
+- `red`/`green`/`blue` optionally name chemical species; a cell's color in
+  that channel is its concentration of that species, normalized by the
+  species' maximum value over the whole simulation. Channels left as `None`
+  default to a constant mid-gray value.
+- Dead cells (`alive == False`) are removed from the display as soon as they
+  die and do not appear in subsequent frames.
+- The region outside `environment.BOUNDS` is tinted red.
+- `interval` is the delay between frames in milliseconds.
+
+The video is only shown interactively (via `plt.show()`); saving it to a file
+is not yet implemented.
 
 ## Unimplemented / stubs
 

@@ -4,15 +4,82 @@ import numpy as np
 
 _kBT = 1.380649e-23 * 310.15  # J  (k_B × 37°C)
 
+_PARALLEL_TOL = 1e-10  # denom threshold for segment-segment parallel detection
+
+
+def _segment_segment_closest(a1, b1, a2, b2):
+    """
+    Closest points between segment [a1, b1] and segment [a2, b2].
+
+    Returns (p1, p2, d): p1 on seg1, p2 on seg2, d = |p1 - p2|.
+
+    When segments are nearly parallel, uses the midpoint of their overlapping
+    axial projection rather than a degenerate endpoint, per the physics spec.
+    """
+    d1 = b1 - a1
+    d2 = b2 - a2
+    w = a1 - a2
+
+    a = np.dot(d1, d1)
+    b = np.dot(d1, d2)
+    c = np.dot(d2, d2)
+    e = np.dot(d1, w)
+    f = np.dot(d2, w)
+
+    denom = a * c - b * b  # zero iff segments are parallel
+
+    if denom < _PARALLEL_TOL:
+        # Parallel or degenerate: project seg2 endpoints onto seg1 and use the
+        # midpoint of the overlapping range, or the nearest endpoint pair if
+        # there is no axial overlap.
+        if a < _PARALLEL_TOL:
+            s = 0.0
+        else:
+            t0 = np.dot(a2 - a1, d1) / a
+            t1 = np.dot(b2 - a1, d1) / a
+            lo = max(0.0, min(t0, t1))
+            hi = min(1.0, max(t0, t1))
+            s = (lo + hi) / 2.0 if lo <= hi else float(np.clip(-e / a, 0.0, 1.0))
+
+        p1 = a1 + s * d1
+        t = (
+            float(np.clip(np.dot(p1 - a2, d2) / c, 0.0, 1.0))
+            if c > _PARALLEL_TOL
+            else 0.0
+        )
+        p2 = a2 + t * d2
+    else:
+        # General (non-parallel) case: closed-form minimum with clamped parameters.
+        # Clamp s, recompute t, clamp t, then recompute s once more.
+        s = float(np.clip((b * f - c * e) / denom, 0.0, 1.0))
+        t = float(np.clip((b * s + f) / c, 0.0, 1.0)) if c > _PARALLEL_TOL else 0.0
+        s = float(np.clip((-e + b * t) / a, 0.0, 1.0)) if a > _PARALLEL_TOL else 0.0
+        p1 = a1 + s * d1
+        p2 = a2 + t * d2
+
+    d = float(np.linalg.norm(p1 - p2))
+    return p1, p2, d
+
 
 class Colony:
     """
     A collection of Cells living within an Environment.
     """
 
-    def __init__(self, cells, environment):
+    def __init__(self, cells, environment, k=10.0, drag=1.0):
+        """
+        Args:
+            cells: initial list of Cell objects.
+            environment: the shared Environment.
+            k: Hookean contact stiffness (force / length).
+            drag: isotropic drag constant for contact dynamics.
+                  Translational drag: ζ_t = drag * length.
+                  Rotational drag:    ζ_r = (drag / 12) * length³.
+        """
         self.cells = list(cells)
         self.environment = environment
+        self.k = k
+        self.drag = drag
         existing_ids = [cell.id for cell in self.cells if cell.id is not None]
         self._next_id = max(existing_ids, default=-1) + 1
 
@@ -27,6 +94,7 @@ class Colony:
         self.enforce_bounds()
         for cell in self.living_cells:
             self._apply_brownian_motion(cell, dt)
+        self._apply_contact_forces(dt)
         self.handle_divisions()
 
     def _sample_field(self, field_array, position):
@@ -81,6 +149,73 @@ class Colony:
 
         # Rotational Brownian kick
         cell.apply_torque(xi_rot * np.sqrt(2.0 * D_rot / dt), dt)
+
+    def _apply_contact_forces(self, dt):
+        """
+        Apply pairwise Hookean contact forces and torques to all living cells.
+
+        For each overlapping cell pair (i, j):
+          - overlap δ = R_i + R_j - d  (d: axis-segment distance)
+          - force on i: F = k * δ * N  (N: contact normal from j toward i)
+          - torque on i: τ = (p_c - c_i) × F  (2D scalar cross product)
+        Dynamics are overdamped:
+          Δc = F / ζ_t * dt,  ζ_t = drag * length
+          Δθ = τ / ζ_r * dt,  ζ_r = (drag / 12) * length³
+        """
+        alive = self.living_cells
+        n = len(alive)
+        if n < 2:
+            return
+
+        forces = [np.zeros(2) for _ in range(n)]
+        torques = [0.0] * n
+
+        for i in range(n):
+            ci = alive[i]
+            ai = ci.position - (ci.length / 2.0) * ci.orientation
+            bi = ci.position + (ci.length / 2.0) * ci.orientation
+
+            for j in range(i + 1, n):
+                cj = alive[j]
+                aj = cj.position - (cj.length / 2.0) * cj.orientation
+                bj = cj.position + (cj.length / 2.0) * cj.orientation
+
+                pi, pj, d = _segment_segment_closest(ai, bi, aj, bj)
+                delta = ci.radius + cj.radius - d
+
+                if delta <= 0.0:
+                    continue
+
+                # Contact normal: unit vector from j toward i.
+                # When axes coincide (d≈0), fall back to center-to-center direction,
+                # then to ci's perpendicular if centers also coincide.
+                if d > 1e-12:
+                    N = (pi - pj) / d
+                else:
+                    sep = ci.position - cj.position
+                    sep_norm = np.linalg.norm(sep)
+                    if sep_norm > 1e-12:
+                        N = sep / sep_norm
+                    else:
+                        N = np.array([-ci.orientation[1], ci.orientation[0]])
+
+                F = self.k * delta * N
+                pc = (pi + pj) / 2.0
+
+                # 2D torque: τ = r_x * F_y - r_y * F_x
+                ri = pc - ci.position
+                rj = pc - cj.position
+
+                forces[i] += F
+                forces[j] -= F
+                torques[i] += ri[0] * F[1] - ri[1] * F[0]
+                torques[j] -= rj[0] * F[1] - rj[1] * F[0]  # F_ji = -F
+
+        for i, cell in enumerate(alive):
+            zeta_t = self.drag * cell.length
+            zeta_r = (self.drag / 12.0) * cell.length**3
+            cell.position += forces[i] / zeta_t * dt
+            cell.apply_torque(torques[i] / zeta_r, dt)
 
     def enforce_bounds(self):
         """Kill any cell whose center of mass has left the environment bounds."""
