@@ -36,12 +36,11 @@ class Environment:
     implemented; for now the environment is just a container for fields.
     """
 
-    # Hardcoded simulation bounds: a 100um x 100um square (width, height).
-    # Fields may have values outside of these bounds.
-    BOUNDS = (100.0, 100.0)
-
-    def __init__(self, shape, diffusivity=None, eta=None, fields=None):
+    def __init__(
+        self, shape, bounds=(100.0, 100.0), diffusivity=None, eta=None, fields=None
+    ):
         self.shape = tuple(shape)
+        self.bounds = tuple(bounds)
         self.diffusivity = (
             np.full(self.shape, WATER_DIFFUSIVITY_37C)
             if diffusivity is None
@@ -71,5 +70,5 @@ class Environment:
     def in_bounds(self, position):
         """Check whether a 2D position lies within the environment bounds."""
         x, y = position[0], position[1]
-        width, height = self.BOUNDS
+        width, height = self.bounds
         return 0 <= x <= width and 0 <= y <= height

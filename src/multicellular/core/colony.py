@@ -100,7 +100,7 @@ class Colony:
     def _sample_field(self, field_array, position):
         """Nearest-grid-point lookup of a field array at a position in μm."""
         shape = self.environment.shape
-        width, height = self.environment.BOUNDS
+        width, height = self.environment.bounds
         j = int(np.clip(position[0] / width * shape[1], 0, shape[1] - 1))
         i = int(np.clip(position[1] / height * shape[0], 0, shape[0] - 1))
         return field_array[i, j]
