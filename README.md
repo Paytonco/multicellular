@@ -329,6 +329,14 @@ When cell axes are nearly parallel the closest-point solution is non-unique;
 projection rather than a degenerate endpoint, which gives the physically
 correct contact location for densely-packed, aligned cells.
 
+Candidate contact pairs are found with a uniform spatial grid (linked-cell
+algorithm) rather than checking every pair of living cells: cells are binned
+by center position into a grid sized to the largest possible center-to-center
+overlap distance, and only the 3×3 neighborhood of bins around each cell is
+searched. This produces identical force/torque results to an all-pairs check
+but scales roughly linearly with colony size instead of quadratically, which
+matters since colonies grow exponentially via division.
+
 ### `Simulation`
 
 `Simulation` steps a `Colony` from `t=0` to `t=t_max` in increments of `dt`,
