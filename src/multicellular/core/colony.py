@@ -150,6 +150,30 @@ class Colony:
         # Rotational Brownian kick
         cell.apply_torque(xi_rot * np.sqrt(2.0 * D_rot / dt), dt)
 
+    def _build_spatial_grid(self, alive):
+        """
+        Bin cells by center position into a uniform grid for neighbor search.
+
+        The grid cell size is set to the largest possible center-to-center
+        distance at which any two cells could overlap (the sum of their
+        half-extents, maximized over all living cells). With that sizing,
+        any pair of cells that could possibly overlap is guaranteed to lie
+        in the same grid cell or one of its 8 neighbors (standard
+        linked-cell / cell-list algorithm), so checking that 3x3
+        neighborhood is sufficient without missing any contacts.
+        """
+        max_half_extent = max(
+            (cell.length / 2.0 + cell.radius for cell in alive), default=0.0
+        )
+        cell_size = max(2.0 * max_half_extent, 1e-6)
+
+        grid = {}
+        for idx, cell in enumerate(alive):
+            gx = int(cell.position[0] // cell_size)
+            gy = int(cell.position[1] // cell_size)
+            grid.setdefault((gx, gy), []).append(idx)
+        return grid
+
     def _apply_contact_forces(self, dt):
         """
         Apply pairwise Hookean contact forces and torques to all living cells.
@@ -161,6 +185,10 @@ class Colony:
         Dynamics are overdamped:
           Δc = F / ζ_t * dt,  ζ_t = drag * length
           Δθ = τ / ζ_r * dt,  ζ_r = (drag / 12) * length³
+
+        Candidate pairs are restricted to cells sharing a grid bin or an
+        adjacent one (see _build_spatial_grid), which avoids the O(n²) blowup
+        of testing every pair directly while still finding every contact.
         """
         alive = self.living_cells
         n = len(alive)
@@ -170,46 +198,63 @@ class Colony:
         forces = [np.zeros(2) for _ in range(n)]
         torques = [0.0] * n
 
-        for i in range(n):
-            ci = alive[i]
-            ai = ci.position - (ci.length / 2.0) * ci.orientation
-            bi = ci.position + (ci.length / 2.0) * ci.orientation
+        endpoints = [
+            (
+                ci.position - (ci.length / 2.0) * ci.orientation,
+                ci.position + (ci.length / 2.0) * ci.orientation,
+            )
+            for ci in alive
+        ]
 
-            for j in range(i + 1, n):
-                cj = alive[j]
-                aj = cj.position - (cj.length / 2.0) * cj.orientation
-                bj = cj.position + (cj.length / 2.0) * cj.orientation
+        grid = self._build_spatial_grid(alive)
 
-                pi, pj, d = _segment_segment_closest(ai, bi, aj, bj)
-                delta = ci.radius + cj.radius - d
+        for (gx, gy), home_indices in grid.items():
+            neighbor_indices = []
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    neighbor_indices.extend(grid.get((gx + dx, gy + dy), ()))
 
-                if delta <= 0.0:
-                    continue
+            for i in home_indices:
+                ci = alive[i]
+                ai, bi = endpoints[i]
 
-                # Contact normal: unit vector from j toward i.
-                # When axes coincide (d≈0), fall back to center-to-center direction,
-                # then to ci's perpendicular if centers also coincide.
-                if d > 1e-12:
-                    N = (pi - pj) / d
-                else:
-                    sep = ci.position - cj.position
-                    sep_norm = np.linalg.norm(sep)
-                    if sep_norm > 1e-12:
-                        N = sep / sep_norm
+                for j in neighbor_indices:
+                    if j <= i:
+                        continue
+
+                    cj = alive[j]
+                    aj, bj = endpoints[j]
+
+                    pi, pj, d = _segment_segment_closest(ai, bi, aj, bj)
+                    delta = ci.radius + cj.radius - d
+
+                    if delta <= 0.0:
+                        continue
+
+                    # Contact normal: unit vector from j toward i.
+                    # When axes coincide (d≈0), fall back to center-to-center direction,
+                    # then to ci's perpendicular if centers also coincide.
+                    if d > 1e-12:
+                        N = (pi - pj) / d
                     else:
-                        N = np.array([-ci.orientation[1], ci.orientation[0]])
+                        sep = ci.position - cj.position
+                        sep_norm = np.linalg.norm(sep)
+                        if sep_norm > 1e-12:
+                            N = sep / sep_norm
+                        else:
+                            N = np.array([-ci.orientation[1], ci.orientation[0]])
 
-                F = self.k * delta * N
-                pc = (pi + pj) / 2.0
+                    F = self.k * delta * N
+                    pc = (pi + pj) / 2.0
 
-                # 2D torque: τ = r_x * F_y - r_y * F_x
-                ri = pc - ci.position
-                rj = pc - cj.position
+                    # 2D torque: τ = r_x * F_y - r_y * F_x
+                    ri = pc - ci.position
+                    rj = pc - cj.position
 
-                forces[i] += F
-                forces[j] -= F
-                torques[i] += ri[0] * F[1] - ri[1] * F[0]
-                torques[j] -= rj[0] * F[1] - rj[1] * F[0]  # F_ji = -F
+                    forces[i] += F
+                    forces[j] -= F
+                    torques[i] += ri[0] * F[1] - ri[1] * F[0]
+                    torques[j] -= rj[0] * F[1] - rj[1] * F[0]  # F_ji = -F
 
         for i, cell in enumerate(alive):
             zeta_t = self.drag * cell.length
