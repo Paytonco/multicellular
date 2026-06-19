@@ -62,7 +62,7 @@ def visualize(simulation, red=None, green=None, blue=None, interval=200):
     """
     df = simulation.to_dataframe()
     environment = simulation.colony.environment
-    width, height = environment.BOUNDS
+    width, height = environment.bounds
 
     scales = {}
     for species in (red, green, blue):

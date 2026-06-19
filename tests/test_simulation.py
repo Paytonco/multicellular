@@ -1,5 +1,6 @@
 # tests/test_simulation.py
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -12,26 +13,33 @@ from multicellular.core.simulation import Simulation
 
 def test_simulation_records_growth_and_division():
     env = Environment(shape=(10, 10))
-    cell = Cell(id=0, position=[50.0, 50.0], orientation=[1.0, 0.0], length=2.0)
+    rng = np.random.default_rng(0)
+    cell = Cell(
+        id=0, position=[50.0, 50.0], orientation=[1.0, 0.0], length=2.0, rng=rng
+    )
+    # Capture the division target before any steps so we can check daughter lengths.
+    division_target = cell._division_target
     colony = Colony([cell], env)
 
-    sim = Simulation(colony, dt=2.0, t_max=4.0)
-    df = sim.run()
+    # dt=10 guarantees the cell grows well past its target (L grows ~1000×) in one step.
+    sim = Simulation(colony, dt=10.0, t_max=10.0)
+    df = sim.run(show_progress=False)
 
     assert isinstance(df, pd.DataFrame)
-    assert len(df) == 4  # 1 cell at t=0, 1 cell at t=2, 2 daughters at t=4
 
-    # The parent cell grows for two steps before dividing.
-    parent_rows = df[df["cell_id"] == 0]
-    assert list(parent_rows["time"]) == [0.0, 2.0]
-    assert list(parent_rows["length"]) == [2.0, 3.0]
+    # Parent appears at t=0 with its initial length.
+    parent_at_0 = df[(df["cell_id"] == 0) & (df["time"] == 0.0)]
+    assert len(parent_at_0) == 1
+    assert parent_at_0["length"].values[0] == pytest.approx(2.0)
 
-    # Daughters appear at t=4 with new ids and conserve copy number / position.
-    daughter_rows = df[df["time"] == 4.0]
-    assert len(daughter_rows) == 2
-    assert set(daughter_rows["cell_id"]) == {1, 2}
-    assert daughter_rows["length"].tolist() == pytest.approx([2.0, 2.0])
-    assert all(daughter_rows["alive"])
+    # After one step the parent has divided; exactly two daughters are recorded.
+    at_t10 = df[df["time"] == 10.0]
+    assert len(at_t10) == 2
+    assert set(at_t10["cell_id"]) == {1, 2}
+    assert all(at_t10["alive"])
+    # Daughters are created at f * L_d = 0.5 * division_target (no growth yet).
+    for length in at_t10["length"]:
+        assert length == pytest.approx(division_target / 2)
 
 
 def test_simulation_records_chemical_concentrations():
@@ -47,7 +55,7 @@ def test_simulation_records_chemical_concentrations():
 
     colony = Colony([cell], env)
     sim = Simulation(colony, dt=0.1, t_max=0.5)
-    df = sim.run()
+    df = sim.run(show_progress=False)
 
     assert "A" in df.columns
     assert "B" in df.columns

@@ -83,7 +83,13 @@ def test_dead_cell_stays_dead_after_colony_step():
 
 def test_step_replaces_dividing_cell_with_daughters():
     env = Environment(shape=(20, 20))
-    cell = Cell(id=0, position=[10.0, 10.0], orientation=[1.0, 0.0], length=4.0)
+    rng = np.random.default_rng(0)
+    cell = Cell(
+        id=0, position=[10.0, 10.0], orientation=[1.0, 0.0], length=2.0, rng=rng
+    )
+    # Advance to the division target so colony.step triggers division.
+    cell.length = cell._division_target
+    expected_daughter_length = cell._division_target / 2.0
 
     colony = Colony([cell], env)
     colony.step(dt=0.1)
@@ -95,4 +101,4 @@ def test_step_replaces_dividing_cell_with_daughters():
     assert ids == {1, 2}
     for daughter in colony.cells:
         assert daughter.alive
-        assert daughter.length == pytest.approx(2.025)
+        assert daughter.length == pytest.approx(expected_daughter_length)

@@ -6,9 +6,16 @@ import pytest
 from multicellular.core.environment import Environment, Field
 
 
-def test_environment_bounds_are_hardcoded():
+def test_environment_default_bounds_are_100_by_100():
     env = Environment(shape=(10, 10))
-    assert env.BOUNDS == (100.0, 100.0)
+    assert env.bounds == (100.0, 100.0)
+
+
+def test_environment_bounds_can_be_specified():
+    env = Environment(shape=(10, 10), bounds=(20.0, 20.0))
+    assert env.bounds == (20.0, 20.0)
+    assert env.in_bounds([10.0, 10.0])
+    assert not env.in_bounds([50.0, 50.0])
 
 
 def test_add_and_get_field():
@@ -34,7 +41,7 @@ def test_field_can_extend_beyond_bounds():
     env = Environment(shape=(200, 200), fields=[field])
 
     assert env.get_field("roughness").shape == (200, 200)
-    assert env.BOUNDS == (100.0, 100.0)
+    assert env.bounds == (100.0, 100.0)
 
 
 def test_add_field_with_mismatched_shape_raises():
