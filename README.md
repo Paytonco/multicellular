@@ -2,16 +2,26 @@
 
 An agent-based simulation framework for bacterial cell colonies. Each cell is
 modeled as a rod-shaped body (cylinder with hemispherical caps) carrying an
-internal chemical reaction network (e.g. a gene-regulatory circuit), and is
-intended to grow, divide, move, and interact within a shared environment.
+internal chemical reaction network (e.g. a gene-regulatory circuit), and grows,
+divides, diffuses, and pushes against its neighbors within a shared environment.
 
 ## Status
 
-This package is under active development. Core building blocks for individual
-cells, chemical reaction networks, a basic environment/field container, a
-basic colony, and a basic simulation loop are implemented and tested; SBML
-import and visualization are not yet implemented (see
-[Unimplemented / stubs](#unimplemented--stubs)).
+This package is under active development. The following are implemented and
+tested:
+
+- Individual cells with geometry, growth, division, and internal reaction
+  networks
+- Chemical reaction networks (mass-action, Michaelis-Menten, Hill-Langmuir,
+  custom rate laws; forward-Euler ODE integration)
+- Environment with spatially-varying diffusivity and viscosity fields
+- Colony with overdamped-Langevin Brownian motion and Hookean cell-cell contact
+  forces and torques
+- Simulation loop with full history recording
+- 2D animation via `visualize()`
+
+Not yet implemented (see [Unimplemented / stubs](#unimplemented--stubs)): SBML
+import, reaction-diffusion field dynamics, and several visualization utilities.
 
 ## Installation
 
@@ -51,6 +61,17 @@ while not cell.ready_to_divide(threshold_length=4.0):
 
 daughter1, daughter2 = cell.divide()
 ```
+
+`Cell` also exposes two methods for directly applying external motion:
+
+- `cell.apply_force(velocity, dt)` — translates the cell by `velocity * dt`.
+  Treats the argument as a velocity (effective force / drag), consistent with
+  the overdamped regime. No-op if the cell is dead.
+- `cell.apply_torque(omega, dt)` — rotates the orientation unit vector by
+  `omega * dt` radians via a 2D rotation matrix. No-op if the cell is dead.
+
+Both are also called internally by `Colony` when applying Brownian motion and
+contact forces.
 
 ### `Reaction` and `ReactionNetwork`
 
@@ -130,9 +151,10 @@ inherited by both daughters.
 ### `Environment` and `Field`
 
 `Environment` represents the shared extracellular space as a collection of
-named `Field`s - matrices of values over a shared grid (e.g. chemical
+named `Field`s — matrices of values over a shared grid (e.g. chemical
 concentrations, temperature, surface roughness). Reaction-diffusion dynamics
-are not implemented yet; for now `Environment` is just a validated container.
+are not implemented yet; for now `Environment` is just a validated container
+for fields.
 
 ```python
 import numpy as np
@@ -177,11 +199,11 @@ env = Environment(shape=(10, 10), diffusivity=D, eta=eta)
 ```
 
 `Environment.BOUNDS` is currently hardcoded to `(100.0, 100.0)`, representing
-a 100um x 100um square that cells will interact within (this will be made
+a 100 μm × 100 μm square that cells will interact within (this will be made
 configurable later). A field's grid `shape` is independent of `BOUNDS` and
 may cover an area larger than the simulation bounds. `env.in_bounds(position)`
 checks whether a 2D position (e.g. a cell's center of mass) falls within
-`[0, BOUNDS[0]] x [0, BOUNDS[1]]`.
+`[0, BOUNDS[0]] × [0, BOUNDS[1]]`.
 
 ### `Colony`
 
@@ -194,20 +216,38 @@ env = Environment(shape=(10, 10))
 cells = [Cell(id=0, position=[10.0, 10.0], orientation=[1.0, 0.0])]
 
 colony = Colony(cells, env)
-colony.step(dt=0.1)  # steps every cell, applies Brownian motion, enforces bounds
+colony.step(dt=0.1)
 ```
+
+`Colony` accepts two mechanical parameters:
+
+- **`k`** (default `10.0`): Hookean contact stiffness (force / length). Controls
+  how hard cells push against one another when they overlap. Must be tuned
+  alongside `dt`; the explicit integrator is stable when
+  `dt < 2 * drag * length / k`.
+- **`drag`** (default `1.0`): isotropic drag constant for contact dynamics
+  (force · time / length²). Sets the translational drag `ζ_t = drag * length`
+  and rotational drag `ζ_r = (drag / 12) * length³`.
 
 `colony.step(dt)` performs the following operations in order:
 
-1. **Internal step** — calls `cell.step(dt)` for every cell (chemistry + growth).
+1. **Internal step** — calls `cell.step(dt)` for every cell (chemistry +
+   growth).
 2. **Bounds enforcement** — kills any living cell whose center of mass lies
    outside `environment.BOUNDS`.
 3. **Brownian motion** — applies an overdamped-Langevin random kick to every
-   surviving living cell (see below).
-4. **Division** — replaces any cell with `cell.ready_to_divide() == True` with
+   surviving living cell (see [Brownian motion](#brownian-motion) below).
+4. **Contact forces** — applies pairwise Hookean repulsion and torques between
+   all overlapping living cells (see [Contact forces](#contact-forces) below).
+5. **Division** — replaces any cell with `cell.ready_to_divide() == True` with
    its two daughter cells, each assigned a new unique `id`.
 
 `colony.living_cells` returns the cells that are still alive.
+
+Dead cells (`cell.alive == False`) are inert: `Cell.step`, `Cell.apply_force`,
+and `Cell.apply_torque` are all no-ops for them, and `Colony` skips both
+Brownian motion and contact forces for dead cells. Dead cells also never
+divide.
 
 #### Brownian motion
 
@@ -246,9 +286,48 @@ where `û` is the cell's orientation unit vector, `û_⊥` is perpendicular to
 it, and `ξ_∥`, `ξ_⊥`, `ξ_rot` are independent standard-normal draws from the
 cell's own RNG. The position update is in μm and `dt` is in seconds.
 
-Dead cells (`cell.alive == False`) are inert: `Cell.step`, `Cell.apply_force`,
-and `Cell.apply_torque` are all no-ops for them, and `Colony` skips Brownian
-motion for dead cells. Dead cells also never divide.
+#### Contact forces
+
+Each timestep, `Colony` computes pairwise Hookean repulsion between every pair
+of living cells whose surfaces overlap. The cell surface is modeled as a
+spherocylinder: every point within distance `R` (the cell's `radius`) of its
+axis segment. Contact between cells `i` and `j` is detected by computing the
+minimum distance `d` between their axis segments; the overlap is:
+
+```
+δ = R_i + R_j − d
+```
+
+Cells are in contact when `δ > 0`. The repulsive force on cell `i` is:
+
+```
+F_ij = k · δ · N
+```
+
+where `N` is the unit contact normal pointing from `j` toward `i`, and `k` is
+the stiffness set on the `Colony`. By Newton's third law, `F_ji = −F_ij`.
+
+Because the contact point `p_c = (p_i + p_j) / 2` is generally off-center,
+the force also generates a torque on each cell. In 2D the torque is the scalar
+cross product of the lever arm and the force:
+
+```
+τ_i = (p_c − c_i) × F_ij   (r_x F_y − r_y F_x)
+τ_j = (p_c − c_j) × F_ji
+```
+
+Forces and torques from all contacting neighbors are summed, then applied with
+overdamped dynamics using the `drag` parameter:
+
+```
+Δc_i = (Σ F_ij) / ζ_t · dt,   ζ_t = drag · length
+Δθ_i = (Σ τ_i)  / ζ_r · dt,   ζ_r = (drag / 12) · length³
+```
+
+When cell axes are nearly parallel the closest-point solution is non-unique;
+`Colony` handles this explicitly by using the midpoint of the overlapping axial
+projection rather than a degenerate endpoint, which gives the physically
+correct contact location for densely-packed, aligned cells.
 
 ### `Simulation`
 
@@ -268,8 +347,8 @@ df = sim.run()  # pandas DataFrame, one row per cell per recorded timestep
 ```
 
 `sim.run()` records the initial state, then repeatedly calls `colony.step(dt)`
-and records the new state of every cell remaining in the colony - including
-any new daughter cells produced by division - until `t_max` is reached. The
+and records the new state of every cell remaining in the colony — including
+any new daughter cells produced by division — until `t_max` is reached. The
 returned DataFrame has columns `time`, `cell_id`, `alive`, `position_x`,
 `position_y`, `orientation_x`, `orientation_y`, `length`, `radius`, plus one
 column per chemical species seen in any cell's `concentrations` (missing
@@ -280,7 +359,7 @@ and `sim.to_dataframe()`.
 ### `visualize`
 
 `visualize(simulation, red=None, green=None, blue=None, interval=200)` shows
-a 2D animation of a (already-`run()`) `Simulation` in a pop-up matplotlib
+a 2D animation of an already-`run()` `Simulation` in a pop-up matplotlib
 window:
 
 ```python
@@ -295,12 +374,12 @@ visualize(sim, red="A", green="B", interval=200)
   that channel is its concentration of that species, normalized by the
   species' maximum value over the whole simulation. Channels left as `None`
   default to a constant mid-gray value.
-- Dead cells (`alive == False`) are removed from the display as soon as they
-  die and do not appear in subsequent frames.
+- Dead cells are removed from the display as soon as they die and do not
+  appear in subsequent frames.
 - The region outside `environment.BOUNDS` is tinted red.
 - `interval` is the delay between frames in milliseconds.
 
-The video is only shown interactively (via `plt.show()`); saving it to a file
+The animation is only shown interactively (via `plt.show()`); saving to a file
 is not yet implemented.
 
 ## Unimplemented / stubs
@@ -309,19 +388,19 @@ These pieces exist as placeholders (empty classes/functions or
 `NotImplementedError`) and are not yet usable:
 
 - **`ReactionNetwork.simulate_step`** with `simulation_method="SSA"` or
-  `"CLE"` - raises `NotImplementedError`. Only `"ODE"` (forward Euler) is
+  `"CLE"` — raises `NotImplementedError`. Only `"ODE"` (forward Euler) is
   implemented.
 - **`ReactionNetwork.from_sbml`** and **`multicellular.parse_sbml`**
-  (`utils/sbml_parser.py`) - raise `NotImplementedError` / are empty. Intended
+  (`utils/sbml_parser.py`) — raise `NotImplementedError` / are empty. Intended
   to construct a `ReactionNetwork` from an SBML model file.
 - **`multicellular.animate_colony`**, **`multicellular.color_cells`**, and
-  **`plot_field`** (`utils/visualization.py`) - empty functions. Intended for
-  animating a `Colony` over time, coloring cells (e.g. by species or
-  concentration), and plotting `Environment` fields.
-- **`Cell.interact_with_environment`** - placeholder method (no-op), intended
+  **`multicellular.plot_field`** (`utils/visualization.py`) — empty functions.
+  Intended for animating a `Colony` directly, coloring cells by species or
+  concentration, and plotting `Environment` fields.
+- **`Cell.interact_with_environment`** — placeholder method (no-op), intended
   to let a cell read from / write to an `Environment`.
 - **`examples/toggle_switch_demo.py`** and
-  **`examples/quorum_sensing_demo.py`** - empty placeholder scripts, intended
+  **`examples/quorum_sensing_demo.py`** — empty placeholder scripts, intended
   as end-to-end demos of a genetic toggle switch and a quorum-sensing circuit.
 
 ## Running tests
@@ -342,6 +421,3 @@ pytest tests/test_colony.py      # Colony bounds enforcement, division, and dead
 pytest tests/test_simulation.py  # Simulation loop and DataFrame export
 pytest tests/test_dummy.py       # trivial sanity check
 ```
-
-`tests/test_rections.py` is currently an empty placeholder (no tests to run
-yet).
