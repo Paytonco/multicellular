@@ -1,6 +1,7 @@
 # core/simulation.py
 
 import pandas as pd
+from tqdm import tqdm
 
 
 class Simulation:
@@ -34,14 +35,14 @@ class Simulation:
             record.update(cell.concentrations)
             self.history.append(record)
 
-    def run(self):
+    def run(self, show_progress=True):
         """Step the colony from t=0 to t=t_max, recording state at every step."""
         self.time = 0.0
         self.history = []
         self.record()
 
         n_steps = round(self.t_max / self.dt)
-        for step_index in range(1, n_steps + 1):
+        for step_index in tqdm(range(1, n_steps + 1), disable=not show_progress):
             self.colony.step(self.dt)
             self.time = step_index * self.dt
             self.record()

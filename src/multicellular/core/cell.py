@@ -23,29 +23,64 @@ class Cell:
         species="default",
         network=None,
         rng=None,
+        growth_rate=np.log(2),
+        delta_bar=1.0,
+        cv_delta=0.10,
+        a=1.0,
+        cv_f=0.0,
     ):
+        """
+        Args:
+            growth_rate: Exponential elongation rate λ. Length evolves as
+                L(t) = L_b * exp(λ * t). Default ln(2) gives a mean doubling
+                time of 1 time unit.
+            delta_bar: Mean added length per generation (ΔL̄). Sets the size
+                scale: at steady state the mean birth length is delta_bar and
+                the mean division length is 2 * delta_bar.
+            cv_delta: Coefficient of variation of the added increment. This is
+                the primary stochasticity parameter; must be > 0 for the adder
+                model. Literature range for E. coli: 0.10–0.15.
+            a: Size-control strategy knob. a=1 (default) is a pure adder;
+                a=0 is a sizer; a=2 approximates a timer.
+            cv_f: CV of the division fraction f ~ Normal(0.5, cv_f * 0.5),
+                clipped to (0, 1). Default 0.0 gives a deterministic symmetric
+                split. Set ~0.03 to enable partition noise.
+        """
         self.id = id
-        self.position = np.array(position, dtype=float)  # Center of mass
-        self.orientation = self._normalize(
-            np.array(orientation, dtype=float)
-        )  # Unit vector
-        self.length = length  # Length of cylindrical portion
-        self.radius = radius  # Radius of cylinder and caps (constant)
+        self.position = np.array(position, dtype=float)
+        self.orientation = self._normalize(np.array(orientation, dtype=float))
+        self.length = length
+        self.radius = radius
         self.species = species
         self.network = network
         self.age = 0.0
         self.alive = True
         self.rng = rng or np.random.default_rng()
 
-        # Chemical species (by name, from self.concentrations) whose copy
-        # number should be partitioned stochastically at division rather
-        # than split deterministically by concentration. Use this for
-        # low-copy molecules (e.g. plasmids) where stochastic partitioning
-        # matters. Designate a species as low-copy via set_concentration().
-        self.low_copy_species = set()
+        self.growth_rate = growth_rate
+        self.delta_bar = delta_bar
+        self.cv_delta = cv_delta
+        self.a = a
+        self.cv_f = cv_f
 
-        # Default initial concentrations: all zero if network exists
+        self.length_at_birth = length
+        self._division_target = self._sample_division_target()
+
+        self.low_copy_species = set()
         self.concentrations = {s: 0.0 for s in network.species} if network else {}
+
+    def _sample_division_target(self):
+        """
+        Sample the division target for this generation.
+
+        L_d = a * L_b + Delta,  Delta ~ Normal(delta_bar, cv_delta * delta_bar).
+        Resamples until Delta > 0 to keep the target above the birth size.
+        """
+        while True:
+            delta = self.rng.normal(self.delta_bar, self.cv_delta * self.delta_bar)
+            if delta > 0:
+                break
+        return self.a * self.length_at_birth + delta
 
     def compute_volume(self):
         """Compute volume of cylindrical rod with hemispherical caps."""
@@ -72,9 +107,9 @@ class Cell:
         else:
             self.low_copy_species.discard(chemical_species)
 
-    def grow(self, dt, growth_rate=0.5):
-        """Increase length linearly and age the cell."""
-        self.length += growth_rate * dt
+    def grow(self, dt):
+        """Grow exponentially by one timestep and age the cell."""
+        self.length *= np.exp(self.growth_rate * dt)
         self.age += dt
 
     def step(self, dt):
@@ -87,9 +122,9 @@ class Cell:
             )
         self.grow(dt)
 
-    def ready_to_divide(self, threshold_length=4.0):
-        """Check if cell should divide based on length threshold."""
-        return self.length >= threshold_length
+    def ready_to_divide(self):
+        """Return True if the cell has reached its sampled division target."""
+        return self.length >= self._division_target
 
     def _partition_copies(self, n):
         """
@@ -109,49 +144,68 @@ class Cell:
         return int(np.clip(round(x), 0, n))
 
     def divide(self):
-        """Split into two daughter cells along the longitudinal axis."""
+        """
+        Split into two daughter cells along the longitudinal axis.
+
+        Daughter lengths are f * L_d and (1 - f) * L_d, where L_d is this
+        cell's sampled division target and f is the division fraction (0.5 by
+        default; optionally noisy when cv_f > 0). Each daughter samples its
+        own division target at construction, continuing the adder lineage.
+        """
         if not self.ready_to_divide():
             return None
 
-        daughter_length = self.length / 2.0
-        offset = (daughter_length / 2.0 + self.radius) * self.orientation
+        if self.cv_f > 0:
+            f = float(np.clip(self.rng.normal(0.5, self.cv_f * 0.5), 1e-6, 1.0 - 1e-6))
+        else:
+            f = 0.5
 
-        pos1 = self.position - offset
-        pos2 = self.position + offset
+        L_d = self._division_target
+        length1 = f * L_d
+        length2 = (1.0 - f) * L_d
 
-        daughter1 = Cell(
+        # Place daughters so their surfaces just touch at the division plane.
+        pos1 = self.position - ((1.0 - f) * L_d / 2.0 + self.radius) * self.orientation
+        pos2 = self.position + (f * L_d / 2.0 + self.radius) * self.orientation
+
+        daughter_kw = dict(
             id=None,
-            position=pos1,
             orientation=self.orientation,
-            length=daughter_length,
             radius=self.radius,
             species=self.species,
-            network=self.network.clone() if self.network else None,
             rng=self.rng,
+            growth_rate=self.growth_rate,
+            delta_bar=self.delta_bar,
+            cv_delta=self.cv_delta,
+            a=self.a,
+            cv_f=self.cv_f,
+        )
+        daughter1 = Cell(
+            position=pos1,
+            length=length1,
+            network=self.network.clone() if self.network else None,
+            **daughter_kw,
         )
         daughter2 = Cell(
-            id=None,
             position=pos2,
-            orientation=self.orientation,
-            length=daughter_length,
-            radius=self.radius,
-            species=self.species,
+            length=length2,
             network=self.network.clone() if self.network else None,
-            rng=self.rng,
+            **daughter_kw,
         )
 
         daughter1.low_copy_species = set(self.low_copy_species)
         daughter2.low_copy_species = set(self.low_copy_species)
 
-        daughter_volume = daughter1.compute_volume()
+        vol1 = daughter1.compute_volume()
+        vol2 = daughter2.compute_volume()
         conc1 = {}
         conc2 = {}
         for chemical_species, conc in self.concentrations.items():
             if chemical_species in self.low_copy_species:
                 n = int(round(self.copy_number(chemical_species)))
                 x = self._partition_copies(n)
-                conc1[chemical_species] = x / daughter_volume
-                conc2[chemical_species] = (n - x) / daughter_volume
+                conc1[chemical_species] = x / vol1
+                conc2[chemical_species] = (n - x) / vol2
             else:
                 conc1[chemical_species] = conc
                 conc2[chemical_species] = conc
