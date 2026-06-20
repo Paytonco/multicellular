@@ -34,8 +34,8 @@ pip install -e .
 ```
 
 This installs the `multicellular` package (from `src/multicellular`) in
-editable mode, along with its dependencies: `numpy`, `pandas`, and
-`matplotlib`.
+editable mode, along with its dependencies: `numpy`, `pandas`, `matplotlib`,
+`tqdm`, and `pillow`.
 
 ## Usage
 
@@ -366,8 +366,17 @@ and `sim.to_dataframe()`.
 
 ### `visualize`
 
-`visualize(simulation, red=None, green=None, blue=None, interval=200)` shows
-a 2D animation of an already-`run()` `Simulation` in a pop-up matplotlib
+```python
+visualize(
+    simulation,
+    red=None, green=None, blue=None,
+    interval=200,
+    save_path=None, filename="simulation.gif",
+    show_progress=True,
+)
+```
+
+shows a 2D animation of an already-`run()` `Simulation` in a pop-up matplotlib
 window:
 
 ```python
@@ -382,13 +391,29 @@ visualize(sim, red="A", green="B", interval=200)
   that channel is its concentration of that species, normalized by the
   species' maximum value over the whole simulation. Channels left as `None`
   default to a constant mid-gray value.
-- Dead cells are removed from the display as soon as they die and do not
-  appear in subsequent frames.
+- Dead cells stop appearing in the frame after they die.
 - The region outside `environment.BOUNDS` is tinted red.
 - `interval` is the delay between frames in milliseconds.
 
-The animation is only shown interactively (via `plt.show()`); saving to a file
-is not yet implemented.
+Every frame (all cell shapes, colors, and the `t = ...` title) is rendered to
+an in-memory image up front, before anything is shown — drawing many
+individual cell patches is the slow part of this visualization, so doing it
+once per frame ahead of time (with a progress bar; set `show_progress=False`
+to silence it) keeps playback smooth no matter how large the colony grows.
+Display afterward is just fast image blitting through the pre-rendered
+frames.
+
+To save the animation, pass a directory via `save_path`; it's created if it
+doesn't already exist, and the animation is written there as an animated GIF
+(via Pillow — no external dependencies like `ffmpeg` required):
+
+```python
+visualize(sim, red="A", green="B", save_path="./out", filename="colony.gif")
+```
+
+`filename` defaults to `"simulation.gif"`. The animation is still shown
+interactively afterward; pass `show_progress=False` and close the window
+yourself (or run headlessly) if you only want the saved file.
 
 ## Unimplemented / stubs
 
