@@ -154,6 +154,14 @@ class ReactionNetwork:
         self.simulation_method = simulation_method.upper()  # ODE, SSA, CLE
         self.species = self._extract_species()
 
+        # Species/reaction ordering and the stoichiometry matrix are fixed for
+        # the lifetime of this network (reactions/species don't change after
+        # construction), so compute them once instead of on every ODE step.
+        self._reaction_names = list(self.reactions.keys())
+        self._stoichiometry_matrix = self.get_stoichiometry_matrix(
+            self.species, self._reaction_names
+        )
+
     def _extract_species(self) -> List[str]:
         species_set = set()
         for reaction in self.reactions.values():
@@ -213,8 +221,8 @@ class ReactionNetwork:
         Simple forward Euler ODE step.
         """
         species_list = self.species
-        reaction_list = list(self.reactions.keys())
-        S = self.get_stoichiometry_matrix(species_list, reaction_list)
+        reaction_list = self._reaction_names
+        S = self._stoichiometry_matrix
 
         v = np.array(
             [self.reactions[rxn_name].rate(state) for rxn_name in reaction_list]

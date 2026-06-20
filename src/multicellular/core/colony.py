@@ -1,30 +1,37 @@
 # core/colony.py
 
+import math
+
 import numpy as np
+
+from .environment import WATER_DIFFUSIVITY_37C
 
 _kBT = 1.380649e-23 * 310.15  # J  (k_B × 37°C)
 
 _PARALLEL_TOL = 1e-10  # denom threshold for segment-segment parallel detection
 
 
-def _segment_segment_closest(a1, b1, a2, b2):
+def _segment_segment_closest(a1x, a1y, b1x, b1y, a2x, a2y, b2x, b2y):
     """
-    Closest points between segment [a1, b1] and segment [a2, b2].
+    Closest points between segment [a1, b1] and segment [a2, b2], given as
+    raw x/y floats rather than vectors.
 
-    Returns (p1, p2, d): p1 on seg1, p2 on seg2, d = |p1 - p2|.
+    Returns (p1x, p1y, p2x, p2y, d): p1 on seg1, p2 on seg2, d = |p1 - p2|.
+    Operates on plain floats (instead of building/dot-producting small numpy
+    arrays) since this runs once per candidate contact pair, every step.
 
     When segments are nearly parallel, uses the midpoint of their overlapping
     axial projection rather than a degenerate endpoint, per the physics spec.
     """
-    d1 = b1 - a1
-    d2 = b2 - a2
-    w = a1 - a2
+    d1x, d1y = b1x - a1x, b1y - a1y
+    d2x, d2y = b2x - a2x, b2y - a2y
+    wx, wy = a1x - a2x, a1y - a2y
 
-    a = np.dot(d1, d1)
-    b = np.dot(d1, d2)
-    c = np.dot(d2, d2)
-    e = np.dot(d1, w)
-    f = np.dot(d2, w)
+    a = d1x * d1x + d1y * d1y
+    b = d1x * d2x + d1y * d2y
+    c = d2x * d2x + d2y * d2y
+    e = d1x * wx + d1y * wy
+    f = d2x * wx + d2y * wy
 
     denom = a * c - b * b  # zero iff segments are parallel
 
@@ -35,30 +42,29 @@ def _segment_segment_closest(a1, b1, a2, b2):
         if a < _PARALLEL_TOL:
             s = 0.0
         else:
-            t0 = np.dot(a2 - a1, d1) / a
-            t1 = np.dot(b2 - a1, d1) / a
+            t0 = ((a2x - a1x) * d1x + (a2y - a1y) * d1y) / a
+            t1 = ((b2x - a1x) * d1x + (b2y - a1y) * d1y) / a
             lo = max(0.0, min(t0, t1))
             hi = min(1.0, max(t0, t1))
-            s = (lo + hi) / 2.0 if lo <= hi else float(np.clip(-e / a, 0.0, 1.0))
+            s = (lo + hi) / 2.0 if lo <= hi else min(max(-e / a, 0.0), 1.0)
 
-        p1 = a1 + s * d1
-        t = (
-            float(np.clip(np.dot(p1 - a2, d2) / c, 0.0, 1.0))
-            if c > _PARALLEL_TOL
-            else 0.0
-        )
-        p2 = a2 + t * d2
+        p1x, p1y = a1x + s * d1x, a1y + s * d1y
+        if c > _PARALLEL_TOL:
+            t = min(max(((p1x - a2x) * d2x + (p1y - a2y) * d2y) / c, 0.0), 1.0)
+        else:
+            t = 0.0
+        p2x, p2y = a2x + t * d2x, a2y + t * d2y
     else:
         # General (non-parallel) case: closed-form minimum with clamped parameters.
         # Clamp s, recompute t, clamp t, then recompute s once more.
-        s = float(np.clip((b * f - c * e) / denom, 0.0, 1.0))
-        t = float(np.clip((b * s + f) / c, 0.0, 1.0)) if c > _PARALLEL_TOL else 0.0
-        s = float(np.clip((-e + b * t) / a, 0.0, 1.0)) if a > _PARALLEL_TOL else 0.0
-        p1 = a1 + s * d1
-        p2 = a2 + t * d2
+        s = min(max((b * f - c * e) / denom, 0.0), 1.0)
+        t = min(max((b * s + f) / c, 0.0), 1.0) if c > _PARALLEL_TOL else 0.0
+        s = min(max((-e + b * t) / a, 0.0), 1.0) if a > _PARALLEL_TOL else 0.0
+        p1x, p1y = a1x + s * d1x, a1y + s * d1y
+        p2x, p2y = a2x + t * d2x, a2y + t * d2y
 
-    d = float(np.linalg.norm(p1 - p2))
-    return p1, p2, d
+    d = math.hypot(p1x - p2x, p1y - p2y)
+    return p1x, p1y, p2x, p2y, d
 
 
 class Colony:
@@ -92,9 +98,11 @@ class Colony:
         for cell in self.cells:
             cell.step(dt)
         self.enforce_bounds()
-        for cell in self.living_cells:
-            self._apply_brownian_motion(cell, dt)
-        self._apply_contact_forces(dt)
+        alive = self.living_cells
+        noise = self._draw_brownian_noise(alive)
+        for cell, xi in zip(alive, noise):
+            self._apply_brownian_motion(cell, dt, xi)
+        self._apply_contact_forces(dt, alive)
         self.handle_divisions()
 
     def _sample_field(self, field_array, position):
@@ -105,50 +113,82 @@ class Colony:
         i = int(np.clip(position[1] / height * shape[0], 0, shape[0] - 1))
         return field_array[i, j]
 
-    def _apply_brownian_motion(self, cell, dt):
+    def _draw_brownian_noise(self, alive):
+        """
+        Draw the 3 standard-normal samples (parallel, perpendicular,
+        rotational) each living cell needs for its Brownian kick this step.
+
+        Calls are batched per distinct rng instance (most cells share one
+        Generator, inherited from parent to daughters at division) instead of
+        issuing one Python-level standard_normal(3) call per cell. A Generator
+        only advances its own stream when its own method is called, and
+        requesting N draws in one batched call consumes that stream
+        identically to N separate calls of the same total size, so each
+        cell's draw is bit-for-bit the same as before — this only removes
+        per-call dispatch overhead.
+        """
+        n = len(alive)
+        noise = [None] * n
+        groups = {}
+        for idx, cell in enumerate(alive):
+            key = id(cell.rng)
+            if key not in groups:
+                groups[key] = (cell.rng, [])
+            groups[key][1].append(idx)
+
+        for rng, indices in groups.values():
+            draws = rng.standard_normal((len(indices), 3))
+            for row, idx in zip(draws, indices):
+                noise[idx] = row
+        return noise
+
+    def _apply_brownian_motion(self, cell, dt, xi):
         """
         Apply overdamped-Langevin Brownian displacements to a living cell.
 
         Uses slender-body drag for an anisotropic rod. Local viscosity and
         diffusivity are sampled from the environment grid at the cell's
-        position. Spatial units are μm; dt is in seconds.
+        position. Spatial units are μm; dt is in seconds. `xi` is the
+        (parallel, perpendicular, rotational) standard-normal triple drawn
+        for this cell by `_draw_brownian_noise`.
         """
         eta = self._sample_field(self.environment.eta, cell.position)
         D_field = self._sample_field(self.environment.diffusivity, cell.position)
 
         # Scale viscosity by local diffusivity relative to the reference medium
         # (Stokes-Einstein: η ∝ 1/D at fixed temperature and probe size).
-        from .environment import WATER_DIFFUSIVITY_37C
-
         eta_local = eta * (WATER_DIFFUSIVITY_37C / D_field)
 
         # Cell geometry in SI (m)
         L_eff = (cell.length + 2.0 * cell.radius) * 1e-6
         r = cell.radius * 1e-6
-        ln_ratio = np.log(L_eff / r)  # ln(total length / radius), always > 0
+        ln_ratio = math.log(L_eff / r)  # ln(total length / radius), always > 0
 
         # Slender-body drag coefficients
-        gamma_par = 2.0 * np.pi * eta_local * L_eff / ln_ratio  # kg/s
-        gamma_perp = 4.0 * np.pi * eta_local * L_eff / ln_ratio  # kg/s
-        gamma_rot = np.pi * eta_local * L_eff**3 / (3.0 * ln_ratio)  # kg·m²/s
+        gamma_par = 2.0 * math.pi * eta_local * L_eff / ln_ratio  # kg/s
+        gamma_perp = 4.0 * math.pi * eta_local * L_eff / ln_ratio  # kg/s
+        gamma_rot = math.pi * eta_local * L_eff**3 / (3.0 * ln_ratio)  # kg·m²/s
 
         # Diffusion coefficients via Einstein relation
         D_par = _kBT / gamma_par  # m²/s
         D_perp = _kBT / gamma_perp  # m²/s
         D_rot = _kBT / gamma_rot  # rad²/s
 
-        u = cell.orientation
-        u_perp = np.array([-u[1], u[0]])
-        xi_par, xi_perp, xi_rot = cell.rng.standard_normal(3)
+        ux, uy = float(cell.orientation[0]), float(cell.orientation[1])
+        uperp_x, uperp_y = -uy, ux
+        xi_par, xi_perp, xi_rot = xi
+
+        s_par = math.sqrt(2.0 * D_par * dt)
+        s_perp = math.sqrt(2.0 * D_perp * dt)
 
         # Translational Brownian kick (convert m → μm)
-        dr = u * xi_par * np.sqrt(2.0 * D_par * dt) + u_perp * xi_perp * np.sqrt(
-            2.0 * D_perp * dt
-        )
-        cell.position += dr * 1e6
+        dr_x = (ux * xi_par * s_par + uperp_x * xi_perp * s_perp) * 1e6
+        dr_y = (uy * xi_par * s_par + uperp_y * xi_perp * s_perp) * 1e6
+        cell.position[0] += dr_x
+        cell.position[1] += dr_y
 
         # Rotational Brownian kick
-        cell.apply_torque(xi_rot * np.sqrt(2.0 * D_rot / dt), dt)
+        cell.apply_torque(xi_rot * math.sqrt(2.0 * D_rot / dt), dt)
 
     def _build_spatial_grid(self, alive):
         """
@@ -174,7 +214,7 @@ class Colony:
             grid.setdefault((gx, gy), []).append(idx)
         return grid
 
-    def _apply_contact_forces(self, dt):
+    def _apply_contact_forces(self, dt, alive=None):
         """
         Apply pairwise Hookean contact forces and torques to all living cells.
 
@@ -189,22 +229,28 @@ class Colony:
         Candidate pairs are restricted to cells sharing a grid bin or an
         adjacent one (see _build_spatial_grid), which avoids the O(n²) blowup
         of testing every pair directly while still finding every contact.
+
+        Per-pair math uses plain floats rather than small numpy arrays/dot
+        products, since this loop runs for every candidate pair, every step.
         """
-        alive = self.living_cells
+        if alive is None:
+            alive = self.living_cells
         n = len(alive)
         if n < 2:
             return
 
-        forces = [np.zeros(2) for _ in range(n)]
+        forces_x = [0.0] * n
+        forces_y = [0.0] * n
         torques = [0.0] * n
 
-        endpoints = [
-            (
-                ci.position - (ci.length / 2.0) * ci.orientation,
-                ci.position + (ci.length / 2.0) * ci.orientation,
+        endpoints = []
+        for ci in alive:
+            px, py = float(ci.position[0]), float(ci.position[1])
+            ox, oy = float(ci.orientation[0]), float(ci.orientation[1])
+            hl = ci.length / 2.0
+            endpoints.append(
+                (px - hl * ox, py - hl * oy, px + hl * ox, py + hl * oy, px, py)
             )
-            for ci in alive
-        ]
 
         grid = self._build_spatial_grid(alive)
 
@@ -216,16 +262,18 @@ class Colony:
 
             for i in home_indices:
                 ci = alive[i]
-                ai, bi = endpoints[i]
+                a1x, a1y, b1x, b1y, cix, ciy = endpoints[i]
 
                 for j in neighbor_indices:
                     if j <= i:
                         continue
 
                     cj = alive[j]
-                    aj, bj = endpoints[j]
+                    a2x, a2y, b2x, b2y, cjx, cjy = endpoints[j]
 
-                    pi, pj, d = _segment_segment_closest(ai, bi, aj, bj)
+                    p1x, p1y, p2x, p2y, d = _segment_segment_closest(
+                        a1x, a1y, b1x, b1y, a2x, a2y, b2x, b2y
+                    )
                     delta = ci.radius + cj.radius - d
 
                     if delta <= 0.0:
@@ -235,31 +283,34 @@ class Colony:
                     # When axes coincide (d≈0), fall back to center-to-center direction,
                     # then to ci's perpendicular if centers also coincide.
                     if d > 1e-12:
-                        N = (pi - pj) / d
+                        Nx, Ny = (p1x - p2x) / d, (p1y - p2y) / d
                     else:
-                        sep = ci.position - cj.position
-                        sep_norm = np.linalg.norm(sep)
+                        sepx, sepy = cix - cjx, ciy - cjy
+                        sep_norm = math.hypot(sepx, sepy)
                         if sep_norm > 1e-12:
-                            N = sep / sep_norm
+                            Nx, Ny = sepx / sep_norm, sepy / sep_norm
                         else:
-                            N = np.array([-ci.orientation[1], ci.orientation[0]])
+                            Nx, Ny = -float(ci.orientation[1]), float(ci.orientation[0])
 
-                    F = self.k * delta * N
-                    pc = (pi + pj) / 2.0
+                    Fx, Fy = self.k * delta * Nx, self.k * delta * Ny
+                    pcx, pcy = (p1x + p2x) / 2.0, (p1y + p2y) / 2.0
 
                     # 2D torque: τ = r_x * F_y - r_y * F_x
-                    ri = pc - ci.position
-                    rj = pc - cj.position
+                    rix, riy = pcx - cix, pcy - ciy
+                    rjx, rjy = pcx - cjx, pcy - cjy
 
-                    forces[i] += F
-                    forces[j] -= F
-                    torques[i] += ri[0] * F[1] - ri[1] * F[0]
-                    torques[j] -= rj[0] * F[1] - rj[1] * F[0]  # F_ji = -F
+                    forces_x[i] += Fx
+                    forces_y[i] += Fy
+                    forces_x[j] -= Fx
+                    forces_y[j] -= Fy
+                    torques[i] += rix * Fy - riy * Fx
+                    torques[j] -= rjx * Fy - rjy * Fx  # F_ji = -F
 
         for i, cell in enumerate(alive):
             zeta_t = self.drag * cell.length
             zeta_r = (self.drag / 12.0) * cell.length**3
-            cell.position += forces[i] / zeta_t * dt
+            cell.position[0] += forces_x[i] / zeta_t * dt
+            cell.position[1] += forces_y[i] / zeta_t * dt
             cell.apply_torque(torques[i] / zeta_r, dt)
 
     def enforce_bounds(self):

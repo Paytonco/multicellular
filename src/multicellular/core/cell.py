@@ -1,5 +1,7 @@
 # core/cell.py
 
+import math
+
 import numpy as np
 
 
@@ -226,11 +228,20 @@ class Cell:
         if not self.alive:
             return
         angle = omega * dt
-        cos_a, sin_a = np.cos(angle), np.sin(angle)
-        x, y = self.orientation
-        self.orientation = self._normalize(
-            np.array([cos_a * x - sin_a * y, sin_a * x + cos_a * y])
-        )
+        cos_a, sin_a = math.cos(angle), math.sin(angle)
+        x, y = float(self.orientation[0]), float(self.orientation[1])
+        nx = cos_a * x - sin_a * y
+        ny = sin_a * x + cos_a * y
+        norm = math.hypot(nx, ny)
+        if norm != 0.0:
+            nx, ny = nx / norm, ny / norm
+        else:
+            nx, ny = 1.0, 0.0
+        # Mutate in place (each cell owns its own orientation array; see
+        # __init__, where np.array(...) always copies) to avoid allocating a
+        # new array on every torque application, which happens every step.
+        self.orientation[0] = nx
+        self.orientation[1] = ny
 
     def interact_with_environment(self, environment):
         """Placeholder for environment interaction logic."""
