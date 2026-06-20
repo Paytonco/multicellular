@@ -6,7 +6,7 @@ import pytest
 
 from multicellular.core.cell import Cell
 from multicellular.core.colony import Colony
-from multicellular.core.environment import Environment
+from multicellular.core.environment import Environment, Field
 from multicellular.core.reactions import Reaction, ReactionNetwork
 from multicellular.core.simulation import Simulation
 
@@ -64,3 +64,61 @@ def test_simulation_records_chemical_concentrations():
     # A decreases and B increases as the reaction proceeds.
     assert df["A"].iloc[0] > df["A"].iloc[-1]
     assert df["B"].iloc[0] < df["B"].iloc[-1]
+
+
+def test_run_again_with_larger_t_max_continues_and_appends_history():
+    env = Environment(shape=(10, 10))
+    cell = Cell(id=0, position=[50.0, 50.0], orientation=[1.0, 0.0])
+    colony = Colony([cell], env)
+
+    sim = Simulation(colony, dt=0.1, t_max=0.5)
+    sim.run(show_progress=False)
+    assert sim.time == pytest.approx(0.5)
+    n_records_first_run = len(sim.history)
+
+    sim.run(show_progress=False, t_max=1.0)
+
+    assert sim.time == pytest.approx(1.0)
+    assert len(sim.history) > n_records_first_run
+    times = sorted({record["time"] for record in sim.history})
+    assert times[0] == pytest.approx(0.0)
+    assert times[-1] == pytest.approx(1.0)
+    # No duplicate record for the time the first run already ended at.
+    assert sum(1 for record in sim.history if record["time"] == pytest.approx(0.5)) == 1
+
+
+def test_run_again_with_same_t_max_is_a_no_op():
+    env = Environment(shape=(10, 10))
+    cell = Cell(id=0, position=[50.0, 50.0], orientation=[1.0, 0.0])
+    colony = Colony([cell], env)
+
+    sim = Simulation(colony, dt=0.1, t_max=0.5)
+    sim.run(show_progress=False)
+    history_after_first_run = list(sim.history)
+
+    sim.run(show_progress=False)
+
+    assert sim.history == history_after_first_run
+
+
+def test_run_continues_after_switching_environment():
+    field_before = Field("A", np.full((10, 10), 1.0), is_chemical=True)
+    env_before = Environment(shape=(10, 10), fields=[field_before])
+    cell = Cell(id=0, position=[50.0, 50.0], orientation=[1.0, 0.0])
+    colony = Colony([cell], env_before)
+
+    sim = Simulation(colony, dt=0.1, t_max=0.5)
+    sim.run(show_progress=False)
+
+    field_after = Field("A", np.full((10, 10), 9.0), is_chemical=True)
+    env_after = Environment(shape=(10, 10), fields=[field_after])
+    colony.switch_environment(env_after)
+
+    df = sim.run(show_progress=False, t_max=1.0)
+
+    # t=0's "A" is NaN: it's recorded before the first step ever applies a
+    # chemical field, so exclude it and compare the rest.
+    before_switch = df[(df["time"] > 0.0) & (df["time"] <= 0.5)]
+    after_switch = df[df["time"] > 0.5]
+    assert np.allclose(before_switch["A"], 1.0)
+    assert np.allclose(after_switch["A"], 9.0)

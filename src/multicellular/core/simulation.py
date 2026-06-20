@@ -35,14 +35,30 @@ class Simulation:
             record.update(cell.concentrations)
             self.history.append(record)
 
-    def run(self, show_progress=True):
-        """Step the colony from t=0 to t=t_max, recording state at every step."""
-        self.time = 0.0
-        self.history = []
-        self.record()
+    def run(self, show_progress=True, t_max=None):
+        """
+        Step the colony forward, recording state at every step.
 
+        On the first call, steps from t=0 to `t_max` (or `self.t_max` if
+        `t_max` is not given), recording the initial state first. Calling
+        `run` again continues from the current time instead of resetting
+        it, appending to the existing history — pass a new, larger `t_max`
+        to extend the simulated window. This supports e.g. switching the
+        colony's environment (via `colony.switch_environment`) partway
+        through a simulation and continuing it.
+        """
+        if t_max is not None:
+            self.t_max = t_max
+
+        if not self.history:
+            self.time = 0.0
+            self.record()
+
+        start_step = round(self.time / self.dt)
         n_steps = round(self.t_max / self.dt)
-        for step_index in tqdm(range(1, n_steps + 1), disable=not show_progress):
+        for step_index in tqdm(
+            range(start_step + 1, n_steps + 1), disable=not show_progress
+        ):
             self.colony.step(self.dt)
             self.time = step_index * self.dt
             self.record()

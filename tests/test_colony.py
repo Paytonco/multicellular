@@ -5,7 +5,7 @@ import pytest
 
 from multicellular.core.cell import Cell
 from multicellular.core.colony import Colony
-from multicellular.core.environment import Environment
+from multicellular.core.environment import Environment, Field
 
 
 def _make_cell(position):
@@ -149,6 +149,81 @@ def test_invalid_survival_condition_operator_raises():
 
     with pytest.raises(ValueError):
         Colony([cell], env, survival_conditions=[("A", "?!", 0)])
+
+
+def test_step_copies_chemical_field_value_into_cell_concentration():
+    values = np.zeros((10, 10))
+    values[5, 5] = 7.5  # cell at (50, 50) maps to grid index (5, 5)
+    field = Field("glucose", values, is_chemical=True)
+    env = Environment(shape=(10, 10), fields=[field])
+    cell = _make_cell([50.0, 50.0])
+
+    colony = Colony([cell], env)
+    colony.step(dt=0.1)
+
+    assert cell.concentrations["glucose"] == pytest.approx(7.5)
+
+
+def test_step_does_not_copy_non_chemical_field_into_concentrations():
+    field = Field("temperature", np.full((10, 10), 37.0), is_chemical=False)
+    env = Environment(shape=(10, 10), fields=[field])
+    cell = _make_cell([50.0, 50.0])
+
+    colony = Colony([cell], env)
+    colony.step(dt=0.1)
+
+    assert "temperature" not in cell.concentrations
+
+
+def test_step_chemical_field_overwrites_existing_concentration():
+    field = Field("A", np.full((10, 10), 3.0), is_chemical=True)
+    env = Environment(shape=(10, 10), fields=[field])
+    cell = _make_cell([50.0, 50.0])
+    cell.set_concentration("A", 0.0)
+
+    colony = Colony([cell], env)
+    colony.step(dt=0.1)
+
+    assert cell.concentrations["A"] == pytest.approx(3.0)
+
+
+def test_apply_chemical_fields_skips_dead_cells():
+    field = Field("A", np.full((10, 10), 3.0), is_chemical=True)
+    env = Environment(shape=(10, 10), fields=[field])
+    cell = _make_cell([50.0, 50.0])
+    cell.kill()
+
+    colony = Colony([cell], env)
+    colony.apply_chemical_fields()
+
+    assert "A" not in cell.concentrations
+
+
+def test_switch_environment_replaces_environment():
+    env = Environment(shape=(10, 10))
+    other_env = Environment(shape=(10, 10))
+    cell = _make_cell([50.0, 50.0])
+    colony = Colony([cell], env)
+
+    colony.switch_environment(other_env)
+
+    assert colony.environment is other_env
+
+
+def test_switch_environment_changes_chemical_field_sampled_on_next_step():
+    before = Field("A", np.full((10, 10), 1.0), is_chemical=True)
+    env_before = Environment(shape=(10, 10), fields=[before])
+    cell = _make_cell([50.0, 50.0])
+    colony = Colony([cell], env_before)
+    colony.step(dt=0.1)
+    assert cell.concentrations["A"] == pytest.approx(1.0)
+
+    after = Field("A", np.full((10, 10), 9.0), is_chemical=True)
+    env_after = Environment(shape=(10, 10), fields=[after])
+    colony.switch_environment(env_after)
+    colony.step(dt=0.1)
+
+    assert cell.concentrations["A"] == pytest.approx(9.0)
 
 
 def test_step_replaces_dividing_cell_with_daughters():

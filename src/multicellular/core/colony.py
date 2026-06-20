@@ -124,6 +124,17 @@ class Colony:
     def living_cells(self):
         return [cell for cell in self.cells if cell.alive]
 
+    def switch_environment(self, environment):
+        """
+        Replace the colony's environment with a new one.
+
+        Useful for simulating discrete induction/perturbation events
+        partway through a simulation (e.g. swapping in an environment whose
+        chemical fields represent an inducer being added to the medium),
+        without needing to recreate the colony or its cells.
+        """
+        self.environment = environment
+
     def step(self, dt):
         """Advance all cells by one timestep, then enforce bounds and divisions."""
         self.apply_chemical_fields()

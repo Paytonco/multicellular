@@ -44,6 +44,16 @@ def test_field_can_extend_beyond_bounds():
     assert env.bounds == (100.0, 100.0)
 
 
+def test_field_is_chemical_defaults_to_false():
+    field = Field("glucose", np.ones((10, 10)))
+    assert field.is_chemical is False
+
+
+def test_field_is_chemical_can_be_set_true():
+    field = Field("glucose", np.ones((10, 10)), is_chemical=True)
+    assert field.is_chemical is True
+
+
 def test_add_field_with_mismatched_shape_raises():
     env = Environment(shape=(10, 10))
     bad_field = Field("glucose", np.ones((5, 5)))

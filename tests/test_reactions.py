@@ -36,13 +36,43 @@ def test_hill_langmuir_rate():
     rxn = Reaction(
         reactants={"S": 1},
         products={"P": 1},
-        catalysts=["E"],
+        catalysts=["E", "Z"],
         rate_law_type="hill_langmuir",
-        rate_params={"Vmax": 1.0, "Kd": 1.0, "n": 2},
+        rate_params={"alpha": 2.0, "beta": 3.0, "C": 1.0, "n": 2},
     )
-    conc = {"S": 1.0, "E": 1.0}
+    conc = {"E": 1.0, "Z": 1.0}
     rate = rxn.rate(conc)
-    assert pytest.approx(rate, rel=1e-6) == 0.5
+    # beta * E * (1 + alpha * C * z^n) / (1 + C * z^n) = 3 * 1 * 3 / 2
+    assert pytest.approx(rate, rel=1e-6) == 4.5
+
+
+def test_hill_langmuir_rate_uses_first_two_catalysts_as_e_and_z():
+    rxn = Reaction(
+        reactants={"S": 1},
+        products={"P": 1},
+        catalysts=["E", "Z"],
+        rate_law_type="hill_langmuir",
+        rate_params={"alpha": 0.0, "beta": 2.0, "C": 1.0, "n": 1},
+    )
+    # alpha=0 collapses the rate to beta * E / (1 + C * z), independent of S.
+    conc = {"E": 5.0, "Z": 3.0}
+    rate = rxn.rate(conc)
+    assert pytest.approx(rate, rel=1e-6) == 2.0 * 5.0 / (1 + 1.0 * 3.0)
+
+
+@pytest.mark.parametrize("missing", ["alpha", "beta", "C", "n"])
+def test_hill_langmuir_missing_required_param_raises(missing):
+    rate_params = {"alpha": 1.0, "beta": 1.0, "C": 1.0, "n": 1.0}
+    del rate_params[missing]
+    rxn = Reaction(
+        reactants={"S": 1},
+        products={"P": 1},
+        catalysts=["E", "Z"],
+        rate_law_type="hill_langmuir",
+        rate_params=rate_params,
+    )
+    with pytest.raises(KeyError):
+        rxn.rate({"E": 1.0, "Z": 1.0})
 
 
 def test_stoichiometry_matrix():
