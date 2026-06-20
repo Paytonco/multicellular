@@ -105,14 +105,16 @@ class Reaction:
     def _hill_langmuir_rate(
         self, reactant_conc: Dict[str, float], catalyst_conc: Dict[str, float]
     ) -> float:
-        S = list(reactant_conc.values())[0] if reactant_conc else 0.0
-        E = list(catalyst_conc.values())[0] if catalyst_conc else 1.0
+        E = catalyst_conc.get(self.catalysts[0], 0.0)
+        z = catalyst_conc.get(self.catalysts[1], 0.0)
 
-        Vmax = self.rate_params.get("Vmax", 1.0)
-        Kd = self.rate_params.get("Kd", 1.0)
-        n = self.rate_params.get("n", 1.0)  # Hill coefficient
+        alpha = self.rate_params["alpha"]
+        beta = self.rate_params["beta"]
+        C = self.rate_params["C"]
+        n = self.rate_params["n"]  # Hill coefficient
 
-        return Vmax * E * (S**n) / (Kd**n + S**n)
+        Cz_n = C * z**n
+        return beta * E * (1 + alpha * Cz_n) / (1 + Cz_n)
 
     def get_stoichiometry_vector(self, species_list: List[str]) -> np.ndarray:
         """
