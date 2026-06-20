@@ -126,6 +126,7 @@ class Colony:
 
     def step(self, dt):
         """Advance all cells by one timestep, then enforce bounds and divisions."""
+        self.apply_chemical_fields()
         for cell in self.cells:
             cell.step(dt)
         self.enforce_bounds()
@@ -144,6 +145,24 @@ class Colony:
         j = int(np.clip(position[0] / width * shape[1], 0, shape[1] - 1))
         i = int(np.clip(position[1] / height * shape[0], 0, shape[0] - 1))
         return field_array[i, j]
+
+    def apply_chemical_fields(self):
+        """
+        Copy each chemical field's local value into every living cell as the
+        concentration of the chemical species sharing the field's name.
+        """
+        chemical_fields = [
+            field for field in self.environment.fields.values() if field.is_chemical
+        ]
+        if not chemical_fields:
+            return
+        for cell in self.cells:
+            if not cell.alive:
+                continue
+            for field in chemical_fields:
+                cell.concentrations[field.name] = self._sample_field(
+                    field.values, cell.position
+                )
 
     def _draw_brownian_noise(self, alive):
         """

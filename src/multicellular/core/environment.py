@@ -17,9 +17,10 @@ class Field:
     bounds (e.g. to provide a margin for future diffusion dynamics).
     """
 
-    def __init__(self, name, values):
+    def __init__(self, name, values, is_chemical=False):
         self.name = name
         self.values = np.asarray(values, dtype=float)
+        self.is_chemical = is_chemical
 
     @property
     def shape(self):
