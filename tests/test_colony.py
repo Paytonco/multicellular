@@ -81,6 +81,76 @@ def test_dead_cell_stays_dead_after_colony_step():
     assert cell.age == 0.0
 
 
+def test_survival_condition_kills_cell_when_violated():
+    env = Environment(shape=(10, 10))
+    cell = _make_cell([50.0, 50.0])
+    cell.set_concentration("A", 0.0)
+
+    colony = Colony([cell], env, survival_conditions=[("A", ">", 0)])
+    colony.step(dt=0.1)
+
+    assert not cell.alive
+
+
+def test_survival_condition_keeps_cell_alive_when_satisfied():
+    env = Environment(shape=(10, 10))
+    cell = _make_cell([50.0, 50.0])
+    cell.set_concentration("A", 1.0)
+
+    colony = Colony([cell], env, survival_conditions=[("A", ">", 0)])
+    colony.step(dt=0.1)
+
+    assert cell.alive
+
+
+def test_survival_conditions_any_violation_kills():
+    env = Environment(shape=(10, 10))
+    ok_cell = _make_cell([50.0, 50.0])
+    ok_cell.set_concentration("A", 1.0)
+    ok_cell.set_concentration("B", 1.0)
+
+    bad_cell = _make_cell([60.0, 60.0])
+    bad_cell.set_concentration("A", 1.0)
+    bad_cell.set_concentration("B", 20.0)  # violates the "B" < 10 condition
+
+    colony = Colony(
+        [ok_cell, bad_cell], env, survival_conditions=[("A", ">", 0), ("B", "<", 10)]
+    )
+    colony.step(dt=0.1)
+
+    assert ok_cell.alive
+    assert not bad_cell.alive
+
+
+def test_survival_condition_missing_species_defaults_to_zero():
+    env = Environment(shape=(10, 10))
+    cell = _make_cell([50.0, 50.0])  # never sets concentration "A"
+
+    colony = Colony([cell], env, survival_conditions=[("A", ">", 0)])
+    colony.step(dt=0.1)
+
+    assert not cell.alive
+
+
+def test_no_survival_conditions_is_a_no_op():
+    env = Environment(shape=(10, 10))
+    cell = _make_cell([50.0, 50.0])
+
+    colony = Colony([cell], env)
+    colony.step(dt=0.1)
+
+    assert cell.alive
+    assert colony.survival_conditions == []
+
+
+def test_invalid_survival_condition_operator_raises():
+    env = Environment(shape=(10, 10))
+    cell = _make_cell([50.0, 50.0])
+
+    with pytest.raises(ValueError):
+        Colony([cell], env, survival_conditions=[("A", "?!", 0)])
+
+
 def test_step_replaces_dividing_cell_with_daughters():
     env = Environment(shape=(20, 20))
     rng = np.random.default_rng(0)

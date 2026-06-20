@@ -15,8 +15,8 @@ tested:
 - Chemical reaction networks (mass-action, Michaelis-Menten, Hill-Langmuir,
   custom rate laws; forward-Euler ODE integration)
 - Environment with spatially-varying diffusivity and viscosity fields
-- Colony with overdamped-Langevin Brownian motion and Hookean cell-cell contact
-  forces and torques
+- Colony with overdamped-Langevin Brownian motion, Hookean cell-cell contact
+  forces and torques, and optional chemical survival conditions
 - Simulation loop with full history recording
 - 2D animation via `visualize()`
 
@@ -229,17 +229,32 @@ colony.step(dt=0.1)
   (force · time / length²). Sets the translational drag `ζ_t = drag * length`
   and rotational drag `ζ_r = (drag / 12) * length³`.
 
+It also accepts an optional **`survival_conditions`** parameter: a list of
+`(species, operator, threshold)` tuples, e.g. `[("A", ">", 0)]`. Every step,
+each living cell's concentration of `species` is compared against
+`threshold` using `operator` — one of `">"`, `">="`, `"<"`, `"<="`, `"=="`,
+`"!="` — and the cell dies as soon as any condition is violated. A species
+missing from a cell's concentrations is treated as `0.0`. With multiple
+conditions, a cell dies if *any* of them is violated:
+
+```python
+# Cells die once species "A" is depleted, or if "B" ever exceeds 10.
+colony = Colony(cells, env, survival_conditions=[("A", ">", 0), ("B", "<=", 10)])
+```
+
 `colony.step(dt)` performs the following operations in order:
 
 1. **Internal step** — calls `cell.step(dt)` for every cell (chemistry +
    growth).
 2. **Bounds enforcement** — kills any living cell whose center of mass lies
    outside `environment.BOUNDS`.
-3. **Brownian motion** — applies an overdamped-Langevin random kick to every
+3. **Survival conditions** — kills any living cell whose concentrations
+   violate a `survival_conditions` entry (no-op if none were given).
+4. **Brownian motion** — applies an overdamped-Langevin random kick to every
    surviving living cell (see [Brownian motion](#brownian-motion) below).
-4. **Contact forces** — applies pairwise Hookean repulsion and torques between
+5. **Contact forces** — applies pairwise Hookean repulsion and torques between
    all overlapping living cells (see [Contact forces](#contact-forces) below).
-5. **Division** — replaces any cell with `cell.ready_to_divide() == True` with
+6. **Division** — replaces any cell with `cell.ready_to_divide() == True` with
    its two daughter cells, each assigned a new unique `id`.
 
 `colony.living_cells` returns the cells that are still alive.

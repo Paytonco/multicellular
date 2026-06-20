@@ -1,6 +1,7 @@
 # core/colony.py
 
 import math
+import operator as _operator
 
 import numpy as np
 
@@ -9,6 +10,16 @@ from .environment import WATER_DIFFUSIVITY_37C
 _kBT = 1.380649e-23 * 310.15  # J  (k_B × 37°C)
 
 _PARALLEL_TOL = 1e-10  # denom threshold for segment-segment parallel detection
+
+# Comparison operators usable in a Colony survival condition, e.g. ("A", ">", 0).
+_COMPARISONS = {
+    ">": _operator.gt,
+    ">=": _operator.ge,
+    "<": _operator.lt,
+    "<=": _operator.le,
+    "==": _operator.eq,
+    "!=": _operator.ne,
+}
 
 
 def _segment_segment_closest(a1x, a1y, b1x, b1y, a2x, a2y, b2x, b2y):
@@ -72,7 +83,7 @@ class Colony:
     A collection of Cells living within an Environment.
     """
 
-    def __init__(self, cells, environment, k=10.0, drag=1.0):
+    def __init__(self, cells, environment, k=10.0, drag=1.0, survival_conditions=None):
         """
         Args:
             cells: initial list of Cell objects.
@@ -81,13 +92,33 @@ class Colony:
             drag: isotropic drag constant for contact dynamics.
                   Translational drag: ζ_t = drag * length.
                   Rotational drag:    ζ_r = (drag / 12) * length³.
+            survival_conditions: optional list of (species, operator, threshold)
+                tuples, e.g. [("A", ">", 0)]. Every step, each living cell's
+                concentration of `species` is compared against `threshold`
+                using `operator` (one of ">", ">=", "<", "<=", "==", "!=");
+                a cell dies as soon as any condition is violated. A species
+                missing from a cell's concentrations is treated as 0.0.
         """
         self.cells = list(cells)
         self.environment = environment
         self.k = k
         self.drag = drag
+        self.survival_conditions = self._validate_survival_conditions(
+            survival_conditions
+        )
         existing_ids = [cell.id for cell in self.cells if cell.id is not None]
         self._next_id = max(existing_ids, default=-1) + 1
+
+    @staticmethod
+    def _validate_survival_conditions(survival_conditions):
+        conditions = list(survival_conditions) if survival_conditions else []
+        for species, op, threshold in conditions:
+            if op not in _COMPARISONS:
+                raise ValueError(
+                    f"Unknown survival condition operator {op!r} for species "
+                    f"{species!r}; must be one of {sorted(_COMPARISONS)}."
+                )
+        return conditions
 
     @property
     def living_cells(self):
@@ -98,6 +129,7 @@ class Colony:
         for cell in self.cells:
             cell.step(dt)
         self.enforce_bounds()
+        self.enforce_survival_conditions()
         alive = self.living_cells
         noise = self._draw_brownian_noise(alive)
         for cell, xi in zip(alive, noise):
@@ -318,6 +350,19 @@ class Colony:
         for cell in self.cells:
             if cell.alive and not self.environment.in_bounds(cell.position):
                 cell.kill()
+
+    def enforce_survival_conditions(self):
+        """Kill any living cell whose concentrations violate a survival condition."""
+        if not self.survival_conditions:
+            return
+        for cell in self.cells:
+            if not cell.alive:
+                continue
+            for species, op, threshold in self.survival_conditions:
+                value = cell.concentrations.get(species, 0.0)
+                if not _COMPARISONS[op](value, threshold):
+                    cell.kill()
+                    break
 
     def handle_divisions(self):
         """Replace any cell ready to divide with its two daughter cells."""
