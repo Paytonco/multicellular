@@ -19,6 +19,8 @@ tested:
   forces and torques, and optional chemical survival conditions
 - Simulation loop with full history recording
 - 2D animation via `visualize()`
+- Running independent simulation replicates across multiple CPU cores via
+  `run_replicates()`
 
 Not yet implemented (see [Unimplemented / stubs](#unimplemented--stubs)): SBML
 import, reaction-diffusion field dynamics, and several visualization utilities.
@@ -35,7 +37,7 @@ pip install -e .
 
 This installs the `multicellular` package (from `src/multicellular`) in
 editable mode, along with its dependencies: `numpy`, `pandas`, `matplotlib`,
-`tqdm`, and `pillow`.
+`tqdm`, `pillow`, and `joblib`.
 
 ## Usage
 
@@ -379,6 +381,50 @@ values are `NaN` for cells/species that don't have that entry). The same data
 is also available via `sim.history` (a list of per-cell-per-timestep dicts)
 and `sim.to_dataframe()`.
 
+### `run_replicates`
+
+Stochasticity (division noise, Brownian motion, low-copy partitioning) means
+a single `Simulation` run is one sample from a distribution; studying that
+distribution means running many independent replicates. `run_replicates` runs
+each replicate's full simulation in its own OS process (via `joblib`), using
+all available CPU cores by default, and returns one combined DataFrame:
+
+```python
+from multicellular import Cell, Colony, Environment, run_replicates
+
+def build_colony(replicate_id):
+    import numpy as np
+    env = Environment(shape=(10, 10))
+    cell = Cell(
+        id=0,
+        position=[50.0, 50.0],
+        orientation=[1.0, 0.0],
+        rng=np.random.default_rng(replicate_id),  # distinct stream per replicate
+    )
+    return Colony([cell], env)
+
+df = run_replicates(build_colony, n_replicates=50, dt=0.01, t_max=10.0, n_jobs=-1)
+```
+
+- `build_colony(replicate_id)` is called once per replicate (inside its
+  worker process) and must return a fresh `Colony`. Give each cell's `rng`
+  a distinct seed (e.g. derived from `replicate_id`) so replicates don't
+  share — or accidentally duplicate — a random stream.
+- `n_jobs` is forwarded to `joblib.Parallel`; `-1` (the default) uses every
+  available core, and a smaller positive number caps how many to use.
+- The returned DataFrame is the concatenation of every replicate's
+  `Simulation.run()` output, with an added `replicate_id` column so rows
+  from different replicates can be told apart (each replicate also numbers
+  its own cells from `cell_id` 0 independently, so always group/filter by
+  `replicate_id` first when comparing across replicates).
+- This parallelizes *across* independent simulations only — it does not
+  speed up the internal step loop of any single simulation. A single
+  `Simulation.run()` call still runs single-process, exactly as before;
+  parallelism is strictly opt-in via `run_replicates`.
+- `show_progress` (default `False`) controls whether each individual
+  replicate's own `Simulation.run()` shows its tqdm bar; left on, bars from
+  different worker processes interleave and are hard to read.
+
 ### `visualize`
 
 ```python
@@ -467,5 +513,6 @@ pytest tests/test_reactions.py   # Reaction rate laws, stoichiometry, ODE steppi
 pytest tests/test_environment.py # Environment/Field construction and validation
 pytest tests/test_colony.py      # Colony bounds enforcement, division, and dead-cell behavior
 pytest tests/test_simulation.py  # Simulation loop and DataFrame export
+pytest tests/test_parallel.py    # run_replicates: parallel execution, independence, correctness
 pytest tests/test_dummy.py       # trivial sanity check
 ```
