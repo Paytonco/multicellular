@@ -1,6 +1,7 @@
 # test_cell.py
 
 import numpy as np
+import pytest
 
 from multicellular.core.cell import Cell
 
@@ -62,6 +63,86 @@ def test_basic_cell_behavior():
         )
     else:
         print("Division failed.")
+
+
+def test_grow_dilutes_concentration_conserving_copy_number():
+    cell = Cell(
+        id=1,
+        position=[0.0, 0.0],
+        orientation=[1.0, 0.0],
+        length=2.0,
+        radius=0.5,
+        growth_rate=np.log(2),
+    )
+    cell.set_concentration("A", 2.0)
+
+    volume_before = cell.compute_volume()
+    copy_number_before = 2.0 * volume_before
+
+    cell.grow(dt=0.1)
+
+    volume_after = cell.compute_volume()
+    assert volume_after > volume_before  # sanity check: cell actually grew
+    assert cell.concentrations["A"] * volume_after == pytest.approx(copy_number_before)
+    assert cell.concentrations["A"] < 2.0  # diluted, not conserved as-is
+
+
+def test_grow_with_zero_growth_rate_does_not_dilute():
+    cell = Cell(
+        id=1,
+        position=[0.0, 0.0],
+        orientation=[1.0, 0.0],
+        length=2.0,
+        radius=0.5,
+        growth_rate=0.0,
+    )
+    cell.set_concentration("A", 2.0)
+
+    cell.grow(dt=1.0)
+
+    assert cell.concentrations["A"] == pytest.approx(2.0)
+
+
+def test_grow_dilutes_multiple_species_independently():
+    cell = Cell(
+        id=1,
+        position=[0.0, 0.0],
+        orientation=[1.0, 0.0],
+        length=2.0,
+        radius=0.5,
+        growth_rate=np.log(2),
+    )
+    cell.set_concentration("A", 2.0)
+    cell.set_concentration("B", 5.0)
+
+    volume_before = cell.compute_volume()
+    copy_numbers_before = {"A": 2.0 * volume_before, "B": 5.0 * volume_before}
+
+    cell.grow(dt=0.1)
+
+    volume_after = cell.compute_volume()
+    for species, copy_number in copy_numbers_before.items():
+        assert cell.concentrations[species] * volume_after == pytest.approx(copy_number)
+
+
+def test_step_dilutes_after_growth_with_no_reaction_network():
+    cell = Cell(
+        id=1,
+        position=[0.0, 0.0],
+        orientation=[1.0, 0.0],
+        length=2.0,
+        radius=0.5,
+        network=None,
+        growth_rate=np.log(2),
+    )
+    cell.set_concentration("A", 2.0)
+    volume_before = cell.compute_volume()
+    copy_number_before = 2.0 * volume_before
+
+    cell.step(dt=0.1)
+
+    volume_after = cell.compute_volume()
+    assert cell.concentrations["A"] * volume_after == pytest.approx(copy_number_before)
 
 
 def test_divide_conserves_concentration_by_default():

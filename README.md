@@ -10,7 +10,8 @@ divides, diffuses, and pushes against its neighbors within a shared environment.
 This package is under active development. The following are implemented and
 tested:
 
-- Individual cells with geometry, growth, division, and internal reaction
+- Individual cells with geometry, growth (with continuous dilution of
+  concentrations as volume increases), division, and internal reaction
   networks
 - Chemical reaction networks (mass-action, Michaelis-Menten, Hill-Langmuir,
   custom rate laws; forward-Euler ODE integration)
@@ -117,6 +118,36 @@ cell.step(dt=0.1)
 print(cell.concentrations)
 ```
 
+### Dilution by growth
+
+Growth changes a cell's volume but not its molecule counts, so `cell.grow(dt)`
+holds each species' copy number (`concentration * volume`) fixed across the
+volume change: it computes every species' copy number at the pre-growth
+volume, grows `length` (and so volume), then divides those copy numbers by
+the new volume to get diluted concentrations. Since `cell.step(dt)` runs the
+reaction network's ODE step before calling `grow`, copy number changes from
+reactions and from growth-driven dilution are applied in two clearly
+separated stages each timestep — reactions are the only thing that changes
+copy number, growth only dilutes it:
+
+```python
+cell = Cell(id=0, position=[0.0, 0.0], orientation=[1.0, 0.0], length=2.0)
+cell.set_concentration("A", 1.0)
+
+volume_before = cell.compute_volume()
+cell.grow(dt=1.0)
+volume_after = cell.compute_volume()
+
+# Copy number is conserved; concentration drops as volume grows.
+assert cell.concentrations["A"] * volume_after == pytest.approx(1.0 * volume_before)
+```
+
+This is currently implemented with explicit multiply-then-divide arithmetic
+since concentrations are stored as continuous values (this is what the ODE
+and CLE simulation methods will need too); a future SSA implementation that
+tracks copy numbers directly would not need this conversion, since dilution
+would fall directly out of resampling propensities against the new volume.
+
 When a cell divides, each daughter receives its own cloned copy of the
 reaction network (`network.clone()`). For most species, concentration is
 conserved across division (each daughter inherits the parent's
@@ -168,6 +199,20 @@ env.get_field("glucose")
 
 Every `Field` added to an `Environment` must have a `values` matrix matching
 the environment's `shape`; adding a mismatched field raises `ValueError`.
+
+A `Field` also carries an `is_chemical` flag (default `False`). Fields marked
+`is_chemical=True` are treated as diffusible chemical species: at each
+timestep, `Colony` samples the field's local value at every living cell's
+position and writes it into that cell's `concentrations` under the field's
+`name`, overwriting any existing value for that species (see
+[`Colony`](#colony) below). This sampling happens both before and after each
+cell's internal step, so a chemical field's value is treated as an
+externally-imposed boundary condition: the cell's own growth (see
+[Dilution by growth](#dilution-by-growth) below) never dilutes it.
+
+```python
+glucose = Field("glucose", np.ones((10, 10)), is_chemical=True)
+```
 
 `Environment` also holds two spatial fields that describe the physical
 properties of the medium, each a 2D numpy array of the same `shape` as the
@@ -244,17 +289,26 @@ colony = Colony(cells, env, survival_conditions=[("A", ">", 0), ("B", "<=", 10)]
 
 `colony.step(dt)` performs the following operations in order:
 
-1. **Internal step** — calls `cell.step(dt)` for every cell (chemistry +
-   growth).
-2. **Bounds enforcement** — kills any living cell whose center of mass lies
+1. **Chemical fields** — for every `Field` on the environment with
+   `is_chemical=True`, samples its local value at each living cell's
+   position and sets that cell's concentration of the same-named species
+   (no-op if there are no chemical fields).
+2. **Internal step** — calls `cell.step(dt)` for every cell (chemistry +
+   growth). Growth dilutes every species in `concentrations`, including
+   ones just set from a chemical field in step 1.
+3. **Chemical fields (re-applied)** — repeats step 1, so each chemical
+   field's value overwrites whatever growth diluted it to in step 2. This
+   keeps the field's value pinned to the environment between steps; reactions
+   in step 2 already saw the correct, freshly-sampled value from step 1.
+4. **Bounds enforcement** — kills any living cell whose center of mass lies
    outside `environment.BOUNDS`.
-3. **Survival conditions** — kills any living cell whose concentrations
+5. **Survival conditions** — kills any living cell whose concentrations
    violate a `survival_conditions` entry (no-op if none were given).
-4. **Brownian motion** — applies an overdamped-Langevin random kick to every
+6. **Brownian motion** — applies an overdamped-Langevin random kick to every
    surviving living cell (see [Brownian motion](#brownian-motion) below).
-5. **Contact forces** — applies pairwise Hookean repulsion and torques between
+7. **Contact forces** — applies pairwise Hookean repulsion and torques between
    all overlapping living cells (see [Contact forces](#contact-forces) below).
-6. **Division** — replaces any cell with `cell.ready_to_divide() == True` with
+8. **Division** — replaces any cell with `cell.ready_to_divide() == True` with
    its two daughter cells, each assigned a new unique `id`.
 
 `colony.living_cells` returns the cells that are still alive.
@@ -263,6 +317,37 @@ Dead cells (`cell.alive == False`) are inert: `Cell.step`, `Cell.apply_force`,
 and `Cell.apply_torque` are all no-ops for them, and `Colony` skips both
 Brownian motion and contact forces for dead cells. Dead cells also never
 divide.
+
+#### Switching environments
+
+`colony.switch_environment(environment)` replaces the colony's `Environment`
+in place, without touching its cells. This is the mechanism for simulating a
+discrete event partway through a run — e.g. an inducer being added to the
+medium — by swapping in a new `Environment` whose chemical `Field`s (see
+[`Environment` and `Field`](#environment-and-field) above) represent the
+post-induction state:
+
+```python
+import numpy as np
+from multicellular import Cell, Colony, Environment, Field, Simulation
+
+env = Environment(shape=(10, 10))
+cell = Cell(id=0, position=[50.0, 50.0], orientation=[1.0, 0.0])
+colony = Colony([cell], env)
+
+sim = Simulation(colony, dt=0.1, t_max=5.0)
+sim.run()  # simulate before induction
+
+# At t=5.0, add an inducer (e.g. IPTG) uniformly across the medium.
+iptg = Field("IPTG", np.full((10, 10), 1.0), is_chemical=True)
+induced_env = Environment(shape=(10, 10), fields=[iptg])
+colony.switch_environment(induced_env)
+
+sim.run(t_max=10.0)  # continue simulating, with IPTG now present
+```
+
+See [`Simulation`](#simulation) below for how `sim.run()` continues from the
+current time and appends to the existing history rather than restarting.
 
 #### Brownian motion
 
@@ -378,6 +463,14 @@ column per chemical species seen in any cell's `concentrations` (missing
 values are `NaN` for cells/species that don't have that entry). The same data
 is also available via `sim.history` (a list of per-cell-per-timestep dicts)
 and `sim.to_dataframe()`.
+
+Calling `sim.run()` again continues the simulation instead of restarting it:
+it picks up from the current `sim.time` and appends new records to the
+existing `sim.history` rather than clearing it. Pass a new, larger `t_max` to
+extend how far it runs (`sim.run(t_max=...)`), e.g. to simulate further after
+calling `colony.switch_environment(...)` mid-simulation — see
+[Switching environments](#switching-environments) above. Calling `run()` a
+second time with the same `t_max` it already reached is a no-op.
 
 ### `visualize`
 

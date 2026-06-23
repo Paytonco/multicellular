@@ -140,6 +140,14 @@ class Colony:
         self.apply_chemical_fields()
         for cell in self.cells:
             cell.step(dt)
+        # Re-apply: a chemical field's value is an externally-imposed boundary
+        # condition, not a quantity the cell's own growth should dilute, but
+        # cell.step's growth phase dilutes every entry in `concentrations`
+        # indiscriminately. Re-sampling here corrects field-backed species
+        # back to the true environment value for this step's recorded state,
+        # while leaving the (correct, freshly-sampled) value reactions saw
+        # during this same step untouched.
+        self.apply_chemical_fields()
         self.enforce_bounds()
         self.enforce_survival_conditions()
         alive = self.living_cells

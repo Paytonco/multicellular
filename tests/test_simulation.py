@@ -104,7 +104,9 @@ def test_run_again_with_same_t_max_is_a_no_op():
 def test_run_continues_after_switching_environment():
     field_before = Field("A", np.full((10, 10), 1.0), is_chemical=True)
     env_before = Environment(shape=(10, 10), fields=[field_before])
-    cell = Cell(id=0, position=[50.0, 50.0], orientation=[1.0, 0.0])
+    # growth_rate=0.0 isolates this test from growth-driven dilution (see
+    # test_cell.py), so the recorded "A" reflects only the chemical field.
+    cell = Cell(id=0, position=[50.0, 50.0], orientation=[1.0, 0.0], growth_rate=0.0)
     colony = Colony([cell], env_before)
 
     sim = Simulation(colony, dt=0.1, t_max=0.5)

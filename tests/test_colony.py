@@ -8,13 +8,17 @@ from multicellular.core.colony import Colony
 from multicellular.core.environment import Environment, Field
 
 
-def _make_cell(position):
+def _make_cell(position, growth_rate=0.0):
+    # growth_rate=0.0 by default so mechanics/survival/field tests aren't
+    # entangled with growth-driven concentration dilution (see test_cell.py
+    # for dedicated dilution tests).
     return Cell(
         id=1,
         position=position,
         orientation=[1.0, 0.0],
         length=2.0,
         radius=0.5,
+        growth_rate=growth_rate,
     )
 
 
@@ -161,6 +165,22 @@ def test_step_copies_chemical_field_value_into_cell_concentration():
     colony = Colony([cell], env)
     colony.step(dt=0.1)
 
+    assert cell.concentrations["glucose"] == pytest.approx(7.5)
+
+
+def test_step_chemical_field_concentration_is_not_diluted_by_growth():
+    # growth_rate > 0 so the cell actually grows (and would dilute
+    # concentrations) within this single step.
+    field = Field("glucose", np.full((10, 10), 7.5), is_chemical=True)
+    env = Environment(shape=(10, 10), fields=[field])
+    cell = _make_cell([50.0, 50.0], growth_rate=np.log(2))
+
+    colony = Colony([cell], env)
+    volume_before = cell.compute_volume()
+    colony.step(dt=0.1)
+    volume_after = cell.compute_volume()
+
+    assert volume_after > volume_before  # sanity check: cell actually grew
     assert cell.concentrations["glucose"] == pytest.approx(7.5)
 
 

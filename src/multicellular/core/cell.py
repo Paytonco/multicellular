@@ -110,9 +110,22 @@ class Cell:
             self.low_copy_species.discard(chemical_species)
 
     def grow(self, dt):
-        """Grow exponentially by one timestep and age the cell."""
+        """
+        Grow exponentially by one timestep, age the cell, and dilute
+        concentrations accordingly.
+
+        Growth changes volume but not molecule count, so each species'
+        copy number (concentration * volume) is held fixed across the
+        volume change: copy numbers are computed at the pre-growth volume,
+        then divided by the post-growth volume to get diluted
+        concentrations. Reactions (run separately, in `step`) are the only
+        thing that changes copy number.
+        """
+        copy_numbers = {s: self.copy_number(s) for s in self.concentrations}
         self.length *= np.exp(self.growth_rate * dt)
         self.age += dt
+        volume = self.compute_volume()
+        self.concentrations = {s: n / volume for s, n in copy_numbers.items()}
 
     def step(self, dt):
         """Advance cell internal state (chemical + growth). No-op if dead."""

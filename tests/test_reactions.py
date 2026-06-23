@@ -121,7 +121,9 @@ def test_cell_with_reaction_network():
     )
     net = ReactionNetwork("linear", {"R": rxn})
 
-    # Create a cell with the network
+    # Create a cell with the network. growth_rate=0.0 keeps this test
+    # focused on reaction-driven conservation, undisturbed by growth-driven
+    # dilution (see test_cell.py for dedicated dilution tests).
     cell = Cell(
         id=0,
         position=[0.0, 0.0],
@@ -129,6 +131,7 @@ def test_cell_with_reaction_network():
         length=2.0,
         radius=0.5,
         network=net,
+        growth_rate=0.0,
     )
     cell.concentrations = {"A": 1.0, "B": 0.0}
 
