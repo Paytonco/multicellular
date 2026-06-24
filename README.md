@@ -210,7 +210,9 @@ position and writes it into that cell's `concentrations` under the field's
 [`Colony`](#colony) below). This sampling happens both before and after each
 cell's internal step, so a chemical field's value is treated as an
 externally-imposed boundary condition: the cell's own growth (see
-[Dilution by growth](#dilution-by-growth) below) never dilutes it.
+[Dilution by growth](#dilution-by-growth) below) never dilutes it. Every living
+cell's position is looked up in the field grid in one batched (vectorized)
+operation per field, rather than one Python-level lookup per cell.
 
 ```python
 glucose = Field("glucose", np.ones((10, 10)), is_chemical=True)
@@ -387,6 +389,11 @@ and the Brownian displacements are drawn as:
 where `û` is the cell's orientation unit vector, `û_⊥` is perpendicular to
 it, and `ξ_∥`, `ξ_⊥`, `ξ_rot` are independent standard-normal draws from the
 cell's own RNG. The position update is in μm and `dt` is in seconds.
+
+This whole pipeline — field sampling, drag/diffusion coefficients, and the
+displacement itself — runs as batched numpy array ops over every living cell
+at once, rather than a Python loop per cell; only the final position/torque
+write-back to each `Cell` is a (cheap) per-cell loop.
 
 #### Contact forces
 

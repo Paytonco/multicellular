@@ -152,18 +152,24 @@ class Colony:
         self.enforce_survival_conditions()
         alive = self.living_cells
         noise = self._draw_brownian_noise(alive)
-        for cell, xi in zip(alive, noise):
-            self._apply_brownian_motion(cell, dt, xi)
+        self._apply_brownian_motion(dt, alive, noise)
         self._apply_contact_forces(dt, alive)
         self.handle_divisions()
 
-    def _sample_field(self, field_array, position):
-        """Nearest-grid-point lookup of a field array at a position in μm."""
+    def _field_indices(self, positions):
+        """
+        Vectorized nearest-grid-point (row, col) indices for an (n, 2) array
+        of positions in μm.
+
+        Replaces what would otherwise be a per-position clip/divide/cast,
+        called once per cell per field per step; batching it into a single
+        pair of array ops removes that per-cell Python overhead.
+        """
         shape = self.environment.shape
         width, height = self.environment.bounds
-        j = int(np.clip(position[0] / width * shape[1], 0, shape[1] - 1))
-        i = int(np.clip(position[1] / height * shape[0], 0, shape[0] - 1))
-        return field_array[i, j]
+        j = np.clip((positions[:, 0] / width * shape[1]).astype(int), 0, shape[1] - 1)
+        i = np.clip((positions[:, 1] / height * shape[0]).astype(int), 0, shape[0] - 1)
+        return i, j
 
     def apply_chemical_fields(self):
         """
@@ -175,13 +181,15 @@ class Colony:
         ]
         if not chemical_fields:
             return
-        for cell in self.cells:
-            if not cell.alive:
-                continue
-            for field in chemical_fields:
-                cell.concentrations[field.name] = self._sample_field(
-                    field.values, cell.position
-                )
+        living = [cell for cell in self.cells if cell.alive]
+        if not living:
+            return
+        positions = np.array([cell.position for cell in living])
+        i_idx, j_idx = self._field_indices(positions)
+        for field in chemical_fields:
+            values = field.values[i_idx, j_idx]
+            for cell, value in zip(living, values):
+                cell.concentrations[field.name] = float(value)
 
     def _draw_brownian_noise(self, alive):
         """
@@ -212,53 +220,72 @@ class Colony:
                 noise[idx] = row
         return noise
 
-    def _apply_brownian_motion(self, cell, dt, xi):
+    def _apply_brownian_motion(self, dt, alive, noise):
         """
-        Apply overdamped-Langevin Brownian displacements to a living cell.
+        Apply overdamped-Langevin Brownian displacements to every living
+        cell, computing the per-cell drag/diffusion pipeline as batched
+        numpy array ops instead of one Python pass per cell.
 
         Uses slender-body drag for an anisotropic rod. Local viscosity and
-        diffusivity are sampled from the environment grid at the cell's
-        position. Spatial units are μm; dt is in seconds. `xi` is the
-        (parallel, perpendicular, rotational) standard-normal triple drawn
-        for this cell by `_draw_brownian_noise`.
+        diffusivity are sampled from the environment grid at each cell's
+        position. Spatial units are μm; dt is in seconds. `noise` is the
+        (n, 3) array of (parallel, perpendicular, rotational) standard-normal
+        triples drawn for `alive` by `_draw_brownian_noise`. Final position
+        and orientation writes are still a per-cell loop (each `Cell` owns
+        its own small position/orientation arrays), but that loop does no
+        further math — `cell.apply_torque` is reused as-is for the rotation
+        update.
         """
-        eta = self._sample_field(self.environment.eta, cell.position)
-        D_field = self._sample_field(self.environment.diffusivity, cell.position)
+        if not alive:
+            return
+
+        positions = np.array([cell.position for cell in alive])
+        lengths = np.array([cell.length for cell in alive])
+        radii = np.array([cell.radius for cell in alive])
+        orientations = np.array([cell.orientation for cell in alive])
+        xi = np.asarray(noise)
+
+        i_idx, j_idx = self._field_indices(positions)
+        eta = self.environment.eta[i_idx, j_idx]
+        D_field = self.environment.diffusivity[i_idx, j_idx]
 
         # Scale viscosity by local diffusivity relative to the reference medium
         # (Stokes-Einstein: η ∝ 1/D at fixed temperature and probe size).
         eta_local = eta * (WATER_DIFFUSIVITY_37C / D_field)
 
         # Cell geometry in SI (m)
-        L_eff = (cell.length + 2.0 * cell.radius) * 1e-6
-        r = cell.radius * 1e-6
-        ln_ratio = math.log(L_eff / r)  # ln(total length / radius), always > 0
+        L_eff = (lengths + 2.0 * radii) * 1e-6
+        r = radii * 1e-6
+        ln_ratio = np.log(L_eff / r)  # ln(total length / radius), always > 0
 
         # Slender-body drag coefficients
-        gamma_par = 2.0 * math.pi * eta_local * L_eff / ln_ratio  # kg/s
-        gamma_perp = 4.0 * math.pi * eta_local * L_eff / ln_ratio  # kg/s
-        gamma_rot = math.pi * eta_local * L_eff**3 / (3.0 * ln_ratio)  # kg·m²/s
+        gamma_par = 2.0 * np.pi * eta_local * L_eff / ln_ratio  # kg/s
+        gamma_perp = 4.0 * np.pi * eta_local * L_eff / ln_ratio  # kg/s
+        gamma_rot = np.pi * eta_local * L_eff**3 / (3.0 * ln_ratio)  # kg·m²/s
 
         # Diffusion coefficients via Einstein relation
         D_par = _kBT / gamma_par  # m²/s
         D_perp = _kBT / gamma_perp  # m²/s
         D_rot = _kBT / gamma_rot  # rad²/s
 
-        ux, uy = float(cell.orientation[0]), float(cell.orientation[1])
+        ux, uy = orientations[:, 0], orientations[:, 1]
         uperp_x, uperp_y = -uy, ux
-        xi_par, xi_perp, xi_rot = xi
+        xi_par, xi_perp, xi_rot = xi[:, 0], xi[:, 1], xi[:, 2]
 
-        s_par = math.sqrt(2.0 * D_par * dt)
-        s_perp = math.sqrt(2.0 * D_perp * dt)
+        s_par = np.sqrt(2.0 * D_par * dt)
+        s_perp = np.sqrt(2.0 * D_perp * dt)
 
         # Translational Brownian kick (convert m → μm)
         dr_x = (ux * xi_par * s_par + uperp_x * xi_perp * s_perp) * 1e6
         dr_y = (uy * xi_par * s_par + uperp_y * xi_perp * s_perp) * 1e6
-        cell.position[0] += dr_x
-        cell.position[1] += dr_y
 
         # Rotational Brownian kick
-        cell.apply_torque(xi_rot * math.sqrt(2.0 * D_rot / dt), dt)
+        omega = xi_rot * np.sqrt(2.0 * D_rot / dt)
+
+        for idx, cell in enumerate(alive):
+            cell.position[0] += dr_x[idx]
+            cell.position[1] += dr_y[idx]
+            cell.apply_torque(omega[idx], dt)
 
     def _build_spatial_grid(self, alive):
         """

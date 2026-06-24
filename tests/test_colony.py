@@ -1,11 +1,58 @@
 # tests/test_colony.py
 
+import copy
+import math
+
 import numpy as np
 import pytest
 
 from multicellular.core.cell import Cell
 from multicellular.core.colony import Colony
-from multicellular.core.environment import Environment, Field
+from multicellular.core.environment import WATER_DIFFUSIVITY_37C, Environment, Field
+
+_KBT = 1.380649e-23 * 310.15  # must match colony.py's _kBT
+
+
+def _reference_brownian_step(environment, cell, dt, xi):
+    """
+    Mirrors the original (pre-vectorization) per-cell scalar implementation
+    of Colony._apply_brownian_motion, to regression-test the vectorized
+    batch version against it.
+    """
+    shape = environment.shape
+    width, height = environment.bounds
+    j = int(np.clip(cell.position[0] / width * shape[1], 0, shape[1] - 1))
+    i = int(np.clip(cell.position[1] / height * shape[0], 0, shape[0] - 1))
+    eta = environment.eta[i, j]
+    D_field = environment.diffusivity[i, j]
+
+    eta_local = eta * (WATER_DIFFUSIVITY_37C / D_field)
+
+    L_eff = (cell.length + 2.0 * cell.radius) * 1e-6
+    r = cell.radius * 1e-6
+    ln_ratio = math.log(L_eff / r)
+
+    gamma_par = 2.0 * math.pi * eta_local * L_eff / ln_ratio
+    gamma_perp = 4.0 * math.pi * eta_local * L_eff / ln_ratio
+    gamma_rot = math.pi * eta_local * L_eff**3 / (3.0 * ln_ratio)
+
+    D_par = _KBT / gamma_par
+    D_perp = _KBT / gamma_perp
+    D_rot = _KBT / gamma_rot
+
+    ux, uy = float(cell.orientation[0]), float(cell.orientation[1])
+    uperp_x, uperp_y = -uy, ux
+    xi_par, xi_perp, xi_rot = xi
+
+    s_par = math.sqrt(2.0 * D_par * dt)
+    s_perp = math.sqrt(2.0 * D_perp * dt)
+
+    dr_x = (ux * xi_par * s_par + uperp_x * xi_perp * s_perp) * 1e6
+    dr_y = (uy * xi_par * s_par + uperp_y * xi_perp * s_perp) * 1e6
+    cell.position[0] += dr_x
+    cell.position[1] += dr_y
+
+    cell.apply_torque(xi_rot * math.sqrt(2.0 * D_rot / dt), dt)
 
 
 def _make_cell(position, growth_rate=0.0):
@@ -217,6 +264,76 @@ def test_apply_chemical_fields_skips_dead_cells():
     colony.apply_chemical_fields()
 
     assert "A" not in cell.concentrations
+
+
+def test_apply_brownian_motion_matches_reference_per_cell_formula():
+    # Non-uniform fields so each cell samples a different (eta, diffusivity)
+    # pair, exercising that the vectorized gather maps each cell to its own
+    # grid index rather than mixing values up across cells.
+    eta = np.array(
+        [
+            [1e-3, 2e-3, 3e-3, 4e-3],
+            [5e-3, 6e-3, 7e-3, 8e-3],
+            [9e-3, 1.0e-2, 1.1e-2, 1.2e-2],
+            [1.3e-2, 1.4e-2, 1.5e-2, 1.6e-2],
+        ]
+    )
+    diffusivity = 1e-9 * (1.0 + np.arange(16).reshape(4, 4))
+    env = Environment(
+        shape=(4, 4), bounds=(40.0, 40.0), eta=eta, diffusivity=diffusivity
+    )
+
+    cells = [
+        Cell(
+            id=0,
+            position=[10.0, 10.0],
+            orientation=[1.0, 0.0],
+            length=3.0,
+            radius=0.4,
+            growth_rate=0.0,
+        ),
+        Cell(
+            id=1,
+            position=[30.0, 5.0],
+            orientation=[0.0, 1.0],
+            length=5.0,
+            radius=0.6,
+            growth_rate=0.0,
+        ),
+        Cell(
+            id=2,
+            position=[15.0, 25.0],
+            orientation=[0.6, 0.8],
+            length=2.5,
+            radius=0.3,
+            growth_rate=0.0,
+        ),
+    ]
+    colony = Colony(cells, env)
+    noise = [
+        np.array([0.3, -0.2, 0.1]),
+        np.array([-0.4, 0.5, -0.3]),
+        np.array([0.7, 0.1, -0.6]),
+    ]
+    dt = 0.05
+
+    expected_cells = [copy.deepcopy(c) for c in cells]
+    for cell, xi in zip(expected_cells, noise):
+        _reference_brownian_step(env, cell, dt, xi)
+
+    colony._apply_brownian_motion(dt, colony.cells, noise)
+
+    for cell, expected in zip(colony.cells, expected_cells):
+        assert np.allclose(cell.position, expected.position)
+        assert np.allclose(cell.orientation, expected.orientation)
+
+
+def test_apply_brownian_motion_no_op_on_empty_alive_list():
+    env = Environment(shape=(4, 4))
+    colony = Colony([], env)
+
+    # Should not raise even though there are no cells to vectorize over.
+    colony._apply_brownian_motion(dt=0.1, alive=[], noise=[])
 
 
 def test_switch_environment_replaces_environment():
