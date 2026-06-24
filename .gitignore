@@ -3,3 +3,4 @@ __pycache__/
 .pytest_cache/
 try_visualize.py
 PARALLELIZATION_TODO.md
+.claude/
