@@ -14,7 +14,8 @@ tested:
   concentrations as volume increases), division, and internal reaction
   networks
 - Chemical reaction networks (mass-action, Michaelis-Menten, Hill-Langmuir,
-  custom rate laws; forward-Euler ODE integration)
+  custom rate laws), simulated via forward-Euler ODE, the chemical Langevin
+  equation (CLE), or Gillespie SSA
 - Environment with spatially-varying diffusivity and viscosity fields
 - Colony with overdamped-Langevin Brownian motion, Hookean cell-cell contact
   forces and torques, and optional chemical survival conditions
@@ -80,8 +81,10 @@ contact forces.
 
 `Reaction` supports `mass_action`, `michaelis_menten`, `hill_langmuir`, and
 `custom` rate laws. `ReactionNetwork` collects reactions, builds a
-stoichiometry matrix, and advances concentrations with a forward-Euler ODE
-step.
+stoichiometry matrix, and advances concentrations with one of three
+`simulation_method`s: `"ODE"` (forward Euler; the default), `"CLE"`
+(chemical Langevin equation), or `"SSA"` (Gillespie stochastic simulation
+algorithm).
 
 ```python
 from multicellular import ReactionNetwork
@@ -100,6 +103,55 @@ network = ReactionNetwork(name="linear", reactions={"R": rxn})
 state = {"A": 1.0, "B": 0.0}
 new_state = network.simulate_step(state, dt=0.1, volume=1.0)
 ```
+
+`simulate_step`'s signature is the same for every method: a concentration
+dict in, a concentration dict out (`{species: value}`, keyed by
+`network.species`). `volume` is the cell's current volume (held fixed across
+the call). `rng` (an optional `np.random.Generator`, used by `"CLE"` and
+`"SSA"`) defaults to a fresh `np.random.default_rng()` if omitted; `Cell.step`
+passes the cell's own `rng` so that one seed per `Cell` controls its entire
+stochastic trajectory — division and Brownian-motion noise as well as
+chemistry.
+
+```python
+network = ReactionNetwork(
+    name="linear", reactions={"R": rxn}, simulation_method="SSA"  # or "CLE"
+)
+new_state = network.simulate_step(state, dt=0.1, volume=1.0, rng=rng)
+```
+
+Every rate law (`mass_action`, `michaelis_menten`, `hill_langmuir`, `custom`)
+is defined in concentration space, the same as the ODE step. `"CLE"` and
+`"SSA"` both bridge from that to a per-reaction propensity (molecules/time)
+as `a_j = volume * v_j(concentration)`, reusing each reaction's existing
+`rate()` rather than separate count-based rate laws. For an elementary
+self-reaction like `2A -> B` this is a standard mean-field simplification of
+the textbook combinatorial SSA propensity (`k * n*(n-1)/volume`) — the same
+kind of approximation already implicit in non-elementary rate laws like
+Michaelis-Menten and Hill-Langmuir.
+
+- **`"CLE"`** stays in concentration space throughout: it takes one
+  Euler-Maruyama step,
+  ```
+  C_new = C + dt * (S @ v(C)) + sqrt(dt / volume) * (S @ (sqrt(v(C)) * ξ))
+  ```
+  where `S` is the stoichiometry matrix, `v(C)` is the same rate vector the
+  ODE step computes (clamped ≥ 0 before the square root), and `ξ` is one
+  standard-normal draw per reaction. The `1/sqrt(volume)` scaling means
+  smaller cells see proportionally larger relative noise. Like the ODE step,
+  the result is clipped at zero.
+- **`"SSA"`** is the only method that needs molecule counts. Internally, it
+  converts the incoming concentrations to integer counts (`round(concentration
+  * volume)`), runs the Gillespie direct method — repeatedly drawing an
+  exponential waiting time and a reaction choice weighted by propensity,
+  applying that reaction's stoichiometry, and advancing its own internal
+  clock — until the elapsed time would exceed `dt` (the pending reaction is
+  not fired; time simply advances to `dt` with the current state, per the
+  standard partial-step convention), then converts counts back to
+  concentrations before returning. This conversion is invisible to callers:
+  `Cell.step` and `Cell.grow`'s dilution logic (see
+  [Dilution by growth](#dilution-by-growth) above) work identically
+  regardless of `simulation_method`.
 
 ### Cell with an internal reaction network
 
@@ -144,11 +196,12 @@ volume_after = cell.compute_volume()
 assert cell.concentrations["A"] * volume_after == pytest.approx(1.0 * volume_before)
 ```
 
-This is currently implemented with explicit multiply-then-divide arithmetic
-since concentrations are stored as continuous values (this is what the ODE
-and CLE simulation methods will need too); a future SSA implementation that
-tracks copy numbers directly would not need this conversion, since dilution
-would fall directly out of resampling propensities against the new volume.
+This is implemented with explicit multiply-then-divide arithmetic, since
+`Cell.concentrations` is always a continuous concentration dict regardless of
+`simulation_method`. SSA tracks molecule counts internally during its own
+step (see [`Reaction` and `ReactionNetwork`](#reaction-and-reactionnetwork)
+below) but still hands back concentrations at the end of that step, so
+`grow`'s dilution logic is identical across `"ODE"`, `"CLE"`, and `"SSA"`.
 
 When a cell divides, each daughter receives its own cloned copy of the
 reaction network (`network.clone()`). For most species, concentration is
@@ -581,9 +634,6 @@ yourself (or run headlessly) if you only want the saved file.
 These pieces exist as placeholders (empty classes/functions or
 `NotImplementedError`) and are not yet usable:
 
-- **`ReactionNetwork.simulate_step`** with `simulation_method="SSA"` or
-  `"CLE"` — raises `NotImplementedError`. Only `"ODE"` (forward Euler) is
-  implemented.
 - **`ReactionNetwork.from_sbml`** and **`multicellular.parse_sbml`**
   (`utils/sbml_parser.py`) — raise `NotImplementedError` / are empty. Intended
   to construct a `ReactionNetwork` from an SBML model file.

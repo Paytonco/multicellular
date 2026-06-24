@@ -133,7 +133,7 @@ class Cell:
             return
         if self.network:
             self.concentrations = self.network.simulate_step(
-                self.concentrations, dt, self.compute_volume()
+                self.concentrations, dt, self.compute_volume(), rng=self.rng
             )
         self.grow(dt)
 

@@ -193,7 +193,11 @@ class ReactionNetwork:
         return S
 
     def simulate_step(
-        self, state: Dict[str, float], dt: float, volume: float
+        self,
+        state: Dict[str, float],
+        dt: float,
+        volume: float,
+        rng: np.random.Generator = None,
     ) -> Dict[str, float]:
         """
         Advance the chemical state by one time step using the specified simulation method.
@@ -202,6 +206,8 @@ class ReactionNetwork:
             state: dict of species → concentration
             dt: timestep size
             volume: cell volume (used for propensities in SSA/CLE)
+            rng: random generator used by SSA/CLE (ignored by ODE). Defaults
+                to a fresh `np.random.default_rng()` if not given.
 
         Returns:
             Updated concentration dictionary
@@ -210,11 +216,21 @@ class ReactionNetwork:
         if method == "ODE":
             return self._simulate_ode_step(state, dt)
         elif method == "SSA":
-            raise NotImplementedError("SSA method not implemented yet.")
+            return self._simulate_ssa_step(
+                state, dt, volume, rng or np.random.default_rng()
+            )
         elif method == "CLE":
-            raise NotImplementedError("CLE method not implemented yet.")
+            return self._simulate_cle_step(
+                state, dt, volume, rng or np.random.default_rng()
+            )
         else:
             raise ValueError(f"Unknown simulation method: {method}")
+
+    def _rate_vector(self, state: Dict[str, float]) -> np.ndarray:
+        """Evaluate every reaction's rate law against `state` (a concentration dict)."""
+        return np.array(
+            [self.reactions[rxn_name].rate(state) for rxn_name in self._reaction_names]
+        )
 
     def _simulate_ode_step(
         self, state: Dict[str, float], dt: float
@@ -223,12 +239,9 @@ class ReactionNetwork:
         Simple forward Euler ODE step.
         """
         species_list = self.species
-        reaction_list = self._reaction_names
         S = self._stoichiometry_matrix
 
-        v = np.array(
-            [self.reactions[rxn_name].rate(state) for rxn_name in reaction_list]
-        )  # Reaction rate vector
+        v = self._rate_vector(state)  # Reaction rate vector (concentration/time)
 
         x = np.array([state.get(s, 0.0) for s in species_list])
         dxdt = S @ v  # Matrix multiplication
@@ -237,6 +250,80 @@ class ReactionNetwork:
         return {
             s: max(x_new[i], 0.0) for i, s in enumerate(species_list)
         }  # Prevent negatives
+
+    def _simulate_ssa_step(
+        self,
+        state: Dict[str, float],
+        dt: float,
+        volume: float,
+        rng: np.random.Generator,
+    ) -> Dict[str, float]:
+        """
+        Gillespie direct-method SSA step, advancing exactly `dt`.
+
+        Reaction rate laws are defined in concentration space (same as ODE),
+        so propensities (molecules/time) are obtained by evaluating each
+        rate law against counts/volume and scaling by `volume`. Internally
+        this works in integer molecule counts; the incoming/outgoing state
+        is still a concentration dict, converted at the boundary via
+        `volume`, so callers (Cell.step) need no special handling.
+        """
+        species_list = self.species
+        S = self._stoichiometry_matrix
+        n_reactions = len(self._reaction_names)
+
+        counts = np.array(
+            [max(0, round(state.get(s, 0.0) * volume)) for s in species_list]
+        )
+
+        t = 0.0
+        while t < dt:
+            conc = {s: counts[i] / volume for i, s in enumerate(species_list)}
+            propensities = np.maximum(self._rate_vector(conc), 0.0) * volume
+            a0 = propensities.sum()
+
+            if a0 <= 0.0:
+                break
+
+            tau = rng.exponential(1.0 / a0)
+            if t + tau > dt:
+                break
+
+            j = rng.choice(n_reactions, p=propensities / a0)
+            counts = np.maximum(counts + S[:, j], 0.0)
+            t += tau
+
+        return {s: counts[i] / volume for i, s in enumerate(species_list)}
+
+    def _simulate_cle_step(
+        self,
+        state: Dict[str, float],
+        dt: float,
+        volume: float,
+        rng: np.random.Generator,
+    ) -> Dict[str, float]:
+        """
+        Chemical Langevin equation step (Euler-Maruyama), in concentration
+        space throughout. Derived from the standard count-space CLE
+        (dN = S.a(N) dt + S.sqrt(a(N)).dW) via the same propensity bridge
+        a(N) = volume * v(C) used by SSA, then dividing through by volume:
+
+            dC = S @ v(C) dt + (1 / sqrt(volume)) * S @ (sqrt(v(C)) * xi) * sqrt(dt)
+        """
+        species_list = self.species
+        S = self._stoichiometry_matrix
+        n_reactions = len(self._reaction_names)
+
+        x = np.array([state.get(s, 0.0) for s in species_list])
+        v = np.maximum(self._rate_vector(state), 0.0)
+
+        xi = rng.normal(size=n_reactions)
+        deterministic = S @ v
+        noise = S @ (np.sqrt(v) * xi)
+
+        x_new = x + dt * deterministic + np.sqrt(dt / volume) * noise
+
+        return {s: max(x_new[i], 0.0) for i, s in enumerate(species_list)}
 
     @classmethod
     def from_sbml(cls, file_path: str) -> "ReactionNetwork":

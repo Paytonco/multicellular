@@ -144,3 +144,142 @@ def test_cell_with_reaction_network():
         pytest.approx(cell.concentrations["A"] + cell.concentrations["B"], rel=1e-6)
         == 1.0
     )
+
+
+def _linear_ab_network(k=1.0, method="SSA"):
+    rxn = Reaction(
+        {"A": 1}, {"B": 1}, rate_law_type="mass_action", rate_params={"k": k}
+    )
+    return ReactionNetwork("linear", {"R": rxn}, simulation_method=method)
+
+
+def test_ssa_step_conserves_integer_counts():
+    net = _linear_ab_network(k=1.0, method="SSA")
+    volume = 10.0
+    state = {"A": 10.0, "B": 0.0}  # 100 copies of A, 0 of B
+    rng = np.random.default_rng(0)
+
+    new_state = net.simulate_step(state, dt=0.05, volume=volume, rng=rng)
+
+    count_a = new_state["A"] * volume
+    count_b = new_state["B"] * volume
+    assert count_a == pytest.approx(round(count_a), abs=1e-6)
+    assert count_b == pytest.approx(round(count_b), abs=1e-6)
+    assert count_a + count_b == pytest.approx(100.0, abs=1e-6)
+
+
+def test_ssa_step_zero_propensity_is_noop():
+    net = _linear_ab_network(k=1.0, method="SSA")
+    rng = np.random.default_rng(0)
+
+    new_state = net.simulate_step({"A": 0.0, "B": 0.0}, dt=1.0, volume=1.0, rng=rng)
+
+    assert new_state == {"A": 0.0, "B": 0.0}
+
+
+def test_ssa_step_matches_ode_mean():
+    k = 1.0
+    volume = 10.0
+    dt = 0.05
+    a0 = 100.0  # copies
+    net = _linear_ab_network(k=k, method="SSA")
+
+    n_reps = 3000
+    b_counts = np.empty(n_reps)
+    for i in range(n_reps):
+        rng = np.random.default_rng(i)
+        new_state = net.simulate_step(
+            {"A": a0 / volume, "B": 0.0}, dt=dt, volume=volume, rng=rng
+        )
+        b_counts[i] = new_state["B"] * volume
+
+    expected_b = a0 * (1.0 - np.exp(-k * dt))
+    assert np.mean(b_counts) == pytest.approx(expected_b, abs=1.0)
+
+
+def test_cle_step_conserves_mass_without_clipping():
+    net = _linear_ab_network(k=2.0, method="CLE")
+    # Large volume + small dt keeps the noise term well clear of the
+    # non-negativity clip, so conservation should hold (near-)exactly.
+    state = {"A": 4.0, "B": 1.0}
+    volume = 100.0
+    dt = 0.02
+
+    for seed in range(20):
+        rng = np.random.default_rng(seed)
+        new_state = net.simulate_step(state, dt=dt, volume=volume, rng=rng)
+        assert new_state["A"] + new_state["B"] == pytest.approx(5.0, abs=1e-9)
+
+
+def test_cle_step_matches_ode_mean_and_scales_noise_with_volume():
+    k = 2.0
+    state = {"A": 4.0, "B": 1.0}
+    dt = 0.02
+    net = _linear_ab_network(k=k, method="CLE")
+    n_reps = 3000
+
+    def run(volume):
+        b_vals = np.empty(n_reps)
+        for i in range(n_reps):
+            rng = np.random.default_rng(i)
+            new_state = net.simulate_step(state, dt=dt, volume=volume, rng=rng)
+            b_vals[i] = new_state["B"]
+        return b_vals
+
+    b_v1 = run(volume=100.0)
+    b_v2 = run(volume=400.0)  # 4x volume -> noise variance should drop ~4x
+
+    expected_b = state["B"] + dt * k * state["A"]
+    assert np.mean(b_v1) == pytest.approx(expected_b, abs=0.01)
+    assert np.mean(b_v2) == pytest.approx(expected_b, abs=0.01)
+
+    var_ratio = np.var(b_v2) / np.var(b_v1)
+    assert var_ratio == pytest.approx(0.25, rel=0.3)
+
+
+def test_cell_with_ssa_reaction_network():
+    net = _linear_ab_network(k=1.0, method="SSA")
+    cell = Cell(
+        id=0,
+        position=[0.0, 0.0],
+        orientation=[1.0, 0.0],
+        length=2.0,
+        radius=0.5,
+        network=net,
+        growth_rate=0.0,
+        rng=np.random.default_rng(0),
+    )
+    cell.concentrations = {"A": 1.0, "B": 0.0}
+
+    volume = cell.compute_volume()
+    expected_copies = round(1.0 * volume)  # initial concentration was 1.0
+    cell.step(dt=0.1)
+
+    assert cell.concentrations["A"] >= 0.0
+    assert cell.concentrations["B"] >= 0.0
+    total_copies = (cell.concentrations["A"] + cell.concentrations["B"]) * volume
+    assert total_copies == pytest.approx(expected_copies, abs=1e-6)
+
+
+def test_cell_with_cle_reaction_network():
+    net = _linear_ab_network(k=1.0, method="CLE")
+    cell = Cell(
+        id=0,
+        position=[0.0, 0.0],
+        orientation=[1.0, 0.0],
+        length=2.0,
+        radius=0.5,
+        network=net,
+        growth_rate=0.0,
+        rng=np.random.default_rng(0),
+    )
+    cell.concentrations = {"A": 1.0, "B": 0.0}
+
+    cell.step(dt=0.1)
+
+    assert cell.concentrations["A"] >= 0.0
+    assert cell.concentrations["B"] >= 0.0
+    assert (
+        pytest.approx(cell.concentrations["A"] + cell.concentrations["B"], abs=1e-6)
+        == 1.0
+    )
