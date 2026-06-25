@@ -261,6 +261,187 @@ def test_cell_with_ssa_reaction_network():
     assert total_copies == pytest.approx(expected_copies, abs=1e-6)
 
 
+def test_reaction_exports_defaults_to_empty():
+    rxn = Reaction(
+        {"A": 1}, {"B": 1}, rate_law_type="mass_action", rate_params={"k": 1}
+    )
+    assert rxn.exports == {}
+
+
+def test_reaction_exports_conflicting_with_products_raises():
+    with pytest.raises(ValueError):
+        Reaction(
+            reactants={"A": 1},
+            products={"B": 1},
+            exports={"B": 1},
+            rate_law_type="mass_action",
+            rate_params={"k": 1.0},
+        )
+
+
+def test_reaction_clone_carries_exports():
+    rxn = Reaction(
+        reactants={"X": 1},
+        products={},
+        exports={"X": 1},
+        rate_law_type="mass_action",
+        rate_params={"k": 1.0},
+    )
+    clone = rxn.clone()
+    assert clone.exports == {"X": 1}
+    clone.exports["X"] = 99  # mutating the clone must not affect the original
+    assert rxn.exports == {"X": 1}
+
+
+def test_get_export_vector():
+    rxn = Reaction(
+        reactants={"X": 1},
+        products={},
+        exports={"X": 1},
+        rate_law_type="mass_action",
+        rate_params={"k": 1.0},
+    )
+    assert list(rxn.get_export_vector(["W", "X", "Y"])) == [0, 1, 0]
+
+
+def _efflux_network(k=1.0, method="ODE"):
+    rxn = Reaction(
+        reactants={"X": 1},
+        products={},
+        exports={"X": 1},
+        rate_law_type="mass_action",
+        rate_params={"k": k},
+    )
+    return ReactionNetwork("efflux", {"R": rxn}, simulation_method=method)
+
+
+def test_reaction_network_computes_exported_species_and_matrix():
+    net = _efflux_network()
+    assert net.exported_species == ["X"]
+    assert list(net._export_stoichiometry_matrix[:, 0]) == [1]
+    assert net.last_exported == {"X": 0.0}
+
+
+def test_reaction_network_with_no_exports_has_empty_exported_species():
+    rxn = Reaction(
+        {"A": 1}, {"B": 1}, rate_law_type="mass_action", rate_params={"k": 1}
+    )
+    net = ReactionNetwork("simple", {"R": rxn})
+    assert net.exported_species == []
+    assert net.last_exported == {}
+
+
+def test_ode_efflux_conserves_mass_via_last_exported():
+    net = _efflux_network(k=1.0)
+    state = {"X": 1.0}
+    volume = 2.0
+    dt = 0.1
+
+    new_state = net.simulate_step(state, dt, volume)
+
+    lost = (state["X"] - new_state["X"]) * volume
+    assert net.last_exported["X"] == pytest.approx(lost, abs=1e-9)
+    assert net.last_exported["X"] > 0.0
+
+
+def test_ode_efflux_caps_export_at_available_pool_for_large_dt():
+    # k*dt = 10 means forward Euler would try to remove 10x the pool in one
+    # step; the per-reaction extent clamp must cap the export at exactly
+    # what's available, not at whatever the (overshooting) raw rate implies.
+    net = _efflux_network(k=100.0)
+    state = {"X": 0.05}
+    volume = 1.0
+    dt = 0.1
+
+    new_state = net.simulate_step(state, dt, volume)
+
+    assert new_state["X"] == pytest.approx(0.0, abs=1e-9)
+    # All available mass (0.05 * volume) should be exported, not more.
+    assert net.last_exported["X"] == pytest.approx(0.05 * volume, abs=1e-9)
+
+
+def test_ssa_efflux_conserves_mass_exactly():
+    net = _efflux_network(k=1.0, method="SSA")
+    state = {"X": 10.0}
+    volume = 10.0  # 100 copies
+    rng = np.random.default_rng(0)
+
+    new_state = net.simulate_step(state, dt=0.5, volume=volume, rng=rng)
+
+    remaining = new_state["X"] * volume
+    exported = net.last_exported["X"]
+    assert exported == pytest.approx(round(exported), abs=1e-9)
+    assert remaining + exported == pytest.approx(100.0, abs=1e-9)
+
+
+def test_ssa_efflux_stops_exporting_once_pool_is_empty():
+    net = _efflux_network(k=1.0, method="SSA")
+    rng = np.random.default_rng(0)
+
+    new_state = net.simulate_step({"X": 0.0}, dt=1.0, volume=1.0, rng=rng)
+
+    assert new_state["X"] == 0.0
+    assert net.last_exported["X"] == 0.0
+
+
+class _FixedNormalRNG:
+    """Stub rng whose .normal() always returns a fixed array, for
+    deterministically reproducing a specific CLE noise draw in tests."""
+
+    def __init__(self, values):
+        self._values = np.asarray(values, dtype=float)
+
+    def normal(self, size=None):
+        return self._values
+
+
+def test_cle_efflux_conserves_mass_with_large_destabilizing_noise():
+    # Regression test for a clipping-asymmetry bug: a large negative noise
+    # draw must not be able to increase the internal pool while exporting
+    # nothing (or vice versa) -- the shared extent clamp should make the
+    # reaction simply not fire instead.
+    net = _efflux_network(k=1.0, method="CLE")
+    state = {"X": 0.05}
+    volume = 1.0
+    dt = 0.02
+    rng = _FixedNormalRNG([-5.0])
+
+    new_state = net.simulate_step(state, dt, volume, rng=rng)
+
+    assert new_state["X"] == pytest.approx(0.05, abs=1e-9)
+    assert net.last_exported["X"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_cle_efflux_conserves_mass_across_many_noise_draws():
+    net = _efflux_network(k=2.0, method="CLE")
+    state = {"X": 4.0}
+    volume = 100.0
+    dt = 0.02
+
+    for seed in range(20):
+        rng = np.random.default_rng(seed)
+        new_state = net.simulate_step(state, dt=dt, volume=volume, rng=rng)
+        remaining = new_state["X"] * volume
+        exported = net.last_exported["X"]
+        assert remaining + exported == pytest.approx(state["X"] * volume, abs=1e-9)
+
+
+def test_cell_pending_export_populated_after_step():
+    net = _efflux_network(k=1.0)
+    cell = Cell(
+        id=0,
+        position=[0.0, 0.0],
+        orientation=[1.0, 0.0],
+        network=net,
+        growth_rate=0.0,
+    )
+    cell.concentrations = {"X": 1.0}
+
+    cell.step(dt=0.1)
+
+    assert cell.pending_export["X"] > 0.0
+
+
 def test_cell_with_cle_reaction_network():
     net = _linear_ab_network(k=1.0, method="CLE")
     cell = Cell(

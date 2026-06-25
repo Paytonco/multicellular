@@ -70,6 +70,9 @@ class Cell:
 
         self.low_copy_species = set()
         self.concentrations = {s: 0.0 for s in network.species} if network else {}
+        # Molecule counts exported (e.g. secreted) by the most recent step,
+        # awaiting deposit into the matching Field by Colony.export_chemical_fields.
+        self.pending_export = {}
 
     def _sample_division_target(self):
         """
@@ -135,6 +138,7 @@ class Cell:
             self.concentrations = self.network.simulate_step(
                 self.concentrations, dt, self.compute_volume(), rng=self.rng
             )
+            self.pending_export = self.network.last_exported
         self.grow(dt)
 
     def ready_to_divide(self):

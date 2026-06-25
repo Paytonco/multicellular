@@ -137,16 +137,20 @@ class Colony:
 
     def step(self, dt):
         """Advance all cells by one timestep, then enforce bounds and divisions."""
+        self.environment.diffuse(dt)
         self.apply_chemical_fields()
         for cell in self.cells:
             cell.step(dt)
+        self.export_chemical_fields()
         # Re-apply: a chemical field's value is an externally-imposed boundary
         # condition, not a quantity the cell's own growth should dilute, but
         # cell.step's growth phase dilutes every entry in `concentrations`
         # indiscriminately. Re-sampling here corrects field-backed species
         # back to the true environment value for this step's recorded state,
         # while leaving the (correct, freshly-sampled) value reactions saw
-        # during this same step untouched.
+        # during this same step untouched. Running after export_chemical_fields
+        # means a cell sensing the same field it just exported into sees this
+        # step's freshly-deposited mass.
         self.apply_chemical_fields()
         self.enforce_bounds()
         self.enforce_survival_conditions()
@@ -190,6 +194,42 @@ class Colony:
             values = field.values[i_idx, j_idx]
             for cell, value in zip(living, values):
                 cell.concentrations[field.name] = float(value)
+
+    def export_chemical_fields(self):
+        """
+        Deposit each living cell's pending reaction-network exports (set by
+        Cell.step from ReactionNetwork.last_exported) into the Field sharing
+        the exported species' name, converting molecule counts to a
+        concentration change via the environment's grid cell volume.
+
+        Validates every exported species against environment.fields before
+        writing anything, so a missing field raises ValueError without
+        partially mutating any field.
+        """
+        living = [cell for cell in self.cells if cell.alive and cell.pending_export]
+        if not living:
+            return
+
+        positions = np.array([cell.position for cell in living])
+        i_idx, j_idx = self._field_indices(positions)
+        grid_cell_volume = self.environment.grid_cell_volume
+
+        deltas = {}
+        for cell, i, j in zip(living, i_idx, j_idx):
+            for species, count in cell.pending_export.items():
+                if species not in self.environment.fields:
+                    raise ValueError(
+                        f"Cell {cell.id} exported species '{species}' but no "
+                        f"matching Field exists in the environment."
+                    )
+                delta = deltas.setdefault(species, np.zeros(self.environment.shape))
+                delta[i, j] += count / grid_cell_volume
+
+        for cell in living:
+            cell.pending_export = {}
+        for species, delta in deltas.items():
+            field = self.environment.get_field(species)
+            field.values = field.values + delta
 
     def _draw_brownian_noise(self, alive):
         """

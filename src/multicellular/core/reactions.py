@@ -35,6 +35,7 @@ class Reaction:
             ],
             float,
         ] = None,
+        exports: Dict[str, int] = None,
     ):
         self.reactants = reactants  # e.g., {"A": 1, "B": 2}
         self.products = products  # e.g., {"C": 1}
@@ -42,6 +43,11 @@ class Reaction:
         self.rate_law_type = rate_law_type
         self.rate_params = rate_params or {}
         self.custom_rate_law = custom_rate_law  # Optional user-defined function
+        # Stoichiometry that leaves the cell entirely (e.g. secretion) rather
+        # than being added back into intracellular state, e.g. {"X": 1}.
+        # Recommended pattern: reactants={"X": 1}, products={}, exports={"X": 1}
+        # (export a species that is also this reaction's sole reactant).
+        self.exports = exports or {}
 
         self._validate()
 
@@ -49,6 +55,12 @@ class Reaction:
         if self.rate_law_type == "custom" and self.custom_rate_law is None:
             raise ValueError(
                 "Custom rate law type specified but no custom_rate_law function provided."
+            )
+        if set(self.exports) & set(self.products):
+            raise ValueError(
+                "A species cannot be both a product and an export of the "
+                "same reaction (it would both stay in the cell and leave "
+                "it from a single reactant consumption)."
             )
 
     def rate(self, concentrations: Dict[str, float]) -> float:
@@ -131,6 +143,16 @@ class Reaction:
             delta[i] += self.products.get(species, 0) - self.reactants.get(species, 0)
         return delta
 
+    def get_export_vector(self, exported_species_list: List[str]) -> np.ndarray:
+        """
+        Return this reaction's export stoichiometry for a given species ordering.
+
+        Unlike `get_stoichiometry_vector`, this is pure outflow (no reactant
+        subtraction): it's the amount of each exported species that leaves
+        the cell per unit reaction extent.
+        """
+        return np.array([self.exports.get(s, 0) for s in exported_species_list])
+
     def clone(self):
         """Return a deep copy of the reaction (for cell division use cases)."""
         return Reaction(
@@ -140,12 +162,20 @@ class Reaction:
             rate_law_type=self.rate_law_type,
             rate_params=self.rate_params.copy(),
             custom_rate_law=self.custom_rate_law,
+            exports=self.exports.copy(),
         )
 
 
 class ReactionNetwork:
     """
     Represents a chemical reaction network with associated species and reactions.
+
+    Reactions may also export species to the cell's extracellular
+    environment (e.g. secretion): see `Reaction.exports`. The recommended
+    pattern for an export reaction is reactants={species: 1}, products={},
+    exports={species: 1} — exporting a species that is also that reaction's
+    sole reactant, so it's mass-conserving (the cell's own pool of that
+    species is depleted by exactly the amount that leaves).
     """
 
     def __init__(
@@ -155,6 +185,9 @@ class ReactionNetwork:
         self.reactions = reactions  # dict of name → Reaction
         self.simulation_method = simulation_method.upper()  # ODE, SSA, CLE
         self.species = self._extract_species()
+        self.exported_species = sorted(
+            {s for r in self.reactions.values() for s in r.exports}
+        )
 
         # Species/reaction ordering and the stoichiometry matrix are fixed for
         # the lifetime of this network (reactions/species don't change after
@@ -163,6 +196,15 @@ class ReactionNetwork:
         self._stoichiometry_matrix = self.get_stoichiometry_matrix(
             self.species, self._reaction_names
         )
+        self._export_stoichiometry_matrix = self.get_export_stoichiometry_matrix(
+            self.exported_species, self._reaction_names
+        )
+
+        # Molecule counts (not concentrations) exported by the most recent
+        # `simulate_step` call, keyed by exported species name. Set as a
+        # side effect of `simulate_step`; `Cell.step` reads it immediately
+        # after each call.
+        self.last_exported = {s: 0.0 for s in self.exported_species}
 
     def _extract_species(self) -> List[str]:
         species_set = set()
@@ -192,6 +234,20 @@ class ReactionNetwork:
             S[:, j] = rxn.get_stoichiometry_vector(species_list)
         return S
 
+    def get_export_stoichiometry_matrix(
+        self, exported_species_list: List[str], reaction_list: List[str]
+    ) -> np.ndarray:
+        """
+        Return the export stoichiometry matrix (rows = exported species,
+        columns = reactions), the export-side counterpart of
+        `get_stoichiometry_matrix`.
+        """
+        S_exp = np.zeros((len(exported_species_list), len(reaction_list)))
+        for j, rxn_name in enumerate(reaction_list):
+            rxn = self.reactions[rxn_name]
+            S_exp[:, j] = rxn.get_export_vector(exported_species_list)
+        return S_exp
+
     def simulate_step(
         self,
         state: Dict[str, float],
@@ -214,7 +270,7 @@ class ReactionNetwork:
         """
         method = self.simulation_method
         if method == "ODE":
-            return self._simulate_ode_step(state, dt)
+            return self._simulate_ode_step(state, dt, volume)
         elif method == "SSA":
             return self._simulate_ssa_step(
                 state, dt, volume, rng or np.random.default_rng()
@@ -232,8 +288,37 @@ class ReactionNetwork:
             [self.reactions[rxn_name].rate(state) for rxn_name in self._reaction_names]
         )
 
+    def _clamp_export_extents(
+        self, state: Dict[str, float], extent: np.ndarray
+    ) -> np.ndarray:
+        """
+        Clamp the per-reaction firing extent (concentration-equivalent
+        advancement, before stoichiometry is applied) of every export-tagged
+        reaction to [0, available reactant].
+
+        Export reactions are one-directional (a cell can't un-secrete), and
+        can't remove more of a reactant than the cell currently has. Doing
+        this clamp once, before deriving *both* the intracellular delta
+        (via `_stoichiometry_matrix`) and the exported delta (via
+        `_export_stoichiometry_matrix`) from the same `extent`, guarantees
+        the two stay exactly consistent — independently clipping the two
+        results afterward can otherwise let mass be created or destroyed
+        (e.g. CLE noise driving the aggregate exported amount negative,
+        clipped to 0, while the aggregate internal state isn't clipped).
+        """
+        for j, name in enumerate(self._reaction_names):
+            rxn = self.reactions[name]
+            if not rxn.exports:
+                continue
+            cap = min(
+                (state.get(s, 0.0) / stoich for s, stoich in rxn.reactants.items()),
+                default=np.inf,
+            )
+            extent[j] = min(max(extent[j], 0.0), cap)
+        return extent
+
     def _simulate_ode_step(
-        self, state: Dict[str, float], dt: float
+        self, state: Dict[str, float], dt: float, volume: float
     ) -> Dict[str, float]:
         """
         Simple forward Euler ODE step.
@@ -242,10 +327,15 @@ class ReactionNetwork:
         S = self._stoichiometry_matrix
 
         v = self._rate_vector(state)  # Reaction rate vector (concentration/time)
+        extent = self._clamp_export_extents(state, dt * v)
 
         x = np.array([state.get(s, 0.0) for s in species_list])
-        dxdt = S @ v  # Matrix multiplication
-        x_new = x + dt * dxdt
+        x_new = x + S @ extent
+
+        exported_delta = self._export_stoichiometry_matrix @ extent
+        self.last_exported = {
+            s: exported_delta[i] * volume for i, s in enumerate(self.exported_species)
+        }
 
         return {
             s: max(x_new[i], 0.0) for i, s in enumerate(species_list)
@@ -267,14 +357,21 @@ class ReactionNetwork:
         this works in integer molecule counts; the incoming/outgoing state
         is still a concentration dict, converted at the boundary via
         `volume`, so callers (Cell.step) need no special handling.
+
+        Exported molecule counts are tracked alongside `counts` during the
+        same firing loop, so they're exact by construction (each firing
+        moves an integer number of molecules from one bucket to the other;
+        no separate clamping is needed, unlike the ODE/CLE steps).
         """
         species_list = self.species
         S = self._stoichiometry_matrix
+        S_exp = self._export_stoichiometry_matrix
         n_reactions = len(self._reaction_names)
 
         counts = np.array(
             [max(0, round(state.get(s, 0.0) * volume)) for s in species_list]
         )
+        export_counts = np.zeros(len(self.exported_species))
 
         t = 0.0
         while t < dt:
@@ -291,8 +388,12 @@ class ReactionNetwork:
 
             j = rng.choice(n_reactions, p=propensities / a0)
             counts = np.maximum(counts + S[:, j], 0.0)
+            export_counts += S_exp[:, j]
             t += tau
 
+        self.last_exported = {
+            s: export_counts[i] for i, s in enumerate(self.exported_species)
+        }
         return {s: counts[i] / volume for i, s in enumerate(species_list)}
 
     def _simulate_cle_step(
@@ -318,10 +419,16 @@ class ReactionNetwork:
         v = np.maximum(self._rate_vector(state), 0.0)
 
         xi = rng.normal(size=n_reactions)
-        deterministic = S @ v
-        noise = S @ (np.sqrt(v) * xi)
+        extent = self._clamp_export_extents(
+            state, dt * v + np.sqrt(dt / volume) * (np.sqrt(v) * xi)
+        )
 
-        x_new = x + dt * deterministic + np.sqrt(dt / volume) * noise
+        x_new = x + S @ extent
+
+        exported_delta = self._export_stoichiometry_matrix @ extent
+        self.last_exported = {
+            s: exported_delta[i] * volume for i, s in enumerate(self.exported_species)
+        }
 
         return {s: max(x_new[i], 0.0) for i, s in enumerate(species_list)}
 

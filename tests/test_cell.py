@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from multicellular.core.cell import Cell
+from multicellular.core.reactions import Reaction, ReactionNetwork
 
 
 def _make_cell(rng=None):
@@ -143,6 +144,72 @@ def test_step_dilutes_after_growth_with_no_reaction_network():
 
     volume_after = cell.compute_volume()
     assert cell.concentrations["A"] * volume_after == pytest.approx(copy_number_before)
+
+
+def _efflux_network(k=1.0):
+    rxn = Reaction(
+        reactants={"X": 1},
+        products={},
+        exports={"X": 1},
+        rate_law_type="mass_action",
+        rate_params={"k": k},
+    )
+    return ReactionNetwork("efflux", {"R": rxn})
+
+
+def test_pending_export_defaults_to_empty():
+    cell = Cell(id=1, position=[0.0, 0.0], orientation=[1.0, 0.0], network=None)
+    assert cell.pending_export == {}
+
+
+def test_pending_export_populated_by_step_with_exporting_network():
+    cell = Cell(
+        id=1,
+        position=[0.0, 0.0],
+        orientation=[1.0, 0.0],
+        network=_efflux_network(),
+        growth_rate=0.0,
+    )
+    cell.set_concentration("X", 1.0)
+
+    cell.step(dt=0.1)
+
+    assert cell.pending_export["X"] > 0.0
+
+
+def test_pending_export_stays_empty_without_exports():
+    cell = Cell(
+        id=1,
+        position=[0.0, 0.0],
+        orientation=[1.0, 0.0],
+        network=ReactionNetwork(
+            "noop",
+            {
+                "R": Reaction(
+                    {"A": 1},
+                    {"B": 1},
+                    rate_law_type="mass_action",
+                    rate_params={"k": 1.0},
+                )
+            },
+        ),
+        growth_rate=0.0,
+    )
+    cell.set_concentration("A", 1.0)
+
+    cell.step(dt=0.1)
+
+    assert cell.pending_export == {}
+
+
+def test_daughters_start_with_fresh_pending_export():
+    cell = _make_cell(rng=np.random.default_rng(0))
+    cell.pending_export = {"X": 42.0}  # simulate a parent mid-export this step
+
+    d1, d2 = cell.divide()
+
+    assert d1.pending_export == {}
+    assert d2.pending_export == {}
 
 
 def test_divide_conserves_concentration_by_default():

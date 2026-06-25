@@ -16,16 +16,19 @@ tested:
 - Chemical reaction networks (mass-action, Michaelis-Menten, Hill-Langmuir,
   custom rate laws), simulated via forward-Euler ODE, the chemical Langevin
   equation (CLE), or Gillespie SSA
-- Environment with spatially-varying diffusivity and viscosity fields
+- Environment with spatially-varying diffusivity and viscosity fields, plus
+  per-field diffusion (a mass-conserving finite-difference solver) for any
+  `Field` marked `diffuses=True`
 - Colony with overdamped-Langevin Brownian motion, Hookean cell-cell contact
-  forces and torques, and optional chemical survival conditions
+  forces and torques, chemical field sensing and export (secretion), and
+  optional chemical survival conditions
 - Simulation loop with full history recording
 - 2D animation via `visualize()`
 - Running independent simulation replicates across multiple CPU cores via
   `run_replicates()`
 
 Not yet implemented (see [Unimplemented / stubs](#unimplemented--stubs)): SBML
-import, reaction-diffusion field dynamics, and several visualization utilities.
+import and several visualization utilities.
 
 ## Installation
 
@@ -153,6 +156,43 @@ Michaelis-Menten and Hill-Langmuir.
   [Dilution by growth](#dilution-by-growth) above) work identically
   regardless of `simulation_method`.
 
+#### Exporting species (secretion)
+
+A reaction can also export species out of the cell entirely, via an
+`exports` dict — the export-side counterpart of `products`: stoichiometry in
+`exports` leaves the cell instead of being added back to its
+`concentrations`. The recommended pattern is to export a species that's also
+the reaction's sole reactant, so the cell's own pool is depleted by exactly
+the amount that leaves:
+
+```python
+# X leaves the cell at rate k * [X] (mass-conserving efflux).
+efflux = Reaction(
+    reactants={"X": 1},
+    products={},
+    exports={"X": 1},
+    rate_law_type="mass_action",
+    rate_params={"k": 0.5},
+)
+```
+
+`simulate_step`'s signature/return value (just the concentration dict) is
+unchanged by this. The molecule count exported by the most recent call is
+available as `network.last_exported` (a dict keyed by exported species
+name), which `Cell.step` copies into `cell.pending_export` for `Colony` to
+deposit into a `Field` — see
+[Secretion (chemical export)](#secretion-chemical-export) below.
+
+All three simulation methods keep the exported amount exactly consistent
+with what's actually removed from the cell: for `"ODE"`/`"CLE"`, each export
+reaction's per-step "firing extent" is clamped to `[0, available reactant]`
+once, and *both* the intracellular delta and the exported delta are derived
+from that same clamped value — clipping the two results independently
+afterward instead could let CLE noise (or a forward-Euler overshoot at large
+`dt`) silently create or destroy mass. For `"SSA"`, exported counts are
+tracked exactly during the same firing loop that updates intracellular
+counts, so they're exact by construction.
+
 ### Cell with an internal reaction network
 
 A `Cell` can be given a `ReactionNetwork`; calling `cell.step(dt)` advances
@@ -238,9 +278,8 @@ inherited by both daughters.
 
 `Environment` represents the shared extracellular space as a collection of
 named `Field`s — matrices of values over a shared grid (e.g. chemical
-concentrations, temperature, surface roughness). Reaction-diffusion dynamics
-are not implemented yet; for now `Environment` is just a validated container
-for fields.
+concentrations, temperature, surface roughness), validating that every field
+added matches its grid `shape`.
 
 ```python
 import numpy as np
@@ -271,12 +310,43 @@ operation per field, rather than one Python-level lookup per cell.
 glucose = Field("glucose", np.ones((10, 10)), is_chemical=True)
 ```
 
+#### Field diffusion
+
+A `Field` can also be marked `diffuses=True`, with a required per-field
+`diffusivity` (m²/s — the diffusion coefficient of that specific chemical
+species; see the note below on how this differs from `Environment`'s own
+`diffusivity` grid):
+
+```python
+glucose = Field("glucose", np.ones((10, 10)), diffuses=True, diffusivity=3e-9)
+```
+
+Each `colony.step(dt)` calls `environment.diffuse(dt)`, which advances every
+diffusive field under the 2D diffusion equation `∂C/∂t = D∇²C` using an
+explicit centered-difference (FTCS) scheme with no-flux (Neumann)
+boundaries, so each field's total amount is conserved rather than leaking
+out at the grid edges. FTCS is only numerically stable for a sufficiently
+small `dt` relative to the grid spacing and `D`; rather than require the
+caller to pick a stable `dt`, `diffuse` automatically subdivides it into
+however many equal sub-steps the stability bound
+`dt <= dx²dy² / (2D(dx²+dy²))` requires, so it stays numerically stable
+regardless of the timestep used elsewhere in the simulation.
+
+```python
+env = Environment(shape=(10, 10), fields=[glucose])
+env.diffuse(dt=0.1)  # also called automatically by Colony.step
+```
+
 `Environment` also holds two spatial fields that describe the physical
 properties of the medium, each a 2D numpy array of the same `shape` as the
 grid:
 
-- **`diffusivity`** (m²/s): local solute diffusivity. Defaults to a constant
-  matrix filled with the diffusivity of water at 37°C (3.0 × 10⁻⁹ m²/s).
+- **`diffusivity`** (m²/s): local solute diffusivity *of the medium itself*
+  (used to scale viscosity for Brownian motion — a different quantity from a
+  `Field`'s own `diffusivity`, which is the diffusion coefficient of one
+  specific chemical species; see [Field diffusion](#field-diffusion) above).
+  Defaults to a constant matrix filled with the diffusivity of water at 37°C
+  (3.0 × 10⁻⁹ m²/s).
 - **`eta`** (Pa·s): local dynamic viscosity. Defaults to a constant matrix
   filled with the viscosity of water at 37°C (6.9 × 10⁻⁴ Pa·s).
 
@@ -300,12 +370,68 @@ env = Environment(shape=(10, 10), eta=eta)
 env = Environment(shape=(10, 10), diffusivity=D, eta=eta)
 ```
 
-`Environment.BOUNDS` is currently hardcoded to `(100.0, 100.0)`, representing
-a 100 μm × 100 μm square that cells will interact within (this will be made
-configurable later). A field's grid `shape` is independent of `BOUNDS` and
-may cover an area larger than the simulation bounds. `env.in_bounds(position)`
-checks whether a 2D position (e.g. a cell's center of mass) falls within
-`[0, BOUNDS[0]] × [0, BOUNDS[1]]`.
+`Environment.bounds` defaults to `(100.0, 100.0)`, representing a 100 μm ×
+100 μm square that cells interact within, but is configurable via the
+`bounds=` constructor argument. A field's grid `shape` is independent of
+`bounds` and may cover an area larger than the simulation bounds.
+`env.in_bounds(position)` checks whether a 2D position (e.g. a cell's center
+of mass) falls within `[0, bounds[0]] × [0, bounds[1]]`.
+
+`Environment` also takes a `depth` (μm, default `1.0` — twice the default
+`Cell` radius of 0.5 μm, i.e. sized for a single-cell-thick microfluidics
+monolayer). Together with the grid spacing implied by `shape` and `bounds`,
+this gives every grid cell a well-defined physical volume via the
+`grid_cell_volume` property (`dx * dy * depth`, in μm³, matching
+`Cell.compute_volume()`'s units) — used to convert molecule counts secreted
+by cells into a field concentration change; see
+[Secretion (chemical export)](#secretion-chemical-export) below.
+
+```python
+env = Environment(shape=(10, 10), bounds=(50.0, 50.0), depth=1.0)
+env.grid_cell_volume  # dx * dy * depth = 5.0 * 5.0 * 1.0 = 25.0 μm³
+```
+
+#### Secretion (chemical export)
+
+Cells can export (secrete) a chemical species into the matching-named
+`Field` by including an export reaction in their `ReactionNetwork` — see
+[Exporting species (secretion)](#exporting-species-secretion) above for how
+to define one. Every `colony.step(dt)`, after each cell's internal step,
+`colony.export_chemical_fields()` deposits whatever each cell exported into
+the `Field` sharing that species' name, at the cell's nearest grid point
+(summing contributions from multiple cells that map to the same grid cell),
+converting the exported molecule count to a Δconcentration via
+`environment.grid_cell_volume`:
+
+```python
+import numpy as np
+from multicellular import Cell, Colony, Environment, Field, ReactionNetwork
+from multicellular.core.reactions import Reaction
+
+efflux = Reaction(
+    reactants={"X": 1}, products={}, exports={"X": 1},
+    rate_law_type="mass_action", rate_params={"k": 0.5},
+)
+network = ReactionNetwork("efflux", {"R": efflux})
+
+cell = Cell(id=0, position=[50.0, 50.0], orientation=[1.0, 0.0], network=network)
+cell.set_concentration("X", 1.0)
+
+field = Field("X", np.zeros((10, 10)))  # secretion sink
+env = Environment(shape=(10, 10), fields=[field])
+colony = Colony([cell], env)
+
+colony.step(dt=0.1)
+print(cell.concentrations["X"], field.values[5, 5])  # X left the cell, appeared in the field
+```
+
+If a cell exports a species with no matching `Field` in the environment,
+`export_chemical_fields` raises `ValueError` — validated for every exporting
+cell before any field is mutated, so a missing field never causes a partial
+deposit. The target field doesn't need `is_chemical=True` (that flag only
+controls whether `Colony` *senses* the field back into cells — an orthogonal
+concern from whether it can receive secretion) or `diffuses=True`, though
+combining both lets secreted material spread spatially on subsequent steps.
 
 ### `Colony`
 
@@ -346,27 +472,36 @@ colony = Colony(cells, env, survival_conditions=[("A", ">", 0), ("B", "<=", 10)]
 
 `colony.step(dt)` performs the following operations in order:
 
-1. **Chemical fields** — for every `Field` on the environment with
+1. **Diffusion** — calls `environment.diffuse(dt)`, advancing every field
+   with `diffuses=True` (no-op if there are none; see
+   [Field diffusion](#field-diffusion) above).
+2. **Chemical fields** — for every `Field` on the environment with
    `is_chemical=True`, samples its local value at each living cell's
    position and sets that cell's concentration of the same-named species
    (no-op if there are no chemical fields).
-2. **Internal step** — calls `cell.step(dt)` for every cell (chemistry +
+3. **Internal step** — calls `cell.step(dt)` for every cell (chemistry +
    growth). Growth dilutes every species in `concentrations`, including
-   ones just set from a chemical field in step 1.
-3. **Chemical fields (re-applied)** — repeats step 1, so each chemical
-   field's value overwrites whatever growth diluted it to in step 2. This
+   ones just set from a chemical field in step 2.
+4. **Chemical export** — calls `export_chemical_fields()`, depositing
+   whatever each cell exported this step into the matching `Field` (no-op if
+   no cell exported anything; see
+   [Secretion (chemical export)](#secretion-chemical-export) above).
+5. **Chemical fields (re-applied)** — repeats step 2, so each chemical
+   field's value overwrites whatever growth diluted it to in step 3. This
    keeps the field's value pinned to the environment between steps; reactions
-   in step 2 already saw the correct, freshly-sampled value from step 1.
-4. **Bounds enforcement** — kills any living cell whose center of mass lies
-   outside `environment.BOUNDS`.
-5. **Survival conditions** — kills any living cell whose concentrations
+   in step 3 already saw the correct, freshly-sampled value from step 2.
+   Running after step 4 means a cell sensing the same field it just exported
+   into sees this step's freshly-deposited mass.
+6. **Bounds enforcement** — kills any living cell whose center of mass lies
+   outside `environment.bounds`.
+7. **Survival conditions** — kills any living cell whose concentrations
    violate a `survival_conditions` entry (no-op if none were given).
-6. **Brownian motion** — applies an overdamped-Langevin random kick to every
+8. **Brownian motion** — applies an overdamped-Langevin random kick to every
    surviving living cell (see [Brownian motion](#brownian-motion) below).
-7. **Contact forces** — applies pairwise Hookean repulsion and torques between
+9. **Contact forces** — applies pairwise Hookean repulsion and torques between
    all overlapping living cells (see [Contact forces](#contact-forces) below).
-8. **Division** — replaces any cell with `cell.ready_to_divide() == True` with
-   its two daughter cells, each assigned a new unique `id`.
+10. **Division** — replaces any cell with `cell.ready_to_divide() == True` with
+    its two daughter cells, each assigned a new unique `id`.
 
 `colony.living_cells` returns the cells that are still alive.
 
@@ -606,7 +741,7 @@ visualize(sim, red="A", green="B", interval=200)
   species' maximum value over the whole simulation. Channels left as `None`
   default to a constant mid-gray value.
 - Dead cells stop appearing in the frame after they die.
-- The region outside `environment.BOUNDS` is tinted red.
+- The region outside `environment.bounds` is tinted red.
 - `interval` is the delay between frames in milliseconds.
 
 Every frame (all cell shapes, colors, and the `t = ...` title) is rendered to
@@ -658,10 +793,10 @@ pytest
 Run a specific test file:
 
 ```bash
-pytest tests/test_cell.py        # Cell geometry, growth, and division
-pytest tests/test_reactions.py   # Reaction rate laws, stoichiometry, ODE stepping, Cell + ReactionNetwork integration
-pytest tests/test_environment.py # Environment/Field construction and validation
-pytest tests/test_colony.py      # Colony bounds enforcement, division, and dead-cell behavior
+pytest tests/test_cell.py        # Cell geometry, growth, division, and pending chemical export
+pytest tests/test_reactions.py   # Reaction rate laws, stoichiometry, ODE/SSA/CLE stepping, export-reaction mass conservation
+pytest tests/test_environment.py # Environment/Field construction, validation, diffusion, and grid cell volume
+pytest tests/test_colony.py      # Colony bounds enforcement, division, dead-cell behavior, field sensing/diffusion/export
 pytest tests/test_simulation.py  # Simulation loop and DataFrame export
 pytest tests/test_parallel.py    # run_replicates: parallel execution, independence, correctness
 pytest tests/test_dummy.py       # trivial sanity check

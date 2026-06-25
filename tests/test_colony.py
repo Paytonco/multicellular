@@ -9,6 +9,7 @@ import pytest
 from multicellular.core.cell import Cell
 from multicellular.core.colony import Colony
 from multicellular.core.environment import WATER_DIFFUSIVITY_37C, Environment, Field
+from multicellular.core.reactions import Reaction, ReactionNetwork
 
 _KBT = 1.380649e-23 * 310.15  # must match colony.py's _kBT
 
@@ -231,6 +232,20 @@ def test_step_chemical_field_concentration_is_not_diluted_by_growth():
     assert cell.concentrations["glucose"] == pytest.approx(7.5)
 
 
+def test_step_diffuses_diffusive_fields():
+    values = np.zeros((10, 10))
+    values[5, 5] = 100.0
+    field = Field("glucose", values, is_chemical=True, diffuses=True, diffusivity=1e-9)
+    env = Environment(shape=(10, 10), bounds=(50.0, 50.0), fields=[field])
+    cell = _make_cell([50.0, 50.0])
+
+    colony = Colony([cell], env)
+    colony.step(dt=0.5)
+
+    assert field.values[5, 5] < 100.0
+    assert field.values[4, 5] > 0.0
+
+
 def test_step_does_not_copy_non_chemical_field_into_concentrations():
     field = Field("temperature", np.full((10, 10), 37.0), is_chemical=False)
     env = Environment(shape=(10, 10), fields=[field])
@@ -252,6 +267,112 @@ def test_step_chemical_field_overwrites_existing_concentration():
     colony.step(dt=0.1)
 
     assert cell.concentrations["A"] == pytest.approx(3.0)
+
+
+def _efflux_network(k=1.0, species="X"):
+    rxn = Reaction(
+        reactants={species: 1},
+        products={},
+        exports={species: 1},
+        rate_law_type="mass_action",
+        rate_params={"k": k},
+    )
+    return ReactionNetwork("efflux", {"R": rxn})
+
+
+def _make_exporting_cell(position, species="X", concentration=1.0, k=1.0):
+    cell = Cell(
+        id=1,
+        position=position,
+        orientation=[1.0, 0.0],
+        length=2.0,
+        radius=0.5,
+        network=_efflux_network(k=k, species=species),
+        growth_rate=0.0,
+    )
+    cell.set_concentration(species, concentration)
+    return cell
+
+
+def test_export_chemical_fields_deposits_into_matching_field():
+    field = Field("X", np.zeros((10, 10)))
+    env = Environment(shape=(10, 10), bounds=(50.0, 50.0), depth=2.0, fields=[field])
+    cell = _make_cell([25.0, 25.0])
+    cell.pending_export = {"X": 10.0}  # molecules
+
+    colony = Colony([cell], env)
+    colony.export_chemical_fields()
+
+    # grid index for (25,25): dx=dy=5 -> (i,j)=(5,5); grid_cell_volume = 5*5*2=50
+    assert field.values[5, 5] == pytest.approx(10.0 / 50.0)
+    assert cell.pending_export == {}
+
+
+def test_export_chemical_fields_sums_contributions_at_same_grid_point():
+    field = Field("X", np.zeros((10, 10)))
+    env = Environment(shape=(10, 10), bounds=(50.0, 50.0), depth=2.0, fields=[field])
+    cell1 = _make_cell([25.0, 25.0])
+    cell2 = _make_cell([26.0, 26.0])  # same grid cell as cell1
+    cell1.pending_export = {"X": 10.0}
+    cell2.pending_export = {"X": 5.0}
+
+    colony = Colony([cell1, cell2], env)
+    colony.export_chemical_fields()
+
+    assert field.values[5, 5] == pytest.approx(15.0 / 50.0)
+
+
+def test_export_chemical_fields_is_noop_when_nothing_pending():
+    field = Field("X", np.zeros((10, 10)))
+    env = Environment(shape=(10, 10), fields=[field])
+    cell = _make_cell([25.0, 25.0])  # pending_export defaults to {}
+
+    colony = Colony([cell], env)
+    colony.export_chemical_fields()  # must not raise on the empty-living-list path
+
+    assert np.array_equal(field.values, np.zeros((10, 10)))
+
+
+def test_export_chemical_fields_raises_for_unmapped_species_without_mutating_fields():
+    field = Field("Y", np.zeros((10, 10)))
+    env = Environment(shape=(10, 10), fields=[field])
+    cell = _make_cell([25.0, 25.0])
+    cell.pending_export = {"X": 10.0}  # no Field named "X" exists
+
+    colony = Colony([cell], env)
+    with pytest.raises(ValueError):
+        colony.export_chemical_fields()
+
+    assert np.array_equal(field.values, np.zeros((10, 10)))
+
+
+def test_step_exports_efflux_into_field_and_depletes_cell():
+    field = Field("X", np.zeros((10, 10)))
+    env = Environment(shape=(10, 10), bounds=(50.0, 50.0), fields=[field])
+    cell = _make_exporting_cell([25.0, 25.0], concentration=1.0, k=1.0)
+
+    colony = Colony([cell], env)
+    colony.step(dt=0.1)
+
+    assert cell.concentrations["X"] < 1.0
+    assert field.values[5, 5] > 0.0
+
+
+def test_step_conserves_mass_across_cell_and_field():
+    field = Field("X", np.zeros((10, 10)))
+    env = Environment(shape=(10, 10), bounds=(50.0, 50.0), depth=2.0, fields=[field])
+    cell = _make_exporting_cell([25.0, 25.0], concentration=1.0, k=1.0)
+    volume = cell.compute_volume()
+    initial_copies = 1.0 * volume
+
+    colony = Colony([cell], env)
+    colony.step(dt=0.1)
+
+    remaining_copies = cell.concentrations["X"] * cell.compute_volume()
+    deposited_copies = field.values[5, 5] * env.grid_cell_volume
+    assert remaining_copies + deposited_copies == pytest.approx(
+        initial_copies, abs=1e-9
+    )
 
 
 def test_apply_chemical_fields_skips_dead_cells():
