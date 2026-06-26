@@ -159,6 +159,7 @@ def visualize(
     save_path=None,
     filename=_DEFAULT_FILENAME,
     show_progress=True,
+    stride=1,
 ):
     """
     Show a 2D animation of a Simulation's cells over time in a pop-up window.
@@ -181,6 +182,9 @@ def visualize(
         filename: File name to save under, within `save_path`. Defaults to
             "simulation.gif".
         show_progress: Whether to show a progress bar while rendering frames.
+        stride: Only render every `stride`-th recorded time step (default 1 =
+            every step). Use stride > 1 to produce a shorter GIF without
+            re-running the simulation.
 
     Returns:
         The `matplotlib.animation.FuncAnimation` driving the pop-up window.
@@ -193,7 +197,7 @@ def visualize(
         if species is not None and species in df.columns:
             scales[species] = df[species].max()
 
-    times = sorted(df["time"].unique())
+    times = sorted(df["time"].unique())[::stride]
 
     frames = _render_frames(
         df, times, environment, red, green, blue, scales, show_progress
