@@ -7,19 +7,19 @@ from multicellular.core.environment import Environment, Field
 
 
 def test_environment_default_bounds_are_100_by_100():
-    env = Environment(shape=(10, 10))
+    env = Environment("env", shape=(10, 10))
     assert env.bounds == (100.0, 100.0)
 
 
 def test_environment_bounds_can_be_specified():
-    env = Environment(shape=(10, 10), bounds=(20.0, 20.0))
+    env = Environment("env", shape=(10, 10), bounds=(20.0, 20.0))
     assert env.bounds == (20.0, 20.0)
     assert env.in_bounds([10.0, 10.0])
     assert not env.in_bounds([50.0, 50.0])
 
 
 def test_add_and_get_field():
-    env = Environment(shape=(10, 10))
+    env = Environment("env", shape=(10, 10))
     field = Field("glucose", np.ones((10, 10)))
 
     env.add_field(field)
@@ -30,7 +30,7 @@ def test_add_and_get_field():
 
 def test_environment_constructor_accepts_fields():
     field = Field("temperature", np.zeros((5, 5)))
-    env = Environment(shape=(5, 5), fields=[field])
+    env = Environment("env", shape=(5, 5), fields=[field])
 
     assert env.get_field("temperature") is field
 
@@ -38,10 +38,15 @@ def test_environment_constructor_accepts_fields():
 def test_field_can_extend_beyond_bounds():
     # Field grid shape is independent of the (100, 100) simulation bounds.
     field = Field("roughness", np.zeros((200, 200)))
-    env = Environment(shape=(200, 200), fields=[field])
+    env = Environment("env", shape=(200, 200), fields=[field])
 
     assert env.get_field("roughness").shape == (200, 200)
     assert env.bounds == (100.0, 100.0)
+
+
+def test_environment_name_is_stored():
+    env = Environment("LB medium", shape=(10, 10))
+    assert env.name == "LB medium"
 
 
 def test_field_is_chemical_defaults_to_false():
@@ -55,7 +60,7 @@ def test_field_is_chemical_can_be_set_true():
 
 
 def test_add_field_with_mismatched_shape_raises():
-    env = Environment(shape=(10, 10))
+    env = Environment("env", shape=(10, 10))
     bad_field = Field("glucose", np.ones((5, 5)))
 
     with pytest.raises(ValueError):
@@ -66,7 +71,7 @@ def test_constructor_with_mismatched_field_shape_raises():
     bad_field = Field("glucose", np.ones((5, 5)))
 
     with pytest.raises(ValueError):
-        Environment(shape=(10, 10), fields=[bad_field])
+        Environment("env", shape=(10, 10), fields=[bad_field])
 
 
 def test_field_diffuses_defaults_to_false():
@@ -93,7 +98,7 @@ def test_field_diffuses_true_stores_diffusivity():
 
 def test_diffuse_is_no_op_when_no_diffusive_fields():
     field = Field("temperature", np.full((5, 5), 37.0))
-    env = Environment(shape=(5, 5), fields=[field])
+    env = Environment("env", shape=(5, 5), fields=[field])
 
     env.diffuse(1.0)
 
@@ -104,7 +109,7 @@ def test_diffuse_leaves_uniform_field_unchanged():
     # A spatially-uniform field has zero Laplacian everywhere, so diffusion
     # should not change it (no-flux boundaries; nothing to spread).
     field = Field("glucose", np.full((10, 10), 3.0), diffuses=True, diffusivity=1e-9)
-    env = Environment(shape=(10, 10), bounds=(50.0, 50.0), fields=[field])
+    env = Environment("env", shape=(10, 10), bounds=(50.0, 50.0), fields=[field])
 
     env.diffuse(1.0)
 
@@ -117,7 +122,7 @@ def test_diffuse_conserves_total_mass():
     rng = np.random.default_rng(0)
     values = rng.uniform(0.0, 10.0, size=(10, 10))
     field = Field("glucose", values, diffuses=True, diffusivity=1e-9)
-    env = Environment(shape=(10, 10), bounds=(50.0, 50.0), fields=[field])
+    env = Environment("env", shape=(10, 10), bounds=(50.0, 50.0), fields=[field])
 
     total_before = field.values.sum()
     env.diffuse(2.0)
@@ -133,7 +138,7 @@ def test_diffuse_spreads_a_point_source_toward_its_neighbors():
     values = np.zeros((11, 11))
     values[5, 5] = 100.0
     field = Field("glucose", values, diffuses=True, diffusivity=1e-9)
-    env = Environment(shape=(11, 11), bounds=(55.0, 55.0), fields=[field])
+    env = Environment("env", shape=(11, 11), bounds=(55.0, 55.0), fields=[field])
 
     env.diffuse(0.005)
 
@@ -153,7 +158,10 @@ def test_diffuse_only_advances_fields_with_diffuses_true():
         "glucose", diffusing_values, diffuses=True, diffusivity=1e-9
     )
     env = Environment(
-        shape=(10, 10), bounds=(50.0, 50.0), fields=[static_field, diffusing_field]
+        "env",
+        shape=(10, 10),
+        bounds=(50.0, 50.0),
+        fields=[static_field, diffusing_field],
     )
 
     env.diffuse(0.5)
@@ -163,24 +171,24 @@ def test_diffuse_only_advances_fields_with_diffuses_true():
 
 
 def test_environment_depth_defaults_to_1um():
-    env = Environment(shape=(10, 10))
+    env = Environment("env", shape=(10, 10))
     assert env.depth == 1.0
 
 
 def test_environment_depth_can_be_overridden():
-    env = Environment(shape=(10, 10), depth=2.5)
+    env = Environment("env", shape=(10, 10), depth=2.5)
     assert env.depth == 2.5
 
 
 def test_environment_depth_must_be_positive():
     with pytest.raises(ValueError):
-        Environment(shape=(10, 10), depth=0.0)
+        Environment("env", shape=(10, 10), depth=0.0)
     with pytest.raises(ValueError):
-        Environment(shape=(10, 10), depth=-1.0)
+        Environment("env", shape=(10, 10), depth=-1.0)
 
 
 def test_grid_cell_volume_computes_dx_dy_depth():
-    env = Environment(shape=(10, 5), bounds=(100.0, 50.0), depth=2.0)
+    env = Environment("env", shape=(10, 5), bounds=(100.0, 50.0), depth=2.0)
     # dx = 100/10 = 10, dy = 50/5 = 10, depth = 2 -> volume = 10*10*2 = 200
     assert env.grid_cell_volume == pytest.approx(200.0)
 
@@ -192,7 +200,7 @@ def test_diffuse_is_stable_for_a_large_dt_via_substepping():
     values = np.zeros((10, 10))
     values[5, 5] = 100.0
     field = Field("glucose", values, diffuses=True, diffusivity=1e-9)
-    env = Environment(shape=(10, 10), bounds=(20.0, 20.0), fields=[field])
+    env = Environment("env", shape=(10, 10), bounds=(20.0, 20.0), fields=[field])
 
     env.diffuse(100.0)
 

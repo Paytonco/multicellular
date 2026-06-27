@@ -50,7 +50,7 @@ def _channel_value(row, species, scale):
     return float(np.clip(value / scale, 0.0, 1.0))
 
 
-def _render_frames(df, times, environment, red, green, blue, scales, show_progress):
+def _render_frames(df, times, env_by_time, red, green, blue, scales, show_progress):
     """
     Render every animation frame to an in-memory RGBA image up front.
 
@@ -59,7 +59,8 @@ def _render_frames(df, times, environment, red, green, blue, scales, show_progre
     means displaying (or saving) the animation afterward is just fast image
     blitting, regardless of how large the colony grows.
     """
-    width, height = environment.bounds
+    first_env = next(iter(env_by_time.values()))
+    width, height = first_env.bounds
     pad = max(width, height) * 0.1
     x_min = min(0.0, df["position_x"].min()) - pad
     x_max = max(width, df["position_x"].max()) + pad
@@ -121,7 +122,9 @@ def _render_frames(df, times, environment, red, green, blue, scales, show_progre
                 ax.add_patch(patch)
                 cell_polygons.append(patch)
 
-        ax.set_title(f"t = {t:.2f}")
+        env = env_by_time.get(t, first_env)
+        ax.set_title(env.name, loc="left")
+        ax.set_title(f"t = {t:.2f}", loc="right")
         fig.canvas.draw()
         frames.append(np.asarray(fig.canvas.buffer_rgba()).copy())
 
@@ -190,7 +193,7 @@ def visualize(
         The `matplotlib.animation.FuncAnimation` driving the pop-up window.
     """
     df = simulation.to_dataframe()
-    environment = simulation.colony.environment
+    env_by_time = {t: env for t, env in simulation.env_history}
 
     scales = {}
     for species in (red, green, blue):
@@ -200,7 +203,7 @@ def visualize(
     times = sorted(df["time"].unique())[::stride]
 
     frames = _render_frames(
-        df, times, environment, red, green, blue, scales, show_progress
+        df, times, env_by_time, red, green, blue, scales, show_progress
     )
 
     if save_path is not None:

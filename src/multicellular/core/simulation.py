@@ -17,9 +17,11 @@ class Simulation:
         self.t_max = t_max
         self.time = 0.0
         self.history = []
+        self.env_history = []
 
     def record(self):
-        """Record the current state of every cell in the colony."""
+        """Record the current state of every cell and the active environment."""
+        self.env_history.append((self.time, self.colony.environment))
         for cell in self.colony.cells:
             record = {
                 "time": self.time,

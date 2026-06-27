@@ -281,12 +281,16 @@ named `Field`s — matrices of values over a shared grid (e.g. chemical
 concentrations, temperature, surface roughness), validating that every field
 added matches its grid `shape`.
 
+Every `Environment` requires a `name` string as its first argument. The name
+identifies the medium or experimental condition and is displayed on the
+top-left of every animation frame produced by `visualize()`.
+
 ```python
 import numpy as np
 from multicellular import Environment, Field
 
 glucose = Field("glucose", np.ones((10, 10)))
-env = Environment(shape=(10, 10), fields=[glucose])
+env = Environment("LB medium", shape=(10, 10), fields=[glucose])
 
 env.get_field("glucose")
 ```
@@ -333,7 +337,7 @@ however many equal sub-steps the stability bound
 regardless of the timestep used elsewhere in the simulation.
 
 ```python
-env = Environment(shape=(10, 10), fields=[glucose])
+env = Environment("LB medium", shape=(10, 10), fields=[glucose])
 env.diffuse(dt=0.1)  # also called automatically by Colony.step
 ```
 
@@ -359,15 +363,15 @@ import numpy as np
 from multicellular import Environment
 
 # Defaults: uniform water at 37°C
-env = Environment(shape=(10, 10))
+env = Environment("M9 minimal", shape=(10, 10))
 
 # Spatially-varying viscosity (e.g. a gel region in the upper half)
 eta = np.full((10, 10), 6.9e-4)
 eta[:5, :] = 5e-3  # more viscous upper half
-env = Environment(shape=(10, 10), eta=eta)
+env = Environment("gel slab", shape=(10, 10), eta=eta)
 
 # Both fields can be set independently
-env = Environment(shape=(10, 10), diffusivity=D, eta=eta)
+env = Environment("custom medium", shape=(10, 10), diffusivity=D, eta=eta)
 ```
 
 `Environment.bounds` defaults to `(100.0, 100.0)`, representing a 100 μm ×
@@ -387,7 +391,7 @@ by cells into a field concentration change; see
 [Secretion (chemical export)](#secretion-chemical-export) below.
 
 ```python
-env = Environment(shape=(10, 10), bounds=(50.0, 50.0), depth=1.0)
+env = Environment("LB medium", shape=(10, 10), bounds=(50.0, 50.0), depth=1.0)
 env.grid_cell_volume  # dx * dy * depth = 5.0 * 5.0 * 1.0 = 25.0 μm³
 ```
 
@@ -418,7 +422,7 @@ cell = Cell(id=0, position=[50.0, 50.0], orientation=[1.0, 0.0], network=network
 cell.set_concentration("X", 1.0)
 
 field = Field("X", np.zeros((10, 10)))  # secretion sink
-env = Environment(shape=(10, 10), fields=[field])
+env = Environment("LB medium", shape=(10, 10), fields=[field])
 colony = Colony([cell], env)
 
 colony.step(dt=0.1)
@@ -440,7 +444,7 @@ A `Colony` is a collection of `Cell`s living in an `Environment`:
 ```python
 from multicellular import Cell, Colony, Environment
 
-env = Environment(shape=(10, 10))
+env = Environment("LB medium", shape=(10, 10))
 cells = [Cell(id=0, position=[10.0, 10.0], orientation=[1.0, 0.0])]
 
 colony = Colony(cells, env)
@@ -523,7 +527,7 @@ post-induction state:
 import numpy as np
 from multicellular import Cell, Colony, Environment, Field, Simulation
 
-env = Environment(shape=(10, 10))
+env = Environment("uninduced", shape=(10, 10))
 cell = Cell(id=0, position=[50.0, 50.0], orientation=[1.0, 0.0])
 colony = Colony([cell], env)
 
@@ -532,7 +536,7 @@ sim.run()  # simulate before induction
 
 # At t=5.0, add an inducer (e.g. IPTG) uniformly across the medium.
 iptg = Field("IPTG", np.full((10, 10), 1.0), is_chemical=True)
-induced_env = Environment(shape=(10, 10), fields=[iptg])
+induced_env = Environment("+ IPTG", shape=(10, 10), fields=[iptg])
 colony.switch_environment(induced_env)
 
 sim.run(t_max=10.0)  # continue simulating, with IPTG now present
@@ -643,7 +647,7 @@ chemical concentrations at every timestep:
 ```python
 from multicellular import Cell, Colony, Environment, Simulation
 
-env = Environment(shape=(10, 10))
+env = Environment("LB medium", shape=(10, 10))
 cell = Cell(id=0, position=[50.0, 50.0], orientation=[1.0, 0.0])
 colony = Colony([cell], env)
 
@@ -661,11 +665,17 @@ values are `NaN` for cells/species that don't have that entry). The same data
 is also available via `sim.history` (a list of per-cell-per-timestep dicts)
 and `sim.to_dataframe()`.
 
+`Simulation` also keeps a parallel record of which `Environment` was active at
+each recorded timestep in `sim.env_history` — a list of `(time, environment)`
+pairs, one per call to `record()`. This is used by `visualize()` to display
+the correct environment name on each frame, and is useful when
+`colony.switch_environment(...)` is called mid-simulation.
+
 Calling `sim.run()` again continues the simulation instead of restarting it:
 it picks up from the current `sim.time` and appends new records to the
-existing `sim.history` rather than clearing it. Pass a new, larger `t_max` to
-extend how far it runs (`sim.run(t_max=...)`), e.g. to simulate further after
-calling `colony.switch_environment(...)` mid-simulation — see
+existing `sim.history` (and `sim.env_history`) rather than clearing them. Pass
+a new, larger `t_max` to extend how far it runs (`sim.run(t_max=...)`), e.g.
+to simulate further after calling `colony.switch_environment(...)` — see
 [Switching environments](#switching-environments) above. Calling `run()` a
 second time with the same `t_max` it already reached is a no-op.
 
@@ -682,7 +692,7 @@ from multicellular import Cell, Colony, Environment, run_replicates
 
 def build_colony(replicate_id):
     import numpy as np
-    env = Environment(shape=(10, 10))
+    env = Environment("LB medium", shape=(10, 10))
     cell = Cell(
         id=0,
         position=[50.0, 50.0],
@@ -742,9 +752,13 @@ visualize(sim, red="A", green="B", interval=200)
   default to a constant mid-gray value.
 - Dead cells stop appearing in the frame after they die.
 - The region outside `environment.bounds` is tinted red.
+- Each frame shows the active environment's `name` on the top-left and the
+  current time (`t = ...`) on the top-right. When `colony.switch_environment`
+  is called mid-simulation, the name updates automatically at the frame where
+  the switch occurred.
 - `interval` is the delay between frames in milliseconds.
 
-Every frame (all cell shapes, colors, and the `t = ...` title) is rendered to
+Every frame (all cell shapes, colors, and the frame labels) is rendered to
 an in-memory image up front, before anything is shown — drawing many
 individual cell patches is the slow part of this visualization, so doing it
 once per frame ahead of time (with a progress bar; set `show_progress=False`

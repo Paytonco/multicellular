@@ -58,6 +58,7 @@ class Environment:
 
     def __init__(
         self,
+        name,
         shape,
         bounds=(100.0, 100.0),
         diffusivity=None,
@@ -65,6 +66,7 @@ class Environment:
         fields=None,
         depth=None,
     ):
+        self.name = name
         self.shape = tuple(shape)
         self.bounds = tuple(bounds)
         self.diffusivity = (
