@@ -778,9 +778,6 @@ These pieces exist as placeholders (empty classes/functions or
   concentration, and plotting `Environment` fields.
 - **`Cell.interact_with_environment`** — placeholder method (no-op), intended
   to let a cell read from / write to an `Environment`.
-- **`examples/toggle_switch_demo.py`** and
-  **`examples/quorum_sensing_demo.py`** — empty placeholder scripts, intended
-  as end-to-end demos of a genetic toggle switch and a quorum-sensing circuit.
 
 ## Running tests
 
