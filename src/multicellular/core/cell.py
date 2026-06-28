@@ -260,10 +260,6 @@ class Cell:
         self.orientation[0] = nx
         self.orientation[1] = ny
 
-    def interact_with_environment(self, environment):
-        """Placeholder for environment interaction logic."""
-        pass
-
     def kill(self):
         self.alive = False
 

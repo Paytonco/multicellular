@@ -28,7 +28,7 @@ tested:
   `run_replicates()`
 
 Not yet implemented (see [Unimplemented / stubs](#unimplemented--stubs)): SBML
-import and several visualization utilities.
+import and `plot_field`.
 
 ## Installation
 
@@ -786,12 +786,8 @@ These pieces exist as placeholders (empty classes/functions or
 - **`ReactionNetwork.from_sbml`** and **`multicellular.parse_sbml`**
   (`utils/sbml_parser.py`) — raise `NotImplementedError` / are empty. Intended
   to construct a `ReactionNetwork` from an SBML model file.
-- **`multicellular.animate_colony`**, **`multicellular.color_cells`**, and
-  **`multicellular.plot_field`** (`utils/visualization.py`) — empty functions.
-  Intended for animating a `Colony` directly, coloring cells by species or
-  concentration, and plotting `Environment` fields.
-- **`Cell.interact_with_environment`** — placeholder method (no-op), intended
-  to let a cell read from / write to an `Environment`.
+- **`multicellular.plot_field`** (`utils/visualization.py`) — empty function.
+  Intended for plotting `Environment` fields.
 
 ## Running tests
 
