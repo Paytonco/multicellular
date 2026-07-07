@@ -26,6 +26,7 @@ class Cell:
         network=None,
         rng=None,
         growth_rate=np.log(2),
+        growth_rate_law=None,
         delta_bar=1.0,
         cv_delta=0.10,
         a=1.0,
@@ -60,6 +61,7 @@ class Cell:
         self.rng = rng or np.random.default_rng()
 
         self.growth_rate = growth_rate
+        self.growth_rate_law = growth_rate_law
         self.delta_bar = delta_bar
         self.cv_delta = cv_delta
         self.a = a
@@ -194,6 +196,7 @@ class Cell:
             species=self.species,
             rng=self.rng,
             growth_rate=self.growth_rate,
+            growth_rate_law=self.growth_rate_law,
             delta_bar=self.delta_bar,
             cv_delta=self.cv_delta,
             a=self.a,

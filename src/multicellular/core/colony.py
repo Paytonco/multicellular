@@ -135,10 +135,29 @@ class Colony:
         """
         self.environment = environment
 
+    def _update_growth_rates(self):
+        """Call each living cell's growth_rate_law with its current state and local field values."""
+        living = [
+            cell
+            for cell in self.cells
+            if cell.alive and cell.growth_rate_law is not None
+        ]
+        if not living:
+            return
+        positions = np.array([cell.position for cell in living])
+        i_idx, j_idx = self._field_indices(positions)
+        for cell, i, j in zip(living, i_idx, j_idx):
+            extracellular = {
+                name: float(field.values[i, j])
+                for name, field in self.environment.fields.items()
+            }
+            cell.growth_rate = cell.growth_rate_law(cell.concentrations, extracellular)
+
     def step(self, dt):
         """Advance all cells by one timestep, then enforce bounds and divisions."""
         self.environment.diffuse(dt)
         self.apply_chemical_fields()
+        self._update_growth_rates()
         for cell in self.cells:
             cell.step(dt)
         self.export_chemical_fields()
