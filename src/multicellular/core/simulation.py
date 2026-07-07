@@ -11,10 +11,17 @@ class Simulation:
     every timestep.
     """
 
-    def __init__(self, colony, dt, t_max):
+    def __init__(self, colony, dt, t_max, simulation_method="ODE"):
+        """
+        Args:
+            simulation_method: how every cell's reaction network is advanced
+                each step: "ODE" (forward Euler, default), "SSA" (Gillespie),
+                or "CLE" (chemical Langevin equation). Case-insensitive.
+        """
         self.colony = colony
         self.dt = dt
         self.t_max = t_max
+        self.simulation_method = simulation_method.upper()
         self.time = 0.0
         self.history = []
         self.env_history = []
@@ -61,7 +68,7 @@ class Simulation:
         for step_index in tqdm(
             range(start_step + 1, n_steps + 1), disable=not show_progress
         ):
-            self.colony.step(self.dt)
+            self.colony.step(self.dt, self.simulation_method)
             self.time = step_index * self.dt
             self.record()
 

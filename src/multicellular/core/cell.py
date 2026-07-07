@@ -132,13 +132,20 @@ class Cell:
         volume = self.compute_volume()
         self.concentrations = {s: n / volume for s, n in copy_numbers.items()}
 
-    def step(self, dt):
-        """Advance cell internal state (chemical + growth). No-op if dead."""
+    def step(self, dt, method="ODE"):
+        """
+        Advance cell internal state (chemical + growth). No-op if dead.
+
+        Args:
+            dt: timestep size.
+            method: simulation method forwarded to
+                `ReactionNetwork.simulate_step` ("ODE", "SSA", or "CLE").
+        """
         if not self.alive:
             return
         if self.network:
             self.concentrations = self.network.simulate_step(
-                self.concentrations, dt, self.compute_volume(), rng=self.rng
+                self.concentrations, dt, self.compute_volume(), method, rng=self.rng
             )
             self.pending_export = self.network.last_exported
         self.grow(dt)

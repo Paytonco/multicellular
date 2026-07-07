@@ -146,20 +146,20 @@ def test_cell_with_reaction_network():
     )
 
 
-def _linear_ab_network(k=1.0, method="SSA"):
+def _linear_ab_network(k=1.0):
     rxn = Reaction(
         {"A": 1}, {"B": 1}, rate_law_type="mass_action", rate_params={"k": k}
     )
-    return ReactionNetwork("linear", {"R": rxn}, simulation_method=method)
+    return ReactionNetwork("linear", {"R": rxn})
 
 
 def test_ssa_step_conserves_integer_counts():
-    net = _linear_ab_network(k=1.0, method="SSA")
+    net = _linear_ab_network(k=1.0)
     volume = 10.0
     state = {"A": 10.0, "B": 0.0}  # 100 copies of A, 0 of B
     rng = np.random.default_rng(0)
 
-    new_state = net.simulate_step(state, dt=0.05, volume=volume, rng=rng)
+    new_state = net.simulate_step(state, dt=0.05, volume=volume, method="SSA", rng=rng)
 
     count_a = new_state["A"] * volume
     count_b = new_state["B"] * volume
@@ -169,10 +169,12 @@ def test_ssa_step_conserves_integer_counts():
 
 
 def test_ssa_step_zero_propensity_is_noop():
-    net = _linear_ab_network(k=1.0, method="SSA")
+    net = _linear_ab_network(k=1.0)
     rng = np.random.default_rng(0)
 
-    new_state = net.simulate_step({"A": 0.0, "B": 0.0}, dt=1.0, volume=1.0, rng=rng)
+    new_state = net.simulate_step(
+        {"A": 0.0, "B": 0.0}, dt=1.0, volume=1.0, method="SSA", rng=rng
+    )
 
     assert new_state == {"A": 0.0, "B": 0.0}
 
@@ -182,14 +184,14 @@ def test_ssa_step_matches_ode_mean():
     volume = 10.0
     dt = 0.05
     a0 = 100.0  # copies
-    net = _linear_ab_network(k=k, method="SSA")
+    net = _linear_ab_network(k=k)
 
     n_reps = 3000
     b_counts = np.empty(n_reps)
     for i in range(n_reps):
         rng = np.random.default_rng(i)
         new_state = net.simulate_step(
-            {"A": a0 / volume, "B": 0.0}, dt=dt, volume=volume, rng=rng
+            {"A": a0 / volume, "B": 0.0}, dt=dt, volume=volume, method="SSA", rng=rng
         )
         b_counts[i] = new_state["B"] * volume
 
@@ -198,7 +200,7 @@ def test_ssa_step_matches_ode_mean():
 
 
 def test_cle_step_conserves_mass_without_clipping():
-    net = _linear_ab_network(k=2.0, method="CLE")
+    net = _linear_ab_network(k=2.0)
     # Large volume + small dt keeps the noise term well clear of the
     # non-negativity clip, so conservation should hold (near-)exactly.
     state = {"A": 4.0, "B": 1.0}
@@ -207,7 +209,9 @@ def test_cle_step_conserves_mass_without_clipping():
 
     for seed in range(20):
         rng = np.random.default_rng(seed)
-        new_state = net.simulate_step(state, dt=dt, volume=volume, rng=rng)
+        new_state = net.simulate_step(
+            state, dt=dt, volume=volume, method="CLE", rng=rng
+        )
         assert new_state["A"] + new_state["B"] == pytest.approx(5.0, abs=1e-9)
 
 
@@ -215,14 +219,16 @@ def test_cle_step_matches_ode_mean_and_scales_noise_with_volume():
     k = 2.0
     state = {"A": 4.0, "B": 1.0}
     dt = 0.02
-    net = _linear_ab_network(k=k, method="CLE")
+    net = _linear_ab_network(k=k)
     n_reps = 3000
 
     def run(volume):
         b_vals = np.empty(n_reps)
         for i in range(n_reps):
             rng = np.random.default_rng(i)
-            new_state = net.simulate_step(state, dt=dt, volume=volume, rng=rng)
+            new_state = net.simulate_step(
+                state, dt=dt, volume=volume, method="CLE", rng=rng
+            )
             b_vals[i] = new_state["B"]
         return b_vals
 
@@ -238,7 +244,7 @@ def test_cle_step_matches_ode_mean_and_scales_noise_with_volume():
 
 
 def test_cell_with_ssa_reaction_network():
-    net = _linear_ab_network(k=1.0, method="SSA")
+    net = _linear_ab_network(k=1.0)
     cell = Cell(
         id=0,
         position=[0.0, 0.0],
@@ -253,7 +259,7 @@ def test_cell_with_ssa_reaction_network():
 
     volume = cell.compute_volume()
     expected_copies = round(1.0 * volume)  # initial concentration was 1.0
-    cell.step(dt=0.1)
+    cell.step(dt=0.1, method="SSA")
 
     assert cell.concentrations["A"] >= 0.0
     assert cell.concentrations["B"] >= 0.0
@@ -304,7 +310,7 @@ def test_get_export_vector():
     assert list(rxn.get_export_vector(["W", "X", "Y"])) == [0, 1, 0]
 
 
-def _efflux_network(k=1.0, method="ODE"):
+def _efflux_network(k=1.0):
     rxn = Reaction(
         reactants={"X": 1},
         products={},
@@ -312,7 +318,7 @@ def _efflux_network(k=1.0, method="ODE"):
         rate_law_type="mass_action",
         rate_params={"k": k},
     )
-    return ReactionNetwork("efflux", {"R": rxn}, simulation_method=method)
+    return ReactionNetwork("efflux", {"R": rxn})
 
 
 def test_reaction_network_computes_exported_species_and_matrix():
@@ -361,12 +367,12 @@ def test_ode_efflux_caps_export_at_available_pool_for_large_dt():
 
 
 def test_ssa_efflux_conserves_mass_exactly():
-    net = _efflux_network(k=1.0, method="SSA")
+    net = _efflux_network(k=1.0)
     state = {"X": 10.0}
     volume = 10.0  # 100 copies
     rng = np.random.default_rng(0)
 
-    new_state = net.simulate_step(state, dt=0.5, volume=volume, rng=rng)
+    new_state = net.simulate_step(state, dt=0.5, volume=volume, method="SSA", rng=rng)
 
     remaining = new_state["X"] * volume
     exported = net.last_exported["X"]
@@ -375,10 +381,10 @@ def test_ssa_efflux_conserves_mass_exactly():
 
 
 def test_ssa_efflux_stops_exporting_once_pool_is_empty():
-    net = _efflux_network(k=1.0, method="SSA")
+    net = _efflux_network(k=1.0)
     rng = np.random.default_rng(0)
 
-    new_state = net.simulate_step({"X": 0.0}, dt=1.0, volume=1.0, rng=rng)
+    new_state = net.simulate_step({"X": 0.0}, dt=1.0, volume=1.0, method="SSA", rng=rng)
 
     assert new_state["X"] == 0.0
     assert net.last_exported["X"] == 0.0
@@ -400,27 +406,29 @@ def test_cle_efflux_conserves_mass_with_large_destabilizing_noise():
     # draw must not be able to increase the internal pool while exporting
     # nothing (or vice versa) -- the shared extent clamp should make the
     # reaction simply not fire instead.
-    net = _efflux_network(k=1.0, method="CLE")
+    net = _efflux_network(k=1.0)
     state = {"X": 0.05}
     volume = 1.0
     dt = 0.02
     rng = _FixedNormalRNG([-5.0])
 
-    new_state = net.simulate_step(state, dt, volume, rng=rng)
+    new_state = net.simulate_step(state, dt, volume, method="CLE", rng=rng)
 
     assert new_state["X"] == pytest.approx(0.05, abs=1e-9)
     assert net.last_exported["X"] == pytest.approx(0.0, abs=1e-9)
 
 
 def test_cle_efflux_conserves_mass_across_many_noise_draws():
-    net = _efflux_network(k=2.0, method="CLE")
+    net = _efflux_network(k=2.0)
     state = {"X": 4.0}
     volume = 100.0
     dt = 0.02
 
     for seed in range(20):
         rng = np.random.default_rng(seed)
-        new_state = net.simulate_step(state, dt=dt, volume=volume, rng=rng)
+        new_state = net.simulate_step(
+            state, dt=dt, volume=volume, method="CLE", rng=rng
+        )
         remaining = new_state["X"] * volume
         exported = net.last_exported["X"]
         assert remaining + exported == pytest.approx(state["X"] * volume, abs=1e-9)
@@ -443,7 +451,7 @@ def test_cell_pending_export_populated_after_step():
 
 
 def test_cell_with_cle_reaction_network():
-    net = _linear_ab_network(k=1.0, method="CLE")
+    net = _linear_ab_network(k=1.0)
     cell = Cell(
         id=0,
         position=[0.0, 0.0],
@@ -456,7 +464,7 @@ def test_cell_with_cle_reaction_network():
     )
     cell.concentrations = {"A": 1.0, "B": 0.0}
 
-    cell.step(dt=0.1)
+    cell.step(dt=0.1, method="CLE")
 
     assert cell.concentrations["A"] >= 0.0
     assert cell.concentrations["B"] >= 0.0

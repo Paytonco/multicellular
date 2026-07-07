@@ -178,12 +178,9 @@ class ReactionNetwork:
     species is depleted by exactly the amount that leaves).
     """
 
-    def __init__(
-        self, name: str, reactions: Dict[str, Reaction], simulation_method: str = "ODE"
-    ):
+    def __init__(self, name: str, reactions: Dict[str, Reaction]):
         self.name = name
         self.reactions = reactions  # dict of name → Reaction
-        self.simulation_method = simulation_method.upper()  # ODE, SSA, CLE
         self.species = self._extract_species()
         self.exported_species = sorted(
             {s for r in self.reactions.values() for s in r.exports}
@@ -253,22 +250,25 @@ class ReactionNetwork:
         state: Dict[str, float],
         dt: float,
         volume: float,
+        method: str = "ODE",
         rng: np.random.Generator = None,
     ) -> Dict[str, float]:
         """
-        Advance the chemical state by one time step using the specified simulation method.
+        Advance the chemical state by one time step using the given simulation method.
 
         Args:
             state: dict of species → concentration
             dt: timestep size
             volume: cell volume (used for propensities in SSA/CLE)
+            method: one of "ODE" (forward Euler), "SSA" (Gillespie), or
+                "CLE" (chemical Langevin equation). Case-insensitive.
             rng: random generator used by SSA/CLE (ignored by ODE). Defaults
                 to a fresh `np.random.default_rng()` if not given.
 
         Returns:
             Updated concentration dictionary
         """
-        method = self.simulation_method
+        method = method.upper()
         if method == "ODE":
             return self._simulate_ode_step(state, dt, volume)
         elif method == "SSA":
@@ -451,5 +451,4 @@ class ReactionNetwork:
         return ReactionNetwork(
             name=self.name,
             reactions={k: v.clone() for k, v in self.reactions.items()},
-            simulation_method=self.simulation_method,
         )

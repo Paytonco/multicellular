@@ -85,9 +85,13 @@ contact forces.
 `Reaction` supports `mass_action`, `michaelis_menten`, `hill_langmuir`, and
 `custom` rate laws. `ReactionNetwork` collects reactions, builds a
 stoichiometry matrix, and advances concentrations with one of three
-`simulation_method`s: `"ODE"` (forward Euler; the default), `"CLE"`
-(chemical Langevin equation), or `"SSA"` (Gillespie stochastic simulation
-algorithm).
+simulation methods: `"ODE"` (forward Euler; the default), `"CLE"` (chemical
+Langevin equation), or `"SSA"` (Gillespie stochastic simulation algorithm).
+The method is chosen per call to `simulate_step` (or, when running a full
+`Colony`/`Simulation`, once via `Simulation`'s `simulation_method` argument —
+see [`Simulation`](#simulation) below) rather than being fixed on the
+`ReactionNetwork` itself, so the same network can be advanced with different
+methods.
 
 ```python
 from multicellular import ReactionNetwork
@@ -104,23 +108,21 @@ rxn = Reaction(
 network = ReactionNetwork(name="linear", reactions={"R": rxn})
 
 state = {"A": 1.0, "B": 0.0}
-new_state = network.simulate_step(state, dt=0.1, volume=1.0)
+new_state = network.simulate_step(state, dt=0.1, volume=1.0)  # method="ODE" by default
 ```
 
 `simulate_step`'s signature is the same for every method: a concentration
 dict in, a concentration dict out (`{species: value}`, keyed by
 `network.species`). `volume` is the cell's current volume (held fixed across
-the call). `rng` (an optional `np.random.Generator`, used by `"CLE"` and
-`"SSA"`) defaults to a fresh `np.random.default_rng()` if omitted; `Cell.step`
-passes the cell's own `rng` so that one seed per `Cell` controls its entire
-stochastic trajectory — division and Brownian-motion noise as well as
-chemistry.
+the call). `method` (`"ODE"`, `"CLE"`, or `"SSA"`, case-insensitive) selects
+the simulation algorithm for that call. `rng` (an optional
+`np.random.Generator`, used by `"CLE"` and `"SSA"`) defaults to a fresh
+`np.random.default_rng()` if omitted; `Cell.step` passes the cell's own `rng`
+so that one seed per `Cell` controls its entire stochastic trajectory —
+division and Brownian-motion noise as well as chemistry.
 
 ```python
-network = ReactionNetwork(
-    name="linear", reactions={"R": rxn}, simulation_method="SSA"  # or "CLE"
-)
-new_state = network.simulate_step(state, dt=0.1, volume=1.0, rng=rng)
+new_state = network.simulate_step(state, dt=0.1, volume=1.0, method="SSA", rng=rng)  # or "CLE"
 ```
 
 Every rate law (`mass_action`, `michaelis_menten`, `hill_langmuir`, `custom`)
@@ -196,7 +198,11 @@ counts, so they're exact by construction.
 ### Cell with an internal reaction network
 
 A `Cell` can be given a `ReactionNetwork`; calling `cell.step(dt)` advances
-both its internal chemistry (via the network's ODE step) and its growth:
+both its internal chemistry and its growth. `cell.step` takes an optional
+`method` argument (`"ODE"` by default, or `"CLE"`/`"SSA"`), forwarded to the
+network's `simulate_step` — this is what `Colony.step` and `Simulation` use
+to apply the simulation method chosen when the `Simulation` was created (see
+[`Simulation`](#simulation) below):
 
 ```python
 from multicellular import Cell, ReactionNetwork
@@ -238,7 +244,7 @@ assert cell.concentrations["A"] * volume_after == pytest.approx(1.0 * volume_bef
 
 This is implemented with explicit multiply-then-divide arithmetic, since
 `Cell.concentrations` is always a continuous concentration dict regardless of
-`simulation_method`. SSA tracks molecule counts internally during its own
+which simulation method is used. SSA tracks molecule counts internally during its own
 step (see [`Reaction` and `ReactionNetwork`](#reaction-and-reactionnetwork)
 below) but still hands back concentrations at the end of that step, so
 `grow`'s dilution logic is identical across `"ODE"`, `"CLE"`, and `"SSA"`.
@@ -474,7 +480,10 @@ conditions, a cell dies if *any* of them is violated:
 colony = Colony(cells, env, survival_conditions=[("A", ">", 0), ("B", "<=", 10)])
 ```
 
-`colony.step(dt)` performs the following operations in order:
+`colony.step(dt)` performs the following operations in order (an optional
+second argument, `method`, is forwarded to every cell's `Cell.step` — see
+[Cell with an internal reaction network](#cell-with-an-internal-reaction-network)
+above — and defaults to `"ODE"`, same as `Cell.step`):
 
 1. **Diffusion** — calls `environment.diffuse(dt)`, advancing every field
    with `diffuses=True` (no-op if there are none; see
@@ -642,7 +651,10 @@ matters since colonies grow exponentially via division.
 
 `Simulation` steps a `Colony` from `t=0` to `t=t_max` in increments of `dt`,
 recording every cell's position, orientation, length, alive status, and
-chemical concentrations at every timestep:
+chemical concentrations at every timestep. It also owns the simulation
+method used to advance every cell's `ReactionNetwork` each step — pass
+`simulation_method="ODE"` (the default), `"SSA"`, or `"CLE"` when
+constructing it:
 
 ```python
 from multicellular import Cell, Colony, Environment, Simulation
@@ -651,13 +663,14 @@ env = Environment("LB medium", shape=(10, 10))
 cell = Cell(id=0, position=[50.0, 50.0], orientation=[1.0, 0.0])
 colony = Colony([cell], env)
 
-sim = Simulation(colony, dt=0.1, t_max=10.0)
+sim = Simulation(colony, dt=0.1, t_max=10.0, simulation_method="ODE")  # or "SSA"/"CLE"
 df = sim.run()  # pandas DataFrame, one row per cell per recorded timestep
 ```
 
-`sim.run()` records the initial state, then repeatedly calls `colony.step(dt)`
-and records the new state of every cell remaining in the colony — including
-any new daughter cells produced by division — until `t_max` is reached. The
+`sim.run()` records the initial state, then repeatedly calls
+`colony.step(dt, sim.simulation_method)` and records the new state of every
+cell remaining in the colony — including any new daughter cells produced by
+division — until `t_max` is reached. The
 returned DataFrame has columns `time`, `cell_id`, `alive`, `position_x`,
 `position_y`, `orientation_x`, `orientation_y`, `length`, `radius`, plus one
 column per chemical species seen in any cell's `concentrations` (missing
@@ -708,6 +721,8 @@ df = run_replicates(build_colony, n_replicates=50, dt=0.01, t_max=10.0, n_jobs=-
   worker process) and must return a fresh `Colony`. Give each cell's `rng`
   a distinct seed (e.g. derived from `replicate_id`) so replicates don't
   share — or accidentally duplicate — a random stream.
+- `simulation_method` (`"ODE"` by default, or `"SSA"`/`"CLE"`) is forwarded
+  to every replicate's `Simulation`.
 - `n_jobs` is forwarded to `joblib.Parallel`; `-1` (the default) uses every
   available core, and a smaller positive number caps how many to use.
 - The returned DataFrame is the concatenation of every replicate's

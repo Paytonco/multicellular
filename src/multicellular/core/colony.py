@@ -153,13 +153,20 @@ class Colony:
             }
             cell.growth_rate = cell.growth_rate_law(cell.concentrations, extracellular)
 
-    def step(self, dt):
-        """Advance all cells by one timestep, then enforce bounds and divisions."""
+    def step(self, dt, method="ODE"):
+        """
+        Advance all cells by one timestep, then enforce bounds and divisions.
+
+        Args:
+            dt: timestep size.
+            method: simulation method forwarded to each cell's
+                `Cell.step` ("ODE", "SSA", or "CLE").
+        """
         self.environment.diffuse(dt)
         self.apply_chemical_fields()
         self._update_growth_rates()
         for cell in self.cells:
-            cell.step(dt)
+            cell.step(dt, method)
         self.export_chemical_fields()
         # Re-apply: a chemical field's value is an externally-imposed boundary
         # condition, not a quantity the cell's own growth should dilute, but
