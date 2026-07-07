@@ -23,12 +23,15 @@ tested:
   forces and torques, chemical field sensing and export (secretion), and
   optional chemical survival conditions
 - Simulation loop with full history recording
-- 2D animation via `visualize()`
+- 2D animation of a colony via `Simulation.visualize_colony()`, or of a
+  chemical `Field` over time via `Simulation.visualize_field()`; static
+  heatmaps of one or more `Field`s at a point in time via
+  `Simulation.plot_field()`
 - Running independent simulation replicates across multiple CPU cores via
   `run_replicates()`
 
 Not yet implemented (see [Unimplemented / stubs](#unimplemented--stubs)): SBML
-import and `plot_field`.
+import.
 
 ## Installation
 
@@ -289,7 +292,7 @@ added matches its grid `shape`.
 
 Every `Environment` requires a `name` string as its first argument. The name
 identifies the medium or experimental condition and is displayed on the
-top-left of every animation frame produced by `visualize()`.
+top-left of every animation frame produced by `Simulation.visualize_colony()`.
 
 ```python
 import numpy as np
@@ -680,15 +683,28 @@ and `sim.to_dataframe()`.
 
 `Simulation` also keeps a parallel record of which `Environment` was active at
 each recorded timestep in `sim.env_history` — a list of `(time, environment)`
-pairs, one per call to `record()`. This is used by `visualize()` to display
-the correct environment name on each frame, and is useful when
+pairs, one per call to `record()`. This is used by `visualize_colony()` to
+display the correct environment name on each frame, and is useful when
 `colony.switch_environment(...)` is called mid-simulation.
+
+Similarly, `sim.field_history` is a list of `(time, {field_name: values})`
+pairs, one per call to `record()`, holding a *copy* of every `Field`'s
+`values` grid on the active `Environment` at that timestep. A copy is
+necessary because a `Field`'s `values` array is mutated in place by
+diffusion and secretion between recorded steps — without copying, every
+entry would end up pointing at the same, ever-changing array rather than a
+snapshot of its value at that time. This is what `visualize_field()` (see
+[`Simulation.visualize_field`](#simulationvisualize_field) below) animates,
+and what `plot_field()` (see
+[`Simulation.plot_field`](#simulationplot_field) below) draws a single
+snapshot of.
 
 Calling `sim.run()` again continues the simulation instead of restarting it:
 it picks up from the current `sim.time` and appends new records to the
-existing `sim.history` (and `sim.env_history`) rather than clearing them. Pass
-a new, larger `t_max` to extend how far it runs (`sim.run(t_max=...)`), e.g.
-to simulate further after calling `colony.switch_environment(...)` — see
+existing `sim.history` (`sim.env_history` and `sim.field_history` too)
+rather than clearing them. Pass a new, larger `t_max` to extend how far it
+runs (`sim.run(t_max=...)`), e.g. to simulate further after calling
+`colony.switch_environment(...)` — see
 [Switching environments](#switching-environments) above. Calling `run()` a
 second time with the same `t_max` it already reached is a no-op.
 
@@ -738,11 +754,10 @@ df = run_replicates(build_colony, n_replicates=50, dt=0.01, t_max=10.0, n_jobs=-
   replicate's own `Simulation.run()` shows its tqdm bar; left on, bars from
   different worker processes interleave and are hard to read.
 
-### `visualize`
+### `Simulation.visualize_colony`
 
 ```python
-visualize(
-    simulation,
+sim.visualize_colony(
     red=None, green=None, blue=None,
     interval=200,
     save_path=None, filename="simulation.gif",
@@ -754,9 +769,7 @@ shows a 2D animation of an already-`run()` `Simulation` in a pop-up matplotlib
 window:
 
 ```python
-from multicellular import visualize
-
-visualize(sim, red="A", green="B", interval=200)
+sim.visualize_colony(red="A", green="B", interval=200)
 ```
 
 - Each cell is drawn as its rod shape (cylinder + hemispherical caps) using
@@ -786,12 +799,93 @@ doesn't already exist, and the animation is written there as an animated GIF
 (via Pillow — no external dependencies like `ffmpeg` required):
 
 ```python
-visualize(sim, red="A", green="B", save_path="./out", filename="colony.gif")
+sim.visualize_colony(red="A", green="B", save_path="./out", filename="colony.gif")
 ```
 
 `filename` defaults to `"simulation.gif"`. The animation is still shown
 interactively afterward; pass `show_progress=False` and close the window
 yourself (or run headlessly) if you only want the saved file.
+
+### `Simulation.visualize_field`
+
+```python
+sim.visualize_field(
+    field_name,
+    cmap="viridis",
+    vmin=0.0, vmax=None,
+    interval=200,
+    save_path=None, filename="simulation.gif",
+    show_progress=True,
+)
+```
+
+shows a 2D animation of one `Field`'s values over time — e.g. watching a
+chemical spread by diffusion, or an `Environment.diffuse()`-driven secretion
+field build up as a colony grows:
+
+```python
+sim.visualize_field("AHL", cmap="YlOrRd", interval=100)
+```
+
+- Works the same way as `visualize_colony`: every frame (a heatmap of the
+  field's grid at that timestep, plus the environment `name`/time labels) is
+  rendered to an in-memory image up front, from `sim.field_history` (see
+  [`Simulation`](#simulation) above), so playback is just fast image
+  blitting regardless of how many timesteps were recorded.
+- `field_name` must be present in `sim.field_history`; a `Field` that never
+  existed in any recorded `Environment` raises `KeyError`.
+- `cmap` is any Matplotlib colormap name.
+- `vmin`/`vmax` set the color scale. `vmax` defaults to the field's maximum
+  recorded value over the whole simulation (`vmin` defaults to `0.0`, e.g.
+  a zero-floor for chemical concentrations); pass both explicitly to keep
+  the scale fixed when comparing separate animations.
+- Each frame shows the active environment's `name` on the top-left and the
+  current time (`t = ...`) on the top-right, exactly as in
+  `visualize_colony`.
+- `interval`, `save_path`, `filename`, `show_progress`, and `stride` all
+  behave identically to `visualize_colony` (see above).
+
+```python
+sim.visualize_field("dye", save_path="./out", filename="dye.gif")
+```
+
+### `Simulation.plot_field`
+
+```python
+sim.plot_field(
+    field_names,
+    time=None,
+    cmap="viridis",
+    vmin=None, vmax=None,
+)
+```
+
+plots one or more `Field`s as static heatmaps at a single point in time —
+e.g. a spatially-varying medium property, or one frame of a diffusing
+chemical picked out for closer inspection:
+
+```python
+sim.plot_field("temperature", cmap="RdYlBu_r", vmin=0, vmax=45)
+sim.plot_field(["eta", "diffusivity"])  # several fields, side by side
+```
+
+- Uses the same imshow/colorbar/title convention as `visualize_field` (env
+  `name` top-left, `t = ...` top-right, a colorbar labeled with the field's
+  name) but renders one static figure instead of an animation.
+- `field_names` can be a single name or a list of names; each is drawn as
+  its own panel in one figure — handy for fields on very different scales
+  (e.g. viscosity and diffusivity), which wouldn't share a sensible color
+  scale.
+- `time` snaps to the closest timestep actually recorded in
+  `sim.field_history`; it defaults to the most recently recorded time (the
+  final state).
+- `vmin`/`vmax` default to `None`, so each panel auto-scales to its own
+  field's value range at the plotted time (plain `imshow` behavior) —
+  unlike `visualize_field`, which fixes the scale across an entire
+  animation. Pass both explicitly for a shared/fixed scale, e.g. to keep
+  two separate `plot_field` calls comparable.
+- Returns the `matplotlib.figure.Figure`, so callers can add further
+  annotations (e.g. `fig.axes[0].axvline(...)`) before displaying it.
 
 ## Unimplemented / stubs
 
@@ -801,8 +895,6 @@ These pieces exist as placeholders (empty classes/functions or
 - **`ReactionNetwork.from_sbml`** and **`multicellular.parse_sbml`**
   (`utils/sbml_parser.py`) — raise `NotImplementedError` / are empty. Intended
   to construct a `ReactionNetwork` from an SBML model file.
-- **`multicellular.plot_field`** (`utils/visualization.py`) — empty function.
-  Intended for plotting `Environment` fields.
 
 ## Running tests
 
@@ -820,6 +912,7 @@ pytest tests/test_reactions.py   # Reaction rate laws, stoichiometry, ODE/SSA/CL
 pytest tests/test_environment.py # Environment/Field construction, validation, diffusion, and grid cell volume
 pytest tests/test_colony.py      # Colony bounds enforcement, division, dead-cell behavior, field sensing/diffusion/export
 pytest tests/test_simulation.py  # Simulation loop and DataFrame export
+pytest tests/test_visualization.py # visualize_colony/visualize_field/plot_field: animation output, GIF export, stride, static plots
 pytest tests/test_parallel.py    # run_replicates: parallel execution, independence, correctness
 pytest tests/test_dummy.py       # trivial sanity check
 ```

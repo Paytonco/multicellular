@@ -161,3 +161,29 @@ def test_env_history_reflects_environment_switch():
     # Last two entries (t=0.3, 0.4) use env_after.
     for t, recorded_env in sim.env_history[3:]:
         assert recorded_env is env_after
+
+
+def test_field_history_tracks_field_values_per_timestep():
+    shape = (5, 5)
+    values = np.zeros(shape)
+    values[2, 2] = 10.0
+    field = Field("dye", values, diffuses=True, diffusivity=5e-10)
+    env = Environment("env", shape=shape, bounds=(20.0, 20.0), fields=[field])
+    colony = Colony([], env)
+
+    sim = Simulation(colony, dt=0.1, t_max=0.3)
+    sim.run(show_progress=False)
+
+    # One field_history entry per recorded timestep (t=0, 0.1, 0.2, 0.3).
+    assert len(sim.field_history) == 4
+    times = [t for t, _ in sim.field_history]
+    assert times[0] == pytest.approx(0.0)
+    assert times[-1] == pytest.approx(0.3)
+
+    # Snapshots are independent copies, not references to the live array
+    # that diffusion mutates in place between recorded steps.
+    first_snapshot = sim.field_history[0][1]["dye"]
+    last_snapshot = sim.field_history[-1][1]["dye"]
+    assert first_snapshot[2, 2] == pytest.approx(10.0)
+    assert last_snapshot[2, 2] < first_snapshot[2, 2]
+    assert not np.allclose(first_snapshot, last_snapshot)

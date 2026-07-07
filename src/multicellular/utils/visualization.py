@@ -11,7 +11,6 @@ from tqdm import tqdm
 
 # Default color used for any RGB channel that isn't tied to a chemical species.
 _DEFAULT_CHANNEL_VALUE = 0.3
-_DEFAULT_FILENAME = "simulation.gif"
 
 
 def _capsule_outline(position, orientation, length, radius, n_points=12):
@@ -136,6 +135,80 @@ def _render_frames(df, times, env_by_time, red, green, blue, scales, show_progre
     return frames
 
 
+def _render_field_frames(
+    times, env_by_time, snapshots, field_name, cmap, vmin, vmax, show_progress
+):
+    """
+    Render every field-animation frame to an in-memory RGBA image up front,
+    the same "render ahead of time" strategy as `_render_frames` uses for
+    cell colonies.
+    """
+    first_env = next(iter(env_by_time.values()))
+    width, height = first_env.bounds
+
+    fig, ax = plt.subplots()
+    ax.set_aspect("equal")
+    image = ax.imshow(
+        snapshots[times[0]],
+        origin="lower",
+        extent=[0, width, 0, height],
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+    )
+    fig.colorbar(image, ax=ax, label=field_name)
+
+    frames = []
+    for t in tqdm(times, disable=not show_progress, desc="Rendering frames"):
+        image.set_data(snapshots[t])
+        env = env_by_time.get(t, first_env)
+        ax.set_title(env.name, loc="left")
+        ax.set_title(f"t = {t:.2f}", loc="right")
+        fig.canvas.draw()
+        frames.append(np.asarray(fig.canvas.buffer_rgba()).copy())
+
+    plt.close(fig)
+    return frames
+
+
+def _render_field_plot(field_names, time, env, values_by_field, cmap, vmin, vmax):
+    """
+    Render one static heatmap per field, side by side in one figure.
+
+    Uses the same imshow/colorbar/title convention as `_render_field_frames`
+    (one panel per field, colorbar labeled with the field's name, env name
+    top-left / time top-right), but for a single point in time rather than
+    a whole animation.
+
+    Unlike `_display_and_save`, this does not call `plt.show()` itself: the
+    figure is returned so the caller can add further annotations (e.g.
+    `fig.axes[0].axvline(...)`) before displaying it — calling `plt.show()`
+    early would, under Jupyter's inline backend, capture the figure
+    immediately and miss anything added afterward.
+    """
+    width, height = env.bounds
+    fig, axes = plt.subplots(
+        1, len(field_names), figsize=(4.5 * len(field_names), 4), squeeze=False
+    )
+
+    for ax, field_name in zip(axes[0], field_names):
+        image = ax.imshow(
+            values_by_field[field_name],
+            origin="lower",
+            extent=[0, width, 0, height],
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+        )
+        ax.set_aspect("equal")
+        fig.colorbar(image, ax=ax, label=field_name)
+        ax.set_title(env.name, loc="left")
+        ax.set_title(f"t = {time:.2f}", loc="right")
+
+    fig.tight_layout()
+    return fig
+
+
 def _save_frames(frames, save_path, filename, fps):
     """Save pre-rendered RGBA frames as an animated GIF under save_path."""
     os.makedirs(save_path, exist_ok=True)
@@ -153,59 +226,15 @@ def _save_frames(frames, save_path, filename, fps):
     return filepath
 
 
-def visualize(
-    simulation,
-    red=None,
-    green=None,
-    blue=None,
-    interval=200,
-    save_path=None,
-    filename=_DEFAULT_FILENAME,
-    show_progress=True,
-    stride=1,
-):
+def _display_and_save(frames, interval, save_path, filename):
     """
-    Show a 2D animation of a Simulation's cells over time in a pop-up window.
+    Save (optionally) and interactively play back pre-rendered RGBA frames.
 
-    Every frame is rendered to an in-memory image up front (see
-    `_render_frames`) rather than drawing cell patches live during
-    interactive playback, so playback stays smooth no matter how many cells
-    the colony grows to.
-
-    Args:
-        simulation: A `Simulation` instance that has already been `run()`.
-        red, green, blue: Optional chemical species names. Each cell's color
-            in that channel is its concentration of the given species,
-            normalized by the species' maximum value over the simulation.
-            Channels left as None default to a constant mid-gray value.
-        interval: Delay between animation frames, in milliseconds.
-        save_path: Optional directory to save the animation into, as an
-            animated GIF. Created if it doesn't already exist. If None
-            (default), the animation is only shown, not saved.
-        filename: File name to save under, within `save_path`. Defaults to
-            "simulation.gif".
-        show_progress: Whether to show a progress bar while rendering frames.
-        stride: Only render every `stride`-th recorded time step (default 1 =
-            every step). Use stride > 1 to produce a shorter GIF without
-            re-running the simulation.
-
-    Returns:
-        The `matplotlib.animation.FuncAnimation` driving the pop-up window.
+    Shared by `Simulation.visualize_colony` and `Simulation.visualize_field`:
+    once a list of frames has been rendered ahead of time, showing (and
+    optionally saving) them works identically regardless of what the frames
+    depict.
     """
-    df = simulation.to_dataframe()
-    env_by_time = {t: env for t, env in simulation.env_history}
-
-    scales = {}
-    for species in (red, green, blue):
-        if species is not None and species in df.columns:
-            scales[species] = df[species].max()
-
-    times = sorted(df["time"].unique())[::stride]
-
-    frames = _render_frames(
-        df, times, env_by_time, red, green, blue, scales, show_progress
-    )
-
     if save_path is not None:
         _save_frames(frames, save_path, filename, fps=1000.0 / interval)
 
@@ -223,7 +252,3 @@ def visualize(
     )
     plt.show()
     return anim
-
-
-def plot_field():
-    pass
