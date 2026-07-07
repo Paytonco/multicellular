@@ -4,7 +4,6 @@ from .core.environment import Environment, Field
 from .core.reactions import ReactionNetwork
 from .core.simulation import Simulation
 from .utils.parallel import run_replicates
-from .utils.visualization import visualize
 
 __all__ = [
     "Cell",
@@ -13,6 +12,5 @@ __all__ = [
     "Field",
     "Simulation",
     "ReactionNetwork",
-    "visualize",
     "run_replicates",
 ]
