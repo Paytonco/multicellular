@@ -12,6 +12,13 @@ from tqdm import tqdm
 # Default color used for any RGB channel that isn't tied to a chemical species.
 _DEFAULT_CHANNEL_VALUE = 0.3
 
+# Transparency and stacking order for the optional field heatmap drawn
+# behind cells in `_render_frames`: below the cell patches (zorder=2) but
+# above the in-bounds white background (zorder=1), so it reads as a subtle
+# backdrop rather than competing with the cells for attention.
+_FIELD_OVERLAY_ALPHA = 0.45
+_FIELD_OVERLAY_ZORDER = 1.5
+
 
 def _capsule_outline(position, orientation, length, radius, n_points=12):
     """
@@ -49,7 +56,47 @@ def _channel_value(row, species, scale):
     return float(np.clip(value / scale, 0.0, 1.0))
 
 
-def _render_frames(df, times, env_by_time, red, green, blue, scales, show_progress):
+def _add_field_overlay(ax, field_name, values, width, height, cmap, vmin, vmax):
+    """
+    Draw a Field's values as a light, semi-transparent heatmap layer behind
+    the cells, and add a colorbar labeled with the field's name.
+
+    The overlay's extent is exactly the in-bounds rectangle (0 to width, 0
+    to height) that `_render_frames` paints back to white — the same region
+    the red out-of-bounds tint is painted *outside* of — so the overlay
+    replaces that white backdrop within bounds and never bleeds into the
+    tinted margin. `zorder` places it above that white backdrop but below
+    the cell patches (see `_FIELD_OVERLAY_ZORDER`).
+    """
+    image = ax.imshow(
+        values,
+        origin="lower",
+        extent=[0, width, 0, height],
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+        alpha=_FIELD_OVERLAY_ALPHA,
+        zorder=_FIELD_OVERLAY_ZORDER,
+    )
+    ax.figure.colorbar(image, ax=ax, label=field_name)
+    return image
+
+
+def _render_frames(
+    df,
+    times,
+    env_by_time,
+    red,
+    green,
+    blue,
+    scales,
+    show_progress,
+    field_name=None,
+    field_snapshots=None,
+    field_cmap="YlOrRd",
+    field_vmin=0.0,
+    field_vmax=None,
+):
     """
     Render every animation frame to an in-memory RGBA image up front.
 
@@ -87,6 +134,19 @@ def _render_frames(df, times, env_by_time, red, green, blue, scales, show_progre
         Rectangle((0, 0), width, height, facecolor="white", edgecolor="none", zorder=1)
     )
 
+    field_image = None
+    if field_name is not None:
+        field_image = _add_field_overlay(
+            ax,
+            field_name,
+            field_snapshots[times[0]],
+            width,
+            height,
+            field_cmap,
+            field_vmin,
+            field_vmax,
+        )
+
     def cell_color(row):
         return (
             _channel_value(row, red, scales.get(red, 1.0)),
@@ -102,6 +162,9 @@ def _render_frames(df, times, env_by_time, red, green, blue, scales, show_progre
     frames = []
     cell_polygons = []
     for t in tqdm(times, disable=not show_progress, desc="Rendering frames"):
+        if field_image is not None:
+            field_image.set_data(field_snapshots[t])
+
         frame_df = frames_by_time.get(t)
         if frame_df is not None:
             for _, row in frame_df.iterrows():

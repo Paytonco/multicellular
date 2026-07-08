@@ -99,6 +99,10 @@ class Simulation:
         red=None,
         green=None,
         blue=None,
+        field=None,
+        field_cmap="YlOrRd",
+        field_vmin=0.0,
+        field_vmax=None,
         interval=200,
         save_path=None,
         filename=_DEFAULT_FILENAME,
@@ -118,6 +122,20 @@ class Simulation:
                 in that channel is its concentration of the given species,
                 normalized by the species' maximum value over the simulation.
                 Channels left as None default to a constant mid-gray value.
+            field: Optional `Field` name (e.g. "temperature") to draw as a
+                light, semi-transparent heatmap behind the cells, with a
+                colorbar labeled with the field's name. The heatmap is
+                confined to `environment.bounds`, so it's never drawn over
+                the red out-of-bounds tint. None (default) draws no field
+                overlay.
+            field_cmap: Matplotlib colormap name used for the field overlay.
+            field_vmin, field_vmax: Color-scale bounds for the field overlay.
+                `field_vmax` defaults to the field's maximum recorded value
+                over the whole simulation; `field_vmin` defaults to `0.0`.
+                For a field whose values don't start near zero (e.g.
+                temperature), the default `field_vmin=0.0` can wash out a
+                diverging `field_cmap` — pass both explicitly for full
+                contrast across the field's actual range.
             interval: Delay between animation frames, in milliseconds.
             save_path: Optional directory to save the animation into, as an
                 animated GIF. Created if it doesn't already exist. If None
@@ -144,8 +162,26 @@ class Simulation:
 
         times = sorted(df["time"].unique())[::stride]
 
+        field_snapshots = None
+        if field is not None:
+            field_snapshots = {t: fields[field] for t, fields in self.field_history}
+            if field_vmax is None:
+                field_vmax = max(field_snapshots[t].max() for t in times)
+
         frames = _render_frames(
-            df, times, env_by_time, red, green, blue, scales, show_progress
+            df,
+            times,
+            env_by_time,
+            red,
+            green,
+            blue,
+            scales,
+            show_progress,
+            field_name=field,
+            field_snapshots=field_snapshots,
+            field_cmap=field_cmap,
+            field_vmin=field_vmin,
+            field_vmax=field_vmax,
         )
 
         return _display_and_save(frames, interval, save_path, filename)

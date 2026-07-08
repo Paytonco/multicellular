@@ -4,6 +4,7 @@ import matplotlib
 
 matplotlib.use("Agg")  # headless: must be set before pyplot is ever imported
 
+import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 from matplotlib.animation import FuncAnimation  # noqa: E402
@@ -85,6 +86,75 @@ def test_visualize_colony_returns_animation():
 
     anim = sim.visualize_colony(show_progress=False)
     assert isinstance(anim, FuncAnimation)
+
+
+def _colony_with_field_sim(dt=0.1, t_max=0.2, shape=(5, 5), bounds=(20.0, 20.0)):
+    """A Simulation with both a living cell and a chemical Field, for the
+    visualize_colony(field=...) overlay tests."""
+    values = np.zeros(shape)
+    values[:, : shape[1] // 2] = 30.0
+    field = Field("temperature", values, is_chemical=True)
+    env = Environment("field overlay test", shape=shape, bounds=bounds, fields=[field])
+    cell = Cell(id=0, position=[10.0, 10.0], orientation=[1.0, 0.0])
+    colony = Colony([cell], env)
+    sim = Simulation(colony, dt=dt, t_max=t_max)
+    sim.run(show_progress=False)
+    return sim
+
+
+def test_visualize_colony_field_defaults_to_none():
+    import inspect
+
+    assert (
+        inspect.signature(Simulation.visualize_colony).parameters["field"].default
+        is None
+    )
+
+
+def test_visualize_colony_with_field_returns_animation():
+    sim = _colony_with_field_sim()
+    anim = sim.visualize_colony(field="temperature", show_progress=False)
+    assert isinstance(anim, FuncAnimation)
+
+
+def test_visualize_colony_unknown_field_raises_key_error():
+    sim = _colony_with_field_sim()
+    with pytest.raises(KeyError):
+        sim.visualize_colony(field="nonexistent", show_progress=False)
+
+
+def test_add_field_overlay_confines_to_bounds_with_transparency_and_colorbar():
+    from multicellular.utils.visualization import (
+        _FIELD_OVERLAY_ALPHA,
+        _FIELD_OVERLAY_ZORDER,
+        _add_field_overlay,
+    )
+
+    fig, ax = plt.subplots()
+    values = np.array([[0.0, 10.0], [5.0, 2.0]])
+
+    image = _add_field_overlay(
+        ax,
+        "temperature",
+        values,
+        width=100.0,
+        height=50.0,
+        cmap="YlOrRd",
+        vmin=0.0,
+        vmax=10.0,
+    )
+
+    # Extent exactly matches the in-bounds rectangle, so the overlay can
+    # never be drawn over the red out-of-bounds tint outside it.
+    assert tuple(image.get_extent()) == (0, 100.0, 0, 50.0)
+    assert image.get_alpha() == _FIELD_OVERLAY_ALPHA
+    assert image.get_zorder() == _FIELD_OVERLAY_ZORDER
+    assert image.get_cmap().name == "YlOrRd"
+    np.testing.assert_allclose(image.get_array(), values)
+
+    # A colorbar labeled with the field's name was added.
+    assert len(fig.axes) == 2
+    assert fig.axes[1].get_ylabel() == "temperature"
 
 
 def test_plot_field_returns_figure_with_correct_data():

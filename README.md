@@ -759,6 +759,7 @@ df = run_replicates(build_colony, n_replicates=50, dt=0.01, t_max=10.0, n_jobs=-
 ```python
 sim.visualize_colony(
     red=None, green=None, blue=None,
+    field=None, field_cmap="YlOrRd", field_vmin=0.0, field_vmax=None,
     interval=200,
     save_path=None, filename="simulation.gif",
     show_progress=True,
@@ -785,6 +786,29 @@ sim.visualize_colony(red="A", green="B", interval=200)
   is called mid-simulation, the name updates automatically at the frame where
   the switch occurred.
 - `interval` is the delay between frames in milliseconds.
+
+`field` optionally names a `Field` (e.g. `"temperature"`) to draw as a light,
+semi-transparent heatmap behind the cells, with a colorbar labeled with the
+field's name — handy for showing spatial structure (like the extent of a
+chemical gradient) that individual cell coloring alone doesn't make clear,
+especially where cells are sparse:
+
+```python
+sim.visualize_colony(red="temperature", field="temperature", field_cmap="RdYlBu_r")
+```
+
+- The heatmap's extent exactly matches `environment.bounds`, so it's never
+  drawn over the red out-of-bounds tint — it replaces the white in-bounds
+  backdrop instead, staying behind the cells.
+- `field_cmap` is any Matplotlib colormap name.
+- `field_vmin`/`field_vmax` set the heatmap's color scale, fixed across the
+  whole animation. `field_vmax` defaults to the field's maximum recorded
+  value; `field_vmin` defaults to `0.0`. For a field whose values don't
+  start near zero (e.g. temperature), the `0.0` default can push a
+  *diverging* `field_cmap` (like `"RdYlBu_r"`, blue-yellow-red) toward its
+  pale midpoint for the whole plotted range — pass `field_vmin` explicitly
+  (e.g. the field's actual minimum) to spread the full range across the
+  colormap's endpoints.
 
 Every frame (all cell shapes, colors, and the frame labels) is rendered to
 an in-memory image up front, before anything is shown — drawing many
