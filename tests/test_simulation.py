@@ -12,7 +12,7 @@ from multicellular.core.simulation import Simulation
 
 
 def test_simulation_records_growth_and_division():
-    env = Environment("env", shape=(10, 10))
+    env = Environment("env", wall_map=np.zeros((10, 10)))
     rng = np.random.default_rng(0)
     cell = Cell(
         id=0, position=[50.0, 50.0], orientation=[1.0, 0.0], length=2.0, rng=rng
@@ -48,8 +48,21 @@ def test_simulation_records_chemical_concentrations():
     )
     network = ReactionNetwork("linear", {"R": rxn})
 
-    env = Environment("env", shape=(10, 10))
-    cell = Cell(id=0, position=[50.0, 50.0], orientation=[1.0, 0.0], network=network)
+    env = Environment("env", wall_map=np.zeros((10, 10)))
+    # growth_rate=0.0 keeps this cell from ever dividing (the default
+    # growth_rate makes it grow and, with an unseeded rng, non-deterministically
+    # divide within the run window, which would append a second cell's records
+    # and break the "len(df) == 6" assumption below); a seeded rng keeps
+    # Brownian motion reproducible. This test is about chemical concentration
+    # recording, not growth/division timing.
+    cell = Cell(
+        id=0,
+        position=[50.0, 50.0],
+        orientation=[1.0, 0.0],
+        network=network,
+        growth_rate=0.0,
+        rng=np.random.default_rng(0),
+    )
     cell.set_concentration("A", 1.0)
     cell.set_concentration("B", 0.0)
 
@@ -67,8 +80,20 @@ def test_simulation_records_chemical_concentrations():
 
 
 def test_run_again_with_larger_t_max_continues_and_appends_history():
-    env = Environment("env", shape=(10, 10))
-    cell = Cell(id=0, position=[50.0, 50.0], orientation=[1.0, 0.0])
+    env = Environment("env", wall_map=np.zeros((10, 10)))
+    # growth_rate=0.0 keeps this cell from ever dividing (the default
+    # growth_rate makes it grow and, with an unseeded rng, non-deterministically
+    # divide before t=1.0, which appends a second cell's records and breaks the
+    # "exactly one record at t=0.5" assumption below); a seeded rng keeps
+    # Brownian motion reproducible. This test is about run()'s continuation
+    # bookkeeping, not growth/division timing.
+    cell = Cell(
+        id=0,
+        position=[50.0, 50.0],
+        orientation=[1.0, 0.0],
+        growth_rate=0.0,
+        rng=np.random.default_rng(0),
+    )
     colony = Colony([cell], env)
 
     sim = Simulation(colony, dt=0.1, t_max=0.5)
@@ -88,7 +113,7 @@ def test_run_again_with_larger_t_max_continues_and_appends_history():
 
 
 def test_run_again_with_same_t_max_is_a_no_op():
-    env = Environment("env", shape=(10, 10))
+    env = Environment("env", wall_map=np.zeros((10, 10)))
     cell = Cell(id=0, position=[50.0, 50.0], orientation=[1.0, 0.0])
     colony = Colony([cell], env)
 
@@ -103,7 +128,9 @@ def test_run_again_with_same_t_max_is_a_no_op():
 
 def test_run_continues_after_switching_environment():
     field_before = Field("A", np.full((10, 10), 1.0), is_chemical=True)
-    env_before = Environment("before", shape=(10, 10), fields=[field_before])
+    env_before = Environment(
+        "before", wall_map=np.zeros((10, 10)), fields=[field_before]
+    )
     # growth_rate=0.0 isolates this test from growth-driven dilution (see
     # test_cell.py), so the recorded "A" reflects only the chemical field.
     cell = Cell(id=0, position=[50.0, 50.0], orientation=[1.0, 0.0], growth_rate=0.0)
@@ -113,7 +140,7 @@ def test_run_continues_after_switching_environment():
     sim.run(show_progress=False)
 
     field_after = Field("A", np.full((10, 10), 9.0), is_chemical=True)
-    env_after = Environment("after", shape=(10, 10), fields=[field_after])
+    env_after = Environment("after", wall_map=np.zeros((10, 10)), fields=[field_after])
     colony.switch_environment(env_after)
 
     df = sim.run(show_progress=False, t_max=1.0)
@@ -127,7 +154,7 @@ def test_run_continues_after_switching_environment():
 
 
 def test_env_history_tracks_environment_per_timestep():
-    env = Environment("env", shape=(10, 10))
+    env = Environment("env", wall_map=np.zeros((10, 10)))
     cell = Cell(id=0, position=[50.0, 50.0], orientation=[1.0, 0.0])
     colony = Colony([cell], env)
 
@@ -144,14 +171,14 @@ def test_env_history_tracks_environment_per_timestep():
 
 
 def test_env_history_reflects_environment_switch():
-    env_before = Environment("before", shape=(10, 10))
+    env_before = Environment("before", wall_map=np.zeros((10, 10)))
     cell = Cell(id=0, position=[50.0, 50.0], orientation=[1.0, 0.0])
     colony = Colony([cell], env_before)
 
     sim = Simulation(colony, dt=0.1, t_max=0.2)
     sim.run(show_progress=False)
 
-    env_after = Environment("after", shape=(10, 10))
+    env_after = Environment("after", wall_map=np.zeros((10, 10)))
     colony.switch_environment(env_after)
     sim.run(show_progress=False, t_max=0.4)
 
@@ -168,7 +195,9 @@ def test_field_history_tracks_field_values_per_timestep():
     values = np.zeros(shape)
     values[2, 2] = 10.0
     field = Field("dye", values, diffuses=True, diffusivity=5e-10)
-    env = Environment("env", shape=shape, bounds=(20.0, 20.0), fields=[field])
+    env = Environment(
+        "env", wall_map=np.zeros(shape), size=(20.0, 20.0), fields=[field]
+    )
     colony = Colony([], env)
 
     sim = Simulation(colony, dt=0.1, t_max=0.3)
