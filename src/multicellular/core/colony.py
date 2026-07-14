@@ -115,7 +115,12 @@ class Colony:
             environment: the shared Environment.
             k: Hookean contact stiffness (force / length).
             k_wall: Hookean stiffness for cell-wall contacts (wallSpec.txt).
-                Defaults to `k` (walls no stiffer than cells).
+                Defaults to `10 * k` (walls much stiffer than cells, so a
+                wall behaves close to a rigid boundary rather than yielding
+                like another cell would). Must be tuned alongside `dt`
+                like `k` (see `_apply_wall_forces`/README): explicit-Euler
+                contact dynamics are only stable while
+                `dt < 2 * drag * length / k_wall`.
             drag: isotropic drag constant for contact dynamics.
                   Translational drag: ζ_t = drag * length.
                   Rotational drag:    ζ_r = (drag / 12) * length³.
@@ -134,7 +139,7 @@ class Colony:
         self.cells = list(cells)
         self.environment = environment
         self.k = k
-        self.k_wall = k if k_wall is None else k_wall
+        self.k_wall = 10.0 * k if k_wall is None else k_wall
         self.drag = drag
         self.survival_conditions = self._validate_survival_conditions(
             survival_conditions

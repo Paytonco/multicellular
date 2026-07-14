@@ -569,9 +569,12 @@ def test_wall_force_does_not_trigger_from_the_far_side_of_a_thick_wall():
 
     colony._apply_contact_forces(dt=0.01, alive=[cell])
 
-    # A single small step of mild penetration should nudge the cell only
-    # slightly left, not launch it across the environment.
-    assert -1.0 < cell.position[0] - 40.7 < 0.0
+    # A single step of mild penetration against the (now much stiffer
+    # default) k_wall should nudge the cell left, but not overshoot past
+    # the true equilibrium (center at x=38.5, a distance of 2.2 from the
+    # start) -- which a spurious contact against the far face's infinite
+    # line would do.
+    assert -2.2 < cell.position[0] - 40.7 < 0.0
 
 
 def test_wall_force_face_does_not_reach_beyond_its_finite_extent():
@@ -628,10 +631,10 @@ def test_wall_corner_stops_a_cell_rounding_a_peninsula_tip():
     assert cell.position[0] == pytest.approx(50.0, abs=1e-9)
 
 
-def test_k_wall_defaults_to_k():
+def test_k_wall_defaults_to_ten_times_k():
     env = _wall_block_env()
     colony = Colony([], env, k=7.5)
-    assert colony.k_wall == 7.5
+    assert colony.k_wall == 75.0
 
 
 def test_k_wall_can_be_overridden():

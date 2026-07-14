@@ -531,9 +531,13 @@ colony.step(dt=0.1)
   how hard cells push against one another when they overlap. Must be tuned
   alongside `dt`; the explicit integrator is stable when
   `dt < 2 * drag * length / k`.
-- **`k_wall`** (default: same as `k`): Hookean stiffness for cell-wall contacts
-  (see [Wall forces](#wall-forces) below). Pass a separate value if walls
-  should be stiffer (or softer) than cells.
+- **`k_wall`** (default: `10 * k`): Hookean stiffness for cell-wall contacts
+  (see [Wall forces](#wall-forces) below). Walls default to much stiffer than
+  cells, so they behave close to a rigid boundary rather than yielding like
+  another cell would; pass an explicit value to override. Like `k`, it must
+  be tuned alongside `dt` — the explicit integrator is stable when
+  `dt < 2 * drag * length / k_wall`, so a much stiffer `k_wall` needs a
+  correspondingly smaller `dt`.
 - **`drag`** (default `1.0`): isotropic drag constant for contact dynamics
   (force · time / length²). Sets the translational drag `ζ_t = drag * length`
   and rotational drag `ζ_r = (drag / 12) * length³`.
