@@ -14,10 +14,28 @@ _DEFAULT_CHANNEL_VALUE = 0.3
 
 # Transparency and stacking order for the optional field heatmap drawn
 # behind cells in `_render_frames`: below the cell patches (zorder=2) but
-# above the in-bounds white background (zorder=1), so it reads as a subtle
+# above the wall_map background (zorder=1), so it reads as a subtle
 # backdrop rather than competing with the cells for attention.
 _FIELD_OVERLAY_ALPHA = 0.45
 _FIELD_OVERLAY_ZORDER = 1.5
+
+# wall_map entry -> RGB, used to paint the environment background: media (0)
+# is left white/uncolored so it doesn't compete with the field overlay, wall
+# (1) is a solid neutral gray, out-of-bounds (-1) is the same red tint as the
+# margin beyond the environment's physical extent.
+_WALL_MAP_COLORS = {
+    -1: (0.86, 0.24, 0.24),
+    0: (1.0, 1.0, 1.0),
+    1: (0.35, 0.35, 0.35),
+}
+
+
+def _wall_map_rgba(wall_map):
+    """Render a wall_map matrix as an RGBA image per `_WALL_MAP_COLORS`."""
+    rgba = np.ones(wall_map.shape + (4,))
+    for value, color in _WALL_MAP_COLORS.items():
+        rgba[wall_map == value, 0:3] = color
+    return rgba
 
 
 def _capsule_outline(position, orientation, length, radius, n_points=12):
@@ -61,12 +79,12 @@ def _add_field_overlay(ax, field_name, values, width, height, cmap, vmin, vmax):
     Draw a Field's values as a light, semi-transparent heatmap layer behind
     the cells, and add a colorbar labeled with the field's name.
 
-    The overlay's extent is exactly the in-bounds rectangle (0 to width, 0
-    to height) that `_render_frames` paints back to white — the same region
-    the red out-of-bounds tint is painted *outside* of — so the overlay
-    replaces that white backdrop within bounds and never bleeds into the
-    tinted margin. `zorder` places it above that white backdrop but below
-    the cell patches (see `_FIELD_OVERLAY_ZORDER`).
+    The overlay's extent is exactly the environment rectangle (0 to width, 0
+    to height) that `_render_frames` paints its wall_map background onto —
+    the same region the red out-of-bounds tint is painted *outside* of — so
+    the overlay sits on top of that background within bounds and never
+    bleeds into the tinted margin. `zorder` places it above the wall_map
+    background but below the cell patches (see `_FIELD_OVERLAY_ZORDER`).
     """
     image = ax.imshow(
         values,
@@ -106,7 +124,7 @@ def _render_frames(
     blitting, regardless of how large the colony grows.
     """
     first_env = next(iter(env_by_time.values()))
-    width, height = first_env.bounds
+    width, height = first_env.size
     pad = max(width, height) * 0.1
     x_min = min(0.0, df["position_x"].min()) - pad
     x_max = max(width, df["position_x"].max()) + pad
@@ -118,8 +136,10 @@ def _render_frames(
     ax.set_ylim(y_min, y_max)
     ax.set_aspect("equal")
 
-    # Tint everything red, then paint the in-bounds region back to white so
-    # only the out-of-bounds margin remains tinted.
+    # Tint the margin beyond the environment's physical extent red (out of
+    # bounds), then paint the environment itself from its wall_map: media
+    # white, walls gray, and any interior out-of-bounds (-1) cells the same
+    # red as the margin.
     ax.add_patch(
         Rectangle(
             (x_min, y_min),
@@ -130,8 +150,12 @@ def _render_frames(
             zorder=0,
         )
     )
-    ax.add_patch(
-        Rectangle((0, 0), width, height, facecolor="white", edgecolor="none", zorder=1)
+    ax.imshow(
+        _wall_map_rgba(first_env.wall_map),
+        origin="lower",
+        extent=[0, width, 0, height],
+        zorder=1,
+        interpolation="nearest",
     )
 
     field_image = None
@@ -207,7 +231,7 @@ def _render_field_frames(
     cell colonies.
     """
     first_env = next(iter(env_by_time.values()))
-    width, height = first_env.bounds
+    width, height = first_env.size
 
     fig, ax = plt.subplots()
     ax.set_aspect("equal")
@@ -249,7 +273,7 @@ def _render_field_plot(field_names, time, env, values_by_field, cmap, vmin, vmax
     early would, under Jupyter's inline backend, capture the figure
     immediately and miss anything added afterward.
     """
-    width, height = env.bounds
+    width, height = env.size
     fig, axes = plt.subplots(
         1, len(field_names), figsize=(4.5 * len(field_names), 4), squeeze=False
     )

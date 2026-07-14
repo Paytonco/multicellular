@@ -19,9 +19,12 @@ tested:
 - Environment with spatially-varying diffusivity and viscosity fields, plus
   per-field diffusion (a mass-conserving finite-difference solver) for any
   `Field` marked `diffuses=True`
-- Colony with overdamped-Langevin Brownian motion, Hookean cell-cell contact
-  forces and torques, chemical field sensing and export (secretion), and
-  optional chemical survival conditions
+- Colony with overdamped-Langevin Brownian motion, Hookean cell-cell and
+  cell-wall contact forces and torques, chemical field sensing and export
+  (secretion), and optional chemical survival conditions
+- Trap walls: an `Environment`'s `wall_map` marks any grid cell as media,
+  wall, or out-of-bounds, and `Colony` pushes cells off wall geometry with
+  the same Hookean contact model used between cells
 - Simulation loop with full history recording
 - 2D animation of a colony via `Simulation.visualize_colony()`, or of a
   chemical `Field` over time via `Simulation.visualize_field()`; static
@@ -290,8 +293,11 @@ named `Field`s — matrices of values over a shared grid (e.g. chemical
 concentrations, temperature, surface roughness), validating that every field
 added matches its grid `shape`.
 
-Every `Environment` requires a `name` string as its first argument. The name
-identifies the medium or experimental condition and is displayed on the
+Every `Environment` requires a `name` string as its first argument, and a
+`wall_map` — a 2D matrix of `-1`/`0`/`1` entries (see
+[Walls and out-of-bounds](#walls-and-out-of-bounds-wall_map) below) whose
+shape becomes the environment's grid `shape`, shared by every `Field`. The
+name identifies the medium or experimental condition and is displayed on the
 top-left of every animation frame produced by `Simulation.visualize_colony()`.
 
 ```python
@@ -299,7 +305,7 @@ import numpy as np
 from multicellular import Environment, Field
 
 glucose = Field("glucose", np.ones((10, 10)))
-env = Environment("LB medium", shape=(10, 10), fields=[glucose])
+env = Environment("LB medium", wall_map=np.zeros((10, 10)), fields=[glucose])
 
 env.get_field("glucose")
 ```
@@ -345,8 +351,21 @@ however many equal sub-steps the stability bound
 `dt <= dx²dy² / (2D(dx²+dy²))` requires, so it stays numerically stable
 regardless of the timestep used elsewhere in the simulation.
 
+Diffusion also respects `wall_map` (see
+[Walls and out-of-bounds](#walls-and-out-of-bounds-wall_map) below): a wall
+(`1`) cell is a no-flux boundary internal to the grid, exactly like the
+domain edge already is — flux across a media/wall face is zeroed instead of
+letting mass flow into a cell that has no medium in it, and wall cells are
+excluded from the update entirely, so they never accumulate mass. This keeps
+the discrete flux exactly antisymmetric between every interacting pair of
+cells, so total mass stays conserved even with walls present; mass that
+would have crossed a wall instead piles up against it (or routes around it,
+if the wall doesn't fully enclose that region). Out-of-bounds (`-1`) cells
+are unaffected and remain ordinary diffusive medium — only walls block
+diffusion.
+
 ```python
-env = Environment("LB medium", shape=(10, 10), fields=[glucose])
+env = Environment("LB medium", wall_map=np.zeros((10, 10)), fields=[glucose])
 env.diffuse(dt=0.1)  # also called automatically by Colony.step
 ```
 
@@ -372,37 +391,82 @@ import numpy as np
 from multicellular import Environment
 
 # Defaults: uniform water at 37°C
-env = Environment("M9 minimal", shape=(10, 10))
+env = Environment("M9 minimal", wall_map=np.zeros((10, 10)))
 
 # Spatially-varying viscosity (e.g. a gel region in the upper half)
 eta = np.full((10, 10), 6.9e-4)
 eta[:5, :] = 5e-3  # more viscous upper half
-env = Environment("gel slab", shape=(10, 10), eta=eta)
+env = Environment("gel slab", wall_map=np.zeros((10, 10)), eta=eta)
 
 # Both fields can be set independently
-env = Environment("custom medium", shape=(10, 10), diffusivity=D, eta=eta)
+env = Environment("custom medium", wall_map=np.zeros((10, 10)), diffusivity=D, eta=eta)
 ```
 
-`Environment.bounds` defaults to `(100.0, 100.0)`, representing a 100 μm ×
+`Environment.size` defaults to `(100.0, 100.0)`, representing a 100 μm ×
 100 μm square that cells interact within, but is configurable via the
-`bounds=` constructor argument. A field's grid `shape` is independent of
-`bounds` and may cover an area larger than the simulation bounds.
-`env.in_bounds(position)` checks whether a 2D position (e.g. a cell's center
-of mass) falls within `[0, bounds[0]] × [0, bounds[1]]`.
+`size=` constructor argument. A field's grid `shape` (taken from `wall_map`)
+is independent of `size` and may cover an area larger than the simulation
+extent. `env.in_bounds(position)` checks whether a 2D position (e.g. a
+cell's center of mass) falls within `[0, size[0]] × [0, size[1]]` *and* does
+not land on a `wall_map` out-of-bounds (`-1`) cell (see next section).
 
 `Environment` also takes a `depth` (μm, default `1.0` — twice the default
 `Cell` radius of 0.5 μm, i.e. sized for a single-cell-thick microfluidics
-monolayer). Together with the grid spacing implied by `shape` and `bounds`,
-this gives every grid cell a well-defined physical volume via the
+monolayer). Together with the grid spacing implied by `wall_map`'s shape and
+`size`, this gives every grid cell a well-defined physical volume via the
 `grid_cell_volume` property (`dx * dy * depth`, in μm³, matching
 `Cell.compute_volume()`'s units) — used to convert molecule counts secreted
 by cells into a field concentration change; see
 [Secretion (chemical export)](#secretion-chemical-export) below.
 
 ```python
-env = Environment("LB medium", shape=(10, 10), bounds=(50.0, 50.0), depth=1.0)
+env = Environment("LB medium", wall_map=np.zeros((10, 10)), size=(50.0, 50.0), depth=1.0)
 env.grid_cell_volume  # dx * dy * depth = 5.0 * 5.0 * 1.0 = 25.0 μm³
 ```
+
+#### Walls and out-of-bounds (`wall_map`)
+
+`wall_map` is a matrix of `-1`, `0`, and `1` entries, scaled to fit `size`,
+that gives the environment its terrain:
+
+- **`0` — media.** Cells move and react freely.
+- **`1` — wall.** Cells feel a Hookean repulsion from wall geometry, the same
+  contact model used between cells (see
+  [Wall forces](#wall-forces) below) — they are pushed off rather than
+  killed.
+- **`-1` — out of bounds.** A cell whose center of mass lands here is killed
+  by `enforce_bounds` (see [`Colony`](#colony) below), the same as leaving
+  `size`'s physical extent entirely.
+
+```python
+import numpy as np
+from multicellular import Environment
+
+# A 100x100um chamber with a 20x20um solid wall block at its center, and
+# the top row marked as a death zone.
+wall_map = np.zeros((10, 10))
+wall_map[4:6, 4:6] = 1   # wall block: x in [40, 60], y in [40, 60]
+wall_map[9, :] = -1      # y in [90, 100] is out of bounds
+
+env = Environment("trap", wall_map=wall_map, size=(100.0, 100.0))
+```
+
+At construction, `Environment` rasterizes `wall_map` into the flat faces and
+corner points `Colony` needs for contact forces (`env.wall_faces`,
+`env.wall_corners`): every wall-cell edge bordering a *media* cell is an
+exposed edge, collinear runs of exposed edges merge into one flat face (so a
+straight wall reads as one long face, not one tiny face per pixel), and each
+face's own endpoints become a corner point. A wall cell's edge is **not**
+exposed against another wall cell (fully interior to a solid block, so cells
+can never reach it), against an out-of-bounds (`-1`) cell, or against the
+grid's outer boundary — a `-1` cell already kills any cell whose center
+reaches it, and there's no medium beyond the grid edge to push a cell back
+into, so generating a repelling face in either case would be moot at best.
+For a wall cell that borders out-of-bounds on one side and media on another
+(e.g. a trap wall next to an open, unwalled outflow — see
+`examples/mother_machine_demo.ipynb`), it would also be actively wrong: it
+would push cells along the unrelated out-of-bounds-facing side instead of
+leaving that direction untouched.
 
 #### Secretion (chemical export)
 
@@ -431,7 +495,7 @@ cell = Cell(id=0, position=[50.0, 50.0], orientation=[1.0, 0.0], network=network
 cell.set_concentration("X", 1.0)
 
 field = Field("X", np.zeros((10, 10)))  # secretion sink
-env = Environment("LB medium", shape=(10, 10), fields=[field])
+env = Environment("LB medium", wall_map=np.zeros((10, 10)), fields=[field])
 colony = Colony([cell], env)
 
 colony.step(dt=0.1)
@@ -451,24 +515,39 @@ combining both lets secreted material spread spatially on subsequent steps.
 A `Colony` is a collection of `Cell`s living in an `Environment`:
 
 ```python
+import numpy as np
 from multicellular import Cell, Colony, Environment
 
-env = Environment("LB medium", shape=(10, 10))
+env = Environment("LB medium", wall_map=np.zeros((10, 10)))
 cells = [Cell(id=0, position=[10.0, 10.0], orientation=[1.0, 0.0])]
 
 colony = Colony(cells, env)
 colony.step(dt=0.1)
 ```
 
-`Colony` accepts two mechanical parameters:
+`Colony` accepts three mechanical parameters:
 
 - **`k`** (default `10.0`): Hookean contact stiffness (force / length). Controls
   how hard cells push against one another when they overlap. Must be tuned
   alongside `dt`; the explicit integrator is stable when
   `dt < 2 * drag * length / k`.
+- **`k_wall`** (default: `10 * k`): Hookean stiffness for cell-wall contacts
+  (see [Wall forces](#wall-forces) below). Walls default to much stiffer than
+  cells, so they behave close to a rigid boundary rather than yielding like
+  another cell would; pass an explicit value to override. Like `k`, it must
+  be tuned alongside `dt` — the explicit integrator is stable when
+  `dt < 2 * drag * length / k_wall`, so a much stiffer `k_wall` needs a
+  correspondingly smaller `dt`.
 - **`drag`** (default `1.0`): isotropic drag constant for contact dynamics
   (force · time / length²). Sets the translational drag `ζ_t = drag * length`
   and rotational drag `ζ_r = (drag / 12) * length³`.
+
+It also accepts **`brownian_motion`** (default `True`): whether `step`
+applies an overdamped-Langevin Brownian kick to living cells each step (see
+[Brownian motion](#brownian-motion) below). Set `brownian_motion=False` to
+disable thermal motion entirely, e.g. for a tightly-confined geometry (like
+a mother-machine trap; see `examples/mother_machine_demo.ipynb`) where only
+contact forces should move cells.
 
 It also accepts an optional **`survival_conditions`** parameter: a list of
 `(species, operator, threshold)` tuples, e.g. `[("A", ">", 0)]`. Every step,
@@ -509,13 +588,17 @@ above — and defaults to `"ODE"`, same as `Cell.step`):
    Running after step 4 means a cell sensing the same field it just exported
    into sees this step's freshly-deposited mass.
 6. **Bounds enforcement** — kills any living cell whose center of mass lies
-   outside `environment.bounds`.
+   outside `environment.size`'s physical extent or on a `wall_map`
+   out-of-bounds (`-1`) cell (see
+   [Walls and out-of-bounds](#walls-and-out-of-bounds-wall_map) above).
 7. **Survival conditions** — kills any living cell whose concentrations
    violate a `survival_conditions` entry (no-op if none were given).
-8. **Brownian motion** — applies an overdamped-Langevin random kick to every
-   surviving living cell (see [Brownian motion](#brownian-motion) below).
+8. **Brownian motion** — if `brownian_motion=True` (the default), applies an
+   overdamped-Langevin random kick to every surviving living cell (see
+   [Brownian motion](#brownian-motion) below); no-op if `False`.
 9. **Contact forces** — applies pairwise Hookean repulsion and torques between
-   all overlapping living cells (see [Contact forces](#contact-forces) below).
+   all overlapping living cells, and between cells and wall geometry (see
+   [Contact forces](#contact-forces) and [Wall forces](#wall-forces) below).
 10. **Division** — replaces any cell with `cell.ready_to_divide() == True` with
     its two daughter cells, each assigned a new unique `id`.
 
@@ -539,7 +622,7 @@ post-induction state:
 import numpy as np
 from multicellular import Cell, Colony, Environment, Field, Simulation
 
-env = Environment("uninduced", shape=(10, 10))
+env = Environment("uninduced", wall_map=np.zeros((10, 10)))
 cell = Cell(id=0, position=[50.0, 50.0], orientation=[1.0, 0.0])
 colony = Colony([cell], env)
 
@@ -548,7 +631,7 @@ sim.run()  # simulate before induction
 
 # At t=5.0, add an inducer (e.g. IPTG) uniformly across the medium.
 iptg = Field("IPTG", np.full((10, 10), 1.0), is_chemical=True)
-induced_env = Environment("+ IPTG", shape=(10, 10), fields=[iptg])
+induced_env = Environment("+ IPTG", wall_map=np.zeros((10, 10)), fields=[iptg])
 colony.switch_environment(induced_env)
 
 sim.run(t_max=10.0)  # continue simulating, with IPTG now present
@@ -650,6 +733,52 @@ searched. This produces identical force/torque results to an all-pairs check
 but scales roughly linearly with colony size instead of quadratically, which
 matters since colonies grow exponentially via division.
 
+#### Wall forces
+
+Cells feel a Hookean repulsion from the environment's `wall_map` geometry
+(`env.wall_faces`, `env.wall_corners` — see
+[Walls and out-of-bounds](#walls-and-out-of-bounds-wall_map) above), folded
+into the same per-cell force and torque sums as cell-cell contact before the
+overdamped update runs, so both contact types are resolved together every
+step. There are two contact primitives:
+
+- **Flat faces.** Rather than a single closest point on the cell axis (which
+  is non-unique for a rod lying parallel to the face — the same degeneracy as
+  parallel cell-cell contact), each axis endpoint `e` of the cell is sampled
+  independently against every face whose finite extent it falls within (the
+  tangential projection of `e` must land between the face's two endpoints —
+  this is what lets a cell pass freely through an open end of a wall run
+  instead of being pushed off an unbounded plane), and only the single
+  *nearest* such face (smallest `|h|`) actually contributes:
+
+  ```
+  h = (e − x_w) · n_w      # signed perpendicular distance from e to the face
+  δ = R_i − h               # penetration depth
+  ```
+
+  where `x_w` is a point on the face and `n_w` its inward unit normal. When
+  `δ > 0`, the force `F = k_wall · δ · n_w` (and matching torque) is added.
+  Summing over both endpoints handles every orientation with no special
+  cases: a rod lying parallel to the face gets an equal push from both ends
+  (straight, zero net torque); a tilted rod gets an off-center push from
+  whichever end penetrates more, pivoting it to lie flat against the wall.
+- **Corner points.** Near the end of a finite face, or an inside corner, a
+  cell rounds the tip rather than being blocked by an unbounded plane. This
+  is point contact between the cell's axis segment and the corner point —
+  the same segment-distance geometry as cell-cell contact, with one segment
+  collapsed to a point.
+
+Because a wall face's perpendicular distance `h` is measured against its
+*infinite* supporting line, an endpoint that has mildly penetrated the near
+face of a wall thicker than one grid cell could otherwise also read as
+deeply "behind" a far parallel face of the same block — whose line it never
+actually approached. Picking only the nearest face by `|h|` (among faces
+whose span the endpoint falls within) resolves this correctly regardless of
+wall thickness: the near face always wins for a thick block, and for a
+thin (single-pixel) wall it's the only candidate regardless of how deep an
+endpoint has penetrated, so it keeps pushing back rather than silently
+letting the endpoint tunnel through once some fixed depth is exceeded.
+
 ### `Simulation`
 
 `Simulation` steps a `Colony` from `t=0` to `t=t_max` in increments of `dt`,
@@ -660,9 +789,10 @@ method used to advance every cell's `ReactionNetwork` each step — pass
 constructing it:
 
 ```python
+import numpy as np
 from multicellular import Cell, Colony, Environment, Simulation
 
-env = Environment("LB medium", shape=(10, 10))
+env = Environment("LB medium", wall_map=np.zeros((10, 10)))
 cell = Cell(id=0, position=[50.0, 50.0], orientation=[1.0, 0.0])
 colony = Colony([cell], env)
 
@@ -721,7 +851,7 @@ from multicellular import Cell, Colony, Environment, run_replicates
 
 def build_colony(replicate_id):
     import numpy as np
-    env = Environment("LB medium", shape=(10, 10))
+    env = Environment("LB medium", wall_map=np.zeros((10, 10)))
     cell = Cell(
         id=0,
         position=[50.0, 50.0],
@@ -780,7 +910,10 @@ sim.visualize_colony(red="A", green="B", interval=200)
   species' maximum value over the whole simulation. Channels left as `None`
   default to a constant mid-gray value.
 - Dead cells stop appearing in the frame after they die.
-- The region outside `environment.bounds` is tinted red.
+- `environment.wall_map` is drawn as the background within `environment.size`:
+  media (`0`) is white, walls (`1`) are solid gray, and out-of-bounds (`-1`)
+  cells are tinted red — the same red used for the margin outside `size`'s
+  physical extent.
 - Each frame shows the active environment's `name` on the top-left and the
   current time (`t = ...`) on the top-right. When `colony.switch_environment`
   is called mid-simulation, the name updates automatically at the frame where
@@ -797,9 +930,9 @@ especially where cells are sparse:
 sim.visualize_colony(red="temperature", field="temperature", field_cmap="RdYlBu_r")
 ```
 
-- The heatmap's extent exactly matches `environment.bounds`, so it's never
-  drawn over the red out-of-bounds tint — it replaces the white in-bounds
-  backdrop instead, staying behind the cells.
+- The heatmap's extent exactly matches `environment.size`, so it's never
+  drawn over the red out-of-bounds tint — it sits on top of the `wall_map`
+  background instead, staying behind the cells.
 - `field_cmap` is any Matplotlib colormap name.
 - `field_vmin`/`field_vmax` set the heatmap's color scale, fixed across the
   whole animation. `field_vmax` defaults to the field's maximum recorded
@@ -933,10 +1066,9 @@ Run a specific test file:
 ```bash
 pytest tests/test_cell.py        # Cell geometry, growth, division, and pending chemical export
 pytest tests/test_reactions.py   # Reaction rate laws, stoichiometry, ODE/SSA/CLE stepping, export-reaction mass conservation
-pytest tests/test_environment.py # Environment/Field construction, validation, diffusion, and grid cell volume
-pytest tests/test_colony.py      # Colony bounds enforcement, division, dead-cell behavior, field sensing/diffusion/export
+pytest tests/test_environment.py # Environment/Field construction, wall_map validation and geometry, diffusion, and grid cell volume
+pytest tests/test_colony.py      # Colony bounds enforcement, wall/cell-cell contact forces, division, dead-cell behavior, field sensing/diffusion/export
 pytest tests/test_simulation.py  # Simulation loop and DataFrame export
 pytest tests/test_visualization.py # visualize_colony/visualize_field/plot_field: animation output, GIF export, stride, static plots
 pytest tests/test_parallel.py    # run_replicates: parallel execution, independence, correctness
-pytest tests/test_dummy.py       # trivial sanity check
 ```

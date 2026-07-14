@@ -78,17 +78,49 @@ def _segment_segment_closest(a1x, a1y, b1x, b1y, a2x, a2y, b2x, b2y):
     return p1x, p1y, p2x, p2y, d
 
 
+def _segment_point_closest(a1x, a1y, b1x, b1y, px, py):
+    """
+    Closest point on segment [a1, b1] to point (px, py).
+
+    Returns (qx, qy, d): q the closest axis point, d = |q - (px, py)|.
+    """
+    dx, dy = b1x - a1x, b1y - a1y
+    len_sq = dx * dx + dy * dy
+    if len_sq < _PARALLEL_TOL:
+        t = 0.0
+    else:
+        t = min(max(((px - a1x) * dx + (py - a1y) * dy) / len_sq, 0.0), 1.0)
+    qx, qy = a1x + t * dx, a1y + t * dy
+    return qx, qy, math.hypot(qx - px, qy - py)
+
+
 class Colony:
     """
     A collection of Cells living within an Environment.
     """
 
-    def __init__(self, cells, environment, k=10.0, drag=1.0, survival_conditions=None):
+    def __init__(
+        self,
+        cells,
+        environment,
+        k=10.0,
+        k_wall=None,
+        drag=1.0,
+        survival_conditions=None,
+        brownian_motion=True,
+    ):
         """
         Args:
             cells: initial list of Cell objects.
             environment: the shared Environment.
             k: Hookean contact stiffness (force / length).
+            k_wall: Hookean stiffness for cell-wall contacts (wallSpec.txt).
+                Defaults to `10 * k` (walls much stiffer than cells, so a
+                wall behaves close to a rigid boundary rather than yielding
+                like another cell would). Must be tuned alongside `dt`
+                like `k` (see `_apply_wall_forces`/README): explicit-Euler
+                contact dynamics are only stable while
+                `dt < 2 * drag * length / k_wall`.
             drag: isotropic drag constant for contact dynamics.
                   Translational drag: ζ_t = drag * length.
                   Rotational drag:    ζ_r = (drag / 12) * length³.
@@ -98,14 +130,21 @@ class Colony:
                 using `operator` (one of ">", ">=", "<", "<=", "==", "!=");
                 a cell dies as soon as any condition is violated. A species
                 missing from a cell's concentrations is treated as 0.0.
+            brownian_motion: whether `step` applies overdamped-Langevin
+                Brownian kicks to living cells each step (default True).
+                Set False to disable thermal motion entirely, e.g. for a
+                tightly-confined geometry where only contact forces should
+                move cells.
         """
         self.cells = list(cells)
         self.environment = environment
         self.k = k
+        self.k_wall = 10.0 * k if k_wall is None else k_wall
         self.drag = drag
         self.survival_conditions = self._validate_survival_conditions(
             survival_conditions
         )
+        self.brownian_motion = brownian_motion
         existing_ids = [cell.id for cell in self.cells if cell.id is not None]
         self._next_id = max(existing_ids, default=-1) + 1
 
@@ -181,25 +220,15 @@ class Colony:
         self.enforce_bounds()
         self.enforce_survival_conditions()
         alive = self.living_cells
-        noise = self._draw_brownian_noise(alive)
-        self._apply_brownian_motion(dt, alive, noise)
+        if self.brownian_motion:
+            noise = self._draw_brownian_noise(alive)
+            self._apply_brownian_motion(dt, alive, noise)
         self._apply_contact_forces(dt, alive)
         self.handle_divisions()
 
     def _field_indices(self, positions):
-        """
-        Vectorized nearest-grid-point (row, col) indices for an (n, 2) array
-        of positions in μm.
-
-        Replaces what would otherwise be a per-position clip/divide/cast,
-        called once per cell per field per step; batching it into a single
-        pair of array ops removes that per-cell Python overhead.
-        """
-        shape = self.environment.shape
-        width, height = self.environment.bounds
-        j = np.clip((positions[:, 0] / width * shape[1]).astype(int), 0, shape[1] - 1)
-        i = np.clip((positions[:, 1] / height * shape[0]).astype(int), 0, shape[0] - 1)
-        return i, j
+        """Vectorized nearest-grid-point (row, col) indices for an (n, 2) array of positions in μm."""
+        return self.environment.grid_indices(positions)
 
     def apply_chemical_fields(self):
         """
@@ -379,19 +408,23 @@ class Colony:
 
     def _apply_contact_forces(self, dt, alive=None):
         """
-        Apply pairwise Hookean contact forces and torques to all living cells.
+        Apply pairwise cell-cell and cell-wall Hookean contact forces and
+        torques to all living cells.
 
         For each overlapping cell pair (i, j):
           - overlap δ = R_i + R_j - d  (d: axis-segment distance)
           - force on i: F = k * δ * N  (N: contact normal from j toward i)
           - torque on i: τ = (p_c - c_i) × F  (2D scalar cross product)
-        Dynamics are overdamped:
+        Wall contacts (wallSpec.txt) are folded into the same per-cell force
+        and torque sums by `_apply_wall_forces` before dynamics are applied,
+        so both contact types go through one overdamped update:
           Δc = F / ζ_t * dt,  ζ_t = drag * length
           Δθ = τ / ζ_r * dt,  ζ_r = (drag / 12) * length³
 
-        Candidate pairs are restricted to cells sharing a grid bin or an
-        adjacent one (see _build_spatial_grid), which avoids the O(n²) blowup
-        of testing every pair directly while still finding every contact.
+        Candidate cell-cell pairs are restricted to cells sharing a grid bin
+        or an adjacent one (see _build_spatial_grid), which avoids the O(n²)
+        blowup of testing every pair directly while still finding every
+        contact.
 
         Per-pair math uses plain floats rather than small numpy arrays/dot
         products, since this loop runs for every candidate pair, every step.
@@ -399,7 +432,7 @@ class Colony:
         if alive is None:
             alive = self.living_cells
         n = len(alive)
-        if n < 2:
+        if n == 0:
             return
 
         forces_x = [0.0] * n
@@ -415,59 +448,64 @@ class Colony:
                 (px - hl * ox, py - hl * oy, px + hl * ox, py + hl * oy, px, py)
             )
 
-        grid = self._build_spatial_grid(alive)
+        if n >= 2:
+            grid = self._build_spatial_grid(alive)
 
-        for (gx, gy), home_indices in grid.items():
-            neighbor_indices = []
-            for dx in (-1, 0, 1):
-                for dy in (-1, 0, 1):
-                    neighbor_indices.extend(grid.get((gx + dx, gy + dy), ()))
+            for (gx, gy), home_indices in grid.items():
+                neighbor_indices = []
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        neighbor_indices.extend(grid.get((gx + dx, gy + dy), ()))
 
-            for i in home_indices:
-                ci = alive[i]
-                a1x, a1y, b1x, b1y, cix, ciy = endpoints[i]
+                for i in home_indices:
+                    ci = alive[i]
+                    a1x, a1y, b1x, b1y, cix, ciy = endpoints[i]
 
-                for j in neighbor_indices:
-                    if j <= i:
-                        continue
+                    for j in neighbor_indices:
+                        if j <= i:
+                            continue
 
-                    cj = alive[j]
-                    a2x, a2y, b2x, b2y, cjx, cjy = endpoints[j]
+                        cj = alive[j]
+                        a2x, a2y, b2x, b2y, cjx, cjy = endpoints[j]
 
-                    p1x, p1y, p2x, p2y, d = _segment_segment_closest(
-                        a1x, a1y, b1x, b1y, a2x, a2y, b2x, b2y
-                    )
-                    delta = ci.radius + cj.radius - d
+                        p1x, p1y, p2x, p2y, d = _segment_segment_closest(
+                            a1x, a1y, b1x, b1y, a2x, a2y, b2x, b2y
+                        )
+                        delta = ci.radius + cj.radius - d
 
-                    if delta <= 0.0:
-                        continue
+                        if delta <= 0.0:
+                            continue
 
-                    # Contact normal: unit vector from j toward i.
-                    # When axes coincide (d≈0), fall back to center-to-center direction,
-                    # then to ci's perpendicular if centers also coincide.
-                    if d > 1e-12:
-                        Nx, Ny = (p1x - p2x) / d, (p1y - p2y) / d
-                    else:
-                        sepx, sepy = cix - cjx, ciy - cjy
-                        sep_norm = math.hypot(sepx, sepy)
-                        if sep_norm > 1e-12:
-                            Nx, Ny = sepx / sep_norm, sepy / sep_norm
+                        # Contact normal: unit vector from j toward i.
+                        # When axes coincide (d≈0), fall back to center-to-center direction,
+                        # then to ci's perpendicular if centers also coincide.
+                        if d > 1e-12:
+                            Nx, Ny = (p1x - p2x) / d, (p1y - p2y) / d
                         else:
-                            Nx, Ny = -float(ci.orientation[1]), float(ci.orientation[0])
+                            sepx, sepy = cix - cjx, ciy - cjy
+                            sep_norm = math.hypot(sepx, sepy)
+                            if sep_norm > 1e-12:
+                                Nx, Ny = sepx / sep_norm, sepy / sep_norm
+                            else:
+                                Nx, Ny = -float(ci.orientation[1]), float(
+                                    ci.orientation[0]
+                                )
 
-                    Fx, Fy = self.k * delta * Nx, self.k * delta * Ny
-                    pcx, pcy = (p1x + p2x) / 2.0, (p1y + p2y) / 2.0
+                        Fx, Fy = self.k * delta * Nx, self.k * delta * Ny
+                        pcx, pcy = (p1x + p2x) / 2.0, (p1y + p2y) / 2.0
 
-                    # 2D torque: τ = r_x * F_y - r_y * F_x
-                    rix, riy = pcx - cix, pcy - ciy
-                    rjx, rjy = pcx - cjx, pcy - cjy
+                        # 2D torque: τ = r_x * F_y - r_y * F_x
+                        rix, riy = pcx - cix, pcy - ciy
+                        rjx, rjy = pcx - cjx, pcy - cjy
 
-                    forces_x[i] += Fx
-                    forces_y[i] += Fy
-                    forces_x[j] -= Fx
-                    forces_y[j] -= Fy
-                    torques[i] += rix * Fy - riy * Fx
-                    torques[j] -= rjx * Fy - rjy * Fx  # F_ji = -F
+                        forces_x[i] += Fx
+                        forces_y[i] += Fy
+                        forces_x[j] -= Fx
+                        forces_y[j] -= Fy
+                        torques[i] += rix * Fy - riy * Fx
+                        torques[j] -= rjx * Fy - rjy * Fx  # F_ji = -F
+
+        self._apply_wall_forces(alive, endpoints, forces_x, forces_y, torques)
 
         for i, cell in enumerate(alive):
             zeta_t = self.drag * cell.length
@@ -476,8 +514,94 @@ class Colony:
             cell.position[1] += forces_y[i] / zeta_t * dt
             cell.apply_torque(torques[i] / zeta_r, dt)
 
+    def _apply_wall_forces(self, alive, endpoints, forces_x, forces_y, torques):
+        """
+        Accumulate spherocylinder-wall contact forces/torques (wallSpec.txt)
+        into the same per-cell sums `_apply_contact_forces` uses for
+        cell-cell contacts.
+
+        Flat faces (secs 1-2): each cell axis endpoint e is sampled
+        independently against the face's line — h = (e - x_w)·n_w,
+        δ = R_i - h — but only within the face's finite extent (the
+        tangential projection of e must fall between its two endpoints);
+        outside that span the face doesn't reach, and the adjacent corner
+        point (below) takes over, which is what makes an open end of a
+        wall run (or the grid boundary) pass cells through freely rather
+        than being pushed off an unbounded plane.
+
+        h is a signed distance to a face's *infinite* line, so for a wall
+        thicker than one pixel, an endpoint sitting just past the near face
+        can also read as deeply "behind" a far parallel face of the same
+        block (whose line the point never actually approached). Rather than
+        cap that reach at a fixed distance -- which, past the cap, would
+        silently stop pushing back on a point that has tunneled into (or
+        through) a *thin* wall in a single large step, letting it drift out
+        the other side unopposed -- each endpoint interacts with only the
+        single face whose line it is nearest to (smallest |h|) among those
+        whose span it falls within. That's always the physically relevant
+        face: the near one for a thick block, and still the only one for a
+        thin wall no matter how deep the penetration.
+
+        Corner points (sec 3): point contact between the cell's axis
+        segment and the corner, reusing `_segment_point_closest` (the
+        cell-cell segment-distance routine with one segment collapsed to a
+        point).
+        """
+        faces = self.environment.wall_faces
+        corners = self.environment.wall_corners
+        if not faces and not corners:
+            return
+        k_wall = self.k_wall
+
+        for i, ci in enumerate(alive):
+            a1x, a1y, b1x, b1y, cix, ciy = endpoints[i]
+            R = ci.radius
+
+            for ex, ey in ((a1x, a1y), (b1x, b1y)):
+                best_h = best_nx = best_ny = None
+                for x0, y0, x1, y1, nx, ny in faces:
+                    tx, ty = x1 - x0, y1 - y0
+                    L = math.hypot(tx, ty)
+                    if L < _PARALLEL_TOL:
+                        continue
+                    tx, ty = tx / L, ty / L
+                    s = (ex - x0) * tx + (ey - y0) * ty
+                    if s < 0.0 or s > L:
+                        continue
+
+                    h = (ex - x0) * nx + (ey - y0) * ny
+                    if best_h is None or abs(h) < abs(best_h):
+                        best_h, best_nx, best_ny = h, nx, ny
+
+                if best_h is None:
+                    continue
+                delta = R - best_h
+                if delta <= 0.0:
+                    continue
+
+                Fx, Fy = k_wall * delta * best_nx, k_wall * delta * best_ny
+                forces_x[i] += Fx
+                forces_y[i] += Fy
+                torques[i] += (ex - cix) * Fy - (ey - ciy) * Fx
+
+            for cx, cy in corners:
+                qx, qy, d = _segment_point_closest(a1x, a1y, b1x, b1y, cx, cy)
+                delta = R - d
+                if delta <= 0.0:
+                    continue
+
+                if d > 1e-12:
+                    Nx, Ny = (qx - cx) / d, (qy - cy) / d
+                else:
+                    Nx, Ny = -float(ci.orientation[1]), float(ci.orientation[0])
+
+                Fx, Fy = k_wall * delta * Nx, k_wall * delta * Ny
+                forces_x[i] += Fx
+                forces_y[i] += Fy
+                torques[i] += (qx - cix) * Fy - (qy - ciy) * Fx
+
     def enforce_bounds(self):
-        """Kill any cell whose center of mass has left the environment bounds."""
+        """Kill any cell whose center of mass has left the environment's physical extent or entered a wall_map out-of-bounds (-1) cell."""
         for cell in self.cells:
             if cell.alive and not self.environment.in_bounds(cell.position):
                 cell.kill()

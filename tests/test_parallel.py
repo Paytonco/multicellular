@@ -11,7 +11,7 @@ from multicellular.utils.parallel import run_replicates
 
 def _build_growing_colony(replicate_id):
     """A single cell with stochastic division (seeded per replicate)."""
-    env = Environment("env", shape=(10, 10))
+    env = Environment("env", wall_map=np.zeros((10, 10)))
     rng = np.random.default_rng(replicate_id)
     cell = Cell(
         id=0,

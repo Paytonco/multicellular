@@ -17,12 +17,14 @@ from multicellular.core.environment import Environment, Field  # noqa: E402
 from multicellular.core.simulation import Simulation  # noqa: E402
 
 
-def _diffusion_sim(dt=0.1, t_max=0.4, shape=(7, 7), bounds=(20.0, 20.0)):
+def _diffusion_sim(dt=0.1, t_max=0.4, shape=(7, 7), size=(20.0, 20.0)):
     """A cell-free Simulation of a single diffusing Field, for visualize_field tests."""
     values = np.zeros(shape)
     values[shape[0] // 2, shape[1] // 2] = 10.0
     field = Field("dye", values, diffuses=True, diffusivity=5e-10)
-    env = Environment("diffusion test", shape=shape, bounds=bounds, fields=[field])
+    env = Environment(
+        "diffusion test", wall_map=np.zeros(shape), size=size, fields=[field]
+    )
     colony = Colony([], env)
     sim = Simulation(colony, dt=dt, t_max=t_max)
     sim.run(show_progress=False)
@@ -79,7 +81,7 @@ def test_visualize_field_default_vmax_uses_max_recorded_value():
 
 def test_visualize_colony_returns_animation():
     cell = Cell(id=0, position=[10.0, 10.0], orientation=[1.0, 0.0])
-    env = Environment("colony test", shape=(5, 5), bounds=(20.0, 20.0))
+    env = Environment("colony test", wall_map=np.zeros((5, 5)), size=(20.0, 20.0))
     colony = Colony([cell], env)
     sim = Simulation(colony, dt=0.1, t_max=0.2)
     sim.run(show_progress=False)
@@ -88,13 +90,15 @@ def test_visualize_colony_returns_animation():
     assert isinstance(anim, FuncAnimation)
 
 
-def _colony_with_field_sim(dt=0.1, t_max=0.2, shape=(5, 5), bounds=(20.0, 20.0)):
+def _colony_with_field_sim(dt=0.1, t_max=0.2, shape=(5, 5), size=(20.0, 20.0)):
     """A Simulation with both a living cell and a chemical Field, for the
     visualize_colony(field=...) overlay tests."""
     values = np.zeros(shape)
     values[:, : shape[1] // 2] = 30.0
     field = Field("temperature", values, is_chemical=True)
-    env = Environment("field overlay test", shape=shape, bounds=bounds, fields=[field])
+    env = Environment(
+        "field overlay test", wall_map=np.zeros(shape), size=size, fields=[field]
+    )
     cell = Cell(id=0, position=[10.0, 10.0], orientation=[1.0, 0.0])
     colony = Colony([cell], env)
     sim = Simulation(colony, dt=dt, t_max=t_max)
@@ -192,8 +196,8 @@ def test_plot_field_multiple_fields_creates_one_panel_each():
     diffusivity = np.full(shape, 3.0e-9)
     env = Environment(
         "multi-field test",
-        shape=shape,
-        bounds=(20.0, 20.0),
+        wall_map=np.zeros(shape),
+        size=(20.0, 20.0),
         fields=[Field("eta_field", eta), Field("diffusivity_field", diffusivity)],
     )
     sim = Simulation(Colony([], env), dt=1.0, t_max=0.0)

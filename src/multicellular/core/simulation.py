@@ -125,9 +125,9 @@ class Simulation:
             field: Optional `Field` name (e.g. "temperature") to draw as a
                 light, semi-transparent heatmap behind the cells, with a
                 colorbar labeled with the field's name. The heatmap is
-                confined to `environment.bounds`, so it's never drawn over
-                the red out-of-bounds tint. None (default) draws no field
-                overlay.
+                confined to `environment.size`, so it's never drawn over
+                the wall/out-of-bounds background. None (default) draws no
+                field overlay.
             field_cmap: Matplotlib colormap name used for the field overlay.
             field_vmin, field_vmax: Color-scale bounds for the field overlay.
                 `field_vmax` defaults to the field's maximum recorded value
