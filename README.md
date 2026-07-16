@@ -19,6 +19,9 @@ tested:
 - Environment with spatially-varying diffusivity and viscosity fields, plus
   per-field diffusion (a mass-conserving finite-difference solver) for any
   `Field` marked `diffuses=True`
+- Reaction-diffusion: an `Environment`'s `Field`s can be coupled to each
+  other by a `ReactionNetwork`, stepped forward independently at every
+  non-wall grid cell (ODE, CLE, or SSA, same as inside a `Cell`)
 - Colony with overdamped-Langevin Brownian motion, Hookean cell-cell and
   cell-wall contact forces and torques, chemical field sensing and export
   (secretion), and optional chemical survival conditions
@@ -424,6 +427,50 @@ env = Environment("LB medium", wall_map=np.zeros((10, 10)), size=(50.0, 50.0), d
 env.grid_cell_volume  # dx * dy * depth = 5.0 * 5.0 * 1.0 = 25.0 μm³
 ```
 
+#### Field reactions (reaction-diffusion)
+
+An `Environment` can also carry a `reactions` `ReactionNetwork` that couples
+its `Field`s to each other, giving `∂C/∂t = D∇²C + R(C)` at every grid cell
+(voxel). This reuses the exact same `ReactionNetwork.simulate_step`
+machinery `Cell.step` uses internally (`"ODE"`, `"SSA"`, or `"CLE"`) — the
+only new code is stepping it independently at every non-wall voxel, with
+each species' value read from and written back to the matching-named
+`Field`:
+
+```python
+import numpy as np
+from multicellular import Environment, Field, ReactionNetwork
+from multicellular.core.reactions import Reaction
+
+decay = Reaction(reactants={"A": 1}, products={}, rate_params={"k": 0.1})
+network = ReactionNetwork("decay", {"decay": decay})
+
+field = Field("A", np.full((10, 10), 5.0), diffuses=True, diffusivity=1e-9)
+env = Environment("env", wall_map=np.zeros((10, 10)), fields=[field], reactions=network)
+
+env.react(dt=1.0)  # also called automatically by Colony.step, right after diffuse()
+```
+
+Every species in `reactions.species` must have a matching `Field` in the
+environment — `react()` raises `ValueError` otherwise, checked before any
+field is mutated. A `reactions` network with any `exports` is rejected at
+construction: exports are `Cell`→`Field` secretion semantics (see
+[Secretion (chemical export)](#secretion-chemical-export) below), and don't
+apply to a Field-local reaction (there's no "outside" for a `Field` to
+export to).
+
+Just like `Cell.step`, `SSA`'s (and `CLE`'s) concentration↔copy-number
+bridge is handled by the same `volume` argument `simulate_step` already
+takes — here it's `environment.grid_cell_volume` (a voxel's physical
+volume) rather than a cell's. No separate conversion logic is needed.
+`react()` excludes wall (`wall_map == 1`) cells from the update, the same as
+`diffuse()`: there's no medium there to react in.
+
+`Colony.step(dt, method)` calls `environment.react(dt, method)` right after
+`environment.diffuse(dt)` (see [`Colony`](#colony) below), so reaction-diffusion
+runs every step even with an empty `Colony` (no cells at all) — see
+`examples/feature_tour.ipynb`'s Gray-Scott Turing pattern demo.
+
 #### Walls and out-of-bounds (`wall_map`)
 
 `wall_map` is a matrix of `-1`, `0`, and `1` entries, scaled to fit `size`,
@@ -570,36 +617,41 @@ above — and defaults to `"ODE"`, same as `Cell.step`):
 1. **Diffusion** — calls `environment.diffuse(dt)`, advancing every field
    with `diffuses=True` (no-op if there are none; see
    [Field diffusion](#field-diffusion) above).
-2. **Chemical fields** — for every `Field` on the environment with
+2. **Field reactions** — calls `environment.react(dt, method)`, advancing the
+   environment's `reactions` network (if any) independently at every
+   non-wall grid cell (no-op if `reactions` is `None`; see
+   [Field reactions (reaction-diffusion)](#field-reactions-reaction-diffusion)
+   above).
+3. **Chemical fields** — for every `Field` on the environment with
    `is_chemical=True`, samples its local value at each living cell's
    position and sets that cell's concentration of the same-named species
    (no-op if there are no chemical fields).
-3. **Internal step** — calls `cell.step(dt)` for every cell (chemistry +
+4. **Internal step** — calls `cell.step(dt)` for every cell (chemistry +
    growth). Growth dilutes every species in `concentrations`, including
-   ones just set from a chemical field in step 2.
-4. **Chemical export** — calls `export_chemical_fields()`, depositing
+   ones just set from a chemical field in step 3.
+5. **Chemical export** — calls `export_chemical_fields()`, depositing
    whatever each cell exported this step into the matching `Field` (no-op if
    no cell exported anything; see
    [Secretion (chemical export)](#secretion-chemical-export) above).
-5. **Chemical fields (re-applied)** — repeats step 2, so each chemical
-   field's value overwrites whatever growth diluted it to in step 3. This
+6. **Chemical fields (re-applied)** — repeats step 3, so each chemical
+   field's value overwrites whatever growth diluted it to in step 4. This
    keeps the field's value pinned to the environment between steps; reactions
-   in step 3 already saw the correct, freshly-sampled value from step 2.
-   Running after step 4 means a cell sensing the same field it just exported
+   in step 4 already saw the correct, freshly-sampled value from step 3.
+   Running after step 5 means a cell sensing the same field it just exported
    into sees this step's freshly-deposited mass.
-6. **Bounds enforcement** — kills any living cell whose center of mass lies
+7. **Bounds enforcement** — kills any living cell whose center of mass lies
    outside `environment.size`'s physical extent or on a `wall_map`
    out-of-bounds (`-1`) cell (see
    [Walls and out-of-bounds](#walls-and-out-of-bounds-wall_map) above).
-7. **Survival conditions** — kills any living cell whose concentrations
+8. **Survival conditions** — kills any living cell whose concentrations
    violate a `survival_conditions` entry (no-op if none were given).
-8. **Brownian motion** — if `brownian_motion=True` (the default), applies an
+9. **Brownian motion** — if `brownian_motion=True` (the default), applies an
    overdamped-Langevin random kick to every surviving living cell (see
    [Brownian motion](#brownian-motion) below); no-op if `False`.
-9. **Contact forces** — applies pairwise Hookean repulsion and torques between
-   all overlapping living cells, and between cells and wall geometry (see
-   [Contact forces](#contact-forces) and [Wall forces](#wall-forces) below).
-10. **Division** — replaces any cell with `cell.ready_to_divide() == True` with
+10. **Contact forces** — applies pairwise Hookean repulsion and torques between
+    all overlapping living cells, and between cells and wall geometry (see
+    [Contact forces](#contact-forces) and [Wall forces](#wall-forces) below).
+11. **Division** — replaces any cell with `cell.ready_to_divide() == True` with
     its two daughter cells, each assigned a new unique `id`.
 
 `colony.living_cells` returns the cells that are still alive.
@@ -1067,6 +1119,7 @@ Run a specific test file:
 pytest tests/test_cell.py        # Cell geometry, growth, division, and pending chemical export
 pytest tests/test_reactions.py   # Reaction rate laws, stoichiometry, ODE/SSA/CLE stepping, export-reaction mass conservation
 pytest tests/test_environment.py # Environment/Field construction, wall_map validation and geometry, diffusion, and grid cell volume
+pytest tests/test_reaction_diffusion.py # Environment.react: validation, ODE/SSA/CLE correctness, wall exclusion, Colony.step coupling, Turing pattern smoke test
 pytest tests/test_colony.py      # Colony bounds enforcement, wall/cell-cell contact forces, division, dead-cell behavior, field sensing/diffusion/export
 pytest tests/test_simulation.py  # Simulation loop and DataFrame export
 pytest tests/test_visualization.py # visualize_colony/visualize_field/plot_field: animation output, GIF export, stride, static plots

@@ -52,8 +52,10 @@ class Environment:
     Holds a collection of named Fields (e.g. chemical concentrations,
     temperature, surface roughness), each represented as a matrix of
     values over a shared grid. Fields marked `diffuses=True` are advanced
-    each timestep by `diffuse()`; reaction-diffusion coupling within the
-    field grid itself (as opposed to inside cells) is not implemented.
+    each timestep by `diffuse()`. An optional `reactions` ReactionNetwork
+    couples those fields to each other at every grid cell (voxel),
+    advanced each timestep by `react()` — the field-grid counterpart of
+    `Cell.step`'s intracellular reaction stepping.
 
     The environment's terrain is given by `wall_map`, a matrix (scaled to
     `size`) whose entries are one of:
@@ -73,7 +75,24 @@ class Environment:
         eta=None,
         fields=None,
         depth=None,
+        reactions=None,
+        rng=None,
     ):
+        """
+        Args:
+            reactions: optional ReactionNetwork coupling this environment's
+                Fields to each other, stepped forward independently at every
+                non-wall grid cell by `react()`. Every species in the
+                network must have a matching Field (validated by `react()`,
+                not here, since Fields may be added after construction).
+                A network with any `exports` is rejected: exports are
+                Cell→Field secretion semantics and meaningless for a
+                Field-local reaction (there's no "outside" for a Field to
+                export to).
+            rng: `np.random.Generator` used by `react()`'s SSA/CLE methods.
+                Defaults to a fresh `np.random.default_rng()`, mirroring
+                `Cell.rng`.
+        """
         self.name = name
         wall_map = np.asarray(wall_map)
         if wall_map.ndim != 2:
@@ -108,6 +127,15 @@ class Environment:
         self.wall_faces, self.wall_corners = _build_wall_geometry(
             self.wall_map, self.size
         )
+        if reactions is not None and reactions.exported_species:
+            raise ValueError(
+                f"Environment reactions network '{reactions.name}' has "
+                f"exports {reactions.exported_species}; a Field-local "
+                "reaction network cannot export (there is no 'outside' for "
+                "a Field to export to)."
+            )
+        self.reactions = reactions
+        self.rng = rng or np.random.default_rng()
 
     @property
     def grid_cell_volume(self):
@@ -225,6 +253,60 @@ class Environment:
                 ) * inv_dx2
                 C = np.where(is_wall, C, C + D * sub_dt * laplacian)
             field.values = C
+
+    def react(self, dt, method="ODE"):
+        """
+        Advance `self.reactions` by dt, independently at every non-wall grid
+        cell (voxel), using the given simulation method. No-op if
+        `self.reactions` is None.
+
+        Mirrors `Cell.step`'s intracellular reaction stepping exactly, but
+        once per voxel instead of once per cell: each voxel's concentration
+        dict (one entry per Field the network touches, at that voxel) is
+        advanced via `ReactionNetwork.simulate_step`, using this
+        environment's `grid_cell_volume` as the per-voxel volume so SSA's
+        internal concentration<->copy-number conversion is on the same
+        physical basis as a Cell's. `simulate_step` only accepts scalar
+        (not array-valued) concentration state, so voxels are stepped in a
+        plain Python loop rather than batched.
+
+        Wall (wall_map == 1) cells are excluded, like `diffuse`: there's no
+        medium there for a reaction to occur in. Out-of-bounds (-1) cells
+        react normally, also like `diffuse`.
+
+        Raises:
+            ValueError: if `self.reactions` references a species with no
+                matching Field in `self.fields`. Checked before any Field is
+                mutated, so a misconfigured network never partially reacts.
+        """
+        if self.reactions is None:
+            return
+
+        network = self.reactions
+        species_list = network.species
+        missing = [s for s in species_list if s not in self.fields]
+        if missing:
+            raise ValueError(
+                f"Environment reactions network '{network.name}' references "
+                f"species {missing} with no matching Field in the "
+                "environment."
+            )
+
+        volume = self.grid_cell_volume
+        is_wall = self.wall_map == 1
+        n_rows, n_cols = self.shape
+        values = {s: self.fields[s].values for s in species_list}
+
+        for i in range(n_rows):
+            for j in range(n_cols):
+                if is_wall[i, j]:
+                    continue
+                state = {s: float(values[s][i, j]) for s in species_list}
+                new_state = network.simulate_step(
+                    state, dt, volume, method, rng=self.rng
+                )
+                for s, value in new_state.items():
+                    values[s][i, j] = value
 
 
 # Coordinate tolerance (μm) for treating two wall-face endpoints, or two
