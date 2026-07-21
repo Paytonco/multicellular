@@ -199,9 +199,11 @@ class Colony:
         Args:
             dt: timestep size.
             method: simulation method forwarded to each cell's
-                `Cell.step` ("ODE", "SSA", or "CLE").
+                `Cell.step` and to the environment's `react()` ("ODE",
+                "SSA", or "CLE").
         """
         self.environment.diffuse(dt)
+        self.environment.react(dt, method)
         self.apply_chemical_fields()
         self._update_growth_rates()
         for cell in self.cells:
