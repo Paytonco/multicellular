@@ -129,7 +129,10 @@ class Colony:
                 concentration of `species` is compared against `threshold`
                 using `operator` (one of ">", ">=", "<", "<=", "==", "!=");
                 a cell dies as soon as any condition is violated. A species
-                missing from a cell's concentrations is treated as 0.0.
+                missing from a cell's concentrations is treated as 0.0. A
+                dying cell with `lysis_targets` set (see `Cell`) also has its
+                lysis payload delivered to the environment; see
+                `_deliver_lysis_payloads`.
             brownian_motion: whether `step` applies overdamped-Langevin
                 Brownian kicks to living cells each step (default True).
                 Set False to disable thermal motion entirely, e.g. for a
@@ -609,9 +612,14 @@ class Colony:
                 cell.kill()
 
     def enforce_survival_conditions(self):
-        """Kill any living cell whose concentrations violate a survival condition."""
+        """
+        Kill any living cell whose concentrations violate a survival
+        condition, then deliver lysis payloads (see
+        `_deliver_lysis_payloads`) for whichever cells were just killed.
+        """
         if not self.survival_conditions:
             return
+        lysed = []
         for cell in self.cells:
             if not cell.alive:
                 continue
@@ -619,7 +627,52 @@ class Colony:
                 value = cell.concentrations.get(species, 0.0)
                 if not _COMPARISONS[op](value, threshold):
                     cell.kill()
+                    lysed.append(cell)
                     break
+        self._deliver_lysis_payloads(lysed)
+
+    def _deliver_lysis_payloads(self, cells):
+        """
+        Deposit each given cell's configured `lysis_targets` molecule counts
+        into the matching Field, at the grid cell the cell's center of mass
+        occupies, converting to a Δconcentration via
+        `environment.grid_cell_volume` (the same convention
+        `export_chemical_fields` uses).
+
+        Only called by `enforce_survival_conditions`, for cells it just
+        killed — never for cells killed by `enforce_bounds` (leaving the
+        environment or entering a death zone represents outflow, not
+        lysis).
+
+        Validates every target species against environment.fields before
+        writing anything, so a missing field raises ValueError without
+        partially mutating any field.
+        """
+        lysing = [cell for cell in cells if cell.lysis_targets]
+        if not lysing:
+            return
+
+        positions = np.array([cell.position for cell in lysing])
+        i_idx, j_idx = self._field_indices(positions)
+        grid_cell_volume = self.environment.grid_cell_volume
+
+        deltas = {}
+        for cell, i, j in zip(lysing, i_idx, j_idx):
+            for source_species, target_field in cell.lysis_targets.items():
+                if target_field not in self.environment.fields:
+                    raise ValueError(
+                        f"Cell {cell.id} lyses species '{source_species}' "
+                        f"into '{target_field}' but no matching Field "
+                        "exists in the environment."
+                    )
+                delta = deltas.setdefault(
+                    target_field, np.zeros(self.environment.shape)
+                )
+                delta[i, j] += cell.copy_number(source_species) / grid_cell_volume
+
+        for target_field, delta in deltas.items():
+            field = self.environment.get_field(target_field)
+            field.values = field.values + delta
 
     def handle_divisions(self):
         """Replace any cell ready to divide with its two daughter cells."""

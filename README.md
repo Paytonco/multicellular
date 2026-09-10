@@ -24,7 +24,9 @@ tested:
   non-wall grid cell (ODE, CLE, or SSA, same as inside a `Cell`)
 - Colony with overdamped-Langevin Brownian motion, Hookean cell-cell and
   cell-wall contact forces and torques, chemical field sensing and export
-  (secretion), and optional chemical survival conditions
+  (secretion), optional chemical survival conditions, and lysis-based
+  delivery (a bulk one-time intracellular-to-`Field` deposit when a cell
+  dies from a violated survival condition)
 - Trap walls: an `Environment`'s `wall_map` marks any grid cell as media,
   wall, or out-of-bounds, and `Colony` pushes cells off wall geometry with
   the same Hookean contact model used between cells
@@ -557,6 +559,70 @@ controls whether `Colony` *senses* the field back into cells — an orthogonal
 concern from whether it can receive secretion) or `diffuses=True`, though
 combining both lets secreted material spread spatially on subsequent steps.
 
+#### Lysis-based delivery
+
+Where secretion above is a continuous, reaction-driven leak, lysis-based
+delivery is a one-time bulk dump: a cell can be configured to deliver an
+entire intracellular species' molecule count into a `Field` at the instant
+it dies — modeling, e.g., a reporter or payload released when an engineered
+kill-switch circuit lyses the cell.
+
+Pass `lysis_targets` when constructing a `Cell`: a dict mapping an
+intracellular species name to the name of the `Field` species it should be
+delivered to.
+
+```python
+import numpy as np
+from multicellular import Cell, Colony, Environment, Field
+
+cell = Cell(
+    id=0, position=[50.0, 50.0], orientation=[1.0, 0.0],
+    lysis_targets={"reporter_internal": "reporter_field"},
+)
+cell.set_concentration("reporter_internal", 5.0)
+cell.set_concentration("A", 0.0)  # will violate the survival condition below
+
+field = Field("reporter_field", np.zeros((10, 10)))
+env = Environment("LB medium", wall_map=np.zeros((10, 10)), fields=[field])
+colony = Colony([cell], env, survival_conditions=[("A", ">", 0)])
+
+colony.step(dt=0.1)
+print(cell.alive, field.values[5, 5])  # False, reporter_internal's molecule count arrived here
+```
+
+Delivery fires **only** when `Colony.enforce_survival_conditions` kills a
+cell for violating a `survival_conditions` entry (see
+[`Colony`](#colony) below) — never when `Colony.enforce_bounds` kills a cell
+for leaving the environment or entering a `wall_map` out-of-bounds (`-1`)
+death zone (see
+[Walls and out-of-bounds](#walls-and-out-of-bounds-wall_map) above), since
+that represents outflow (e.g. off the edge of a microfluidic chip), not
+lysis. At the moment of death, the cell's current molecule count for each
+source species (`concentration * cell.compute_volume()`) is added to the
+matching target `Field` at the cell's nearest grid point (summing
+contributions from multiple cells that lyse at the same grid cell in the
+same step), converting to a Δconcentration via `environment.grid_cell_volume`
+— the same mechanics and the same `ValueError`-before-any-mutation guarantee
+as `export_chemical_fields` above.
+
+A source species must map to a **different** target species name —
+`Cell.__init__` raises `ValueError` if any source equals its own target.
+This isn't just a naming nicety: `Colony.apply_chemical_fields` mirrors a
+chemical `Field`'s value into every living cell's same-named concentration
+every step, but that's a non-conservative copy, not a depleting transfer —
+the field's mass is never actually removed from the field when a cell reads
+it. If a cell then lysed that mirrored value straight back into the
+same-named field, it would inject mass that was never taken out in the
+first place, compounding with every cell that dies. Deliver into a
+distinct species instead — the same discipline already used on the import
+side, where a `Field`-mirrored species is converted into a separate,
+truly-intracellular pool via a reaction (see
+[`Reaction` and `ReactionNetwork`](#reaction-and-reactionnetwork) above)
+before it's consumed.
+
+`lysis_targets` is inherited by both daughters at division, the same way
+`species` and `growth_rate_law` are.
+
 ### `Colony`
 
 A `Colony` is a collection of `Cell`s living in an `Environment`:
@@ -602,7 +668,9 @@ each living cell's concentration of `species` is compared against
 `threshold` using `operator` — one of `">"`, `">="`, `"<"`, `"<="`, `"=="`,
 `"!="` — and the cell dies as soon as any condition is violated. A species
 missing from a cell's concentrations is treated as `0.0`. With multiple
-conditions, a cell dies if *any* of them is violated:
+conditions, a cell dies if *any* of them is violated. A cell killed this way
+that also has `lysis_targets` set delivers its lysis payload to the
+environment — see [Lysis-based delivery](#lysis-based-delivery) above:
 
 ```python
 # Cells die once species "A" is depleted, or if "B" ever exceeds 10.
@@ -644,7 +712,10 @@ above — and defaults to `"ODE"`, same as `Cell.step`):
    out-of-bounds (`-1`) cell (see
    [Walls and out-of-bounds](#walls-and-out-of-bounds-wall_map) above).
 8. **Survival conditions** — kills any living cell whose concentrations
-   violate a `survival_conditions` entry (no-op if none were given).
+   violate a `survival_conditions` entry (no-op if none were given), then
+   delivers any lysis payload configured via `lysis_targets` for the cells
+   just killed (see
+   [Lysis-based delivery](#lysis-based-delivery) above).
 9. **Brownian motion** — if `brownian_motion=True` (the default), applies an
    overdamped-Langevin random kick to every surviving living cell (see
    [Brownian motion](#brownian-motion) below); no-op if `False`.

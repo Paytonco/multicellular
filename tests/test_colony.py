@@ -203,6 +203,91 @@ def test_invalid_survival_condition_operator_raises():
         Colony([cell], env, survival_conditions=[("A", "?!", 0)])
 
 
+def test_lysis_delivers_payload_on_survival_condition_violation():
+    field = Field("X_field", np.zeros((10, 10)))
+    env = Environment(
+        "env", wall_map=np.zeros((10, 10)), size=(50.0, 50.0), depth=2.0, fields=[field]
+    )
+    cell = _make_cell([25.0, 25.0])
+    cell.set_concentration("X", 2.0)
+    cell.lysis_targets = {"X": "X_field"}
+    cell.set_concentration("A", 0.0)  # violates "A" > 0
+
+    expected_count = cell.copy_number("X")
+
+    colony = Colony([cell], env, survival_conditions=[("A", ">", 0)])
+    colony.enforce_survival_conditions()
+
+    assert not cell.alive
+    # grid index for (25,25): dx=dy=5 -> (i,j)=(5,5); grid_cell_volume = 5*5*2=50
+    assert field.values[5, 5] == pytest.approx(expected_count / 50.0)
+
+
+def test_lysis_does_not_fire_when_survival_condition_satisfied():
+    field = Field("X_field", np.zeros((10, 10)))
+    env = Environment(
+        "env", wall_map=np.zeros((10, 10)), size=(50.0, 50.0), depth=2.0, fields=[field]
+    )
+    cell = _make_cell([25.0, 25.0])
+    cell.set_concentration("X", 2.0)
+    cell.lysis_targets = {"X": "X_field"}
+    cell.set_concentration("A", 1.0)  # satisfies "A" > 0
+
+    colony = Colony([cell], env, survival_conditions=[("A", ">", 0)])
+    colony.enforce_survival_conditions()
+
+    assert cell.alive
+    assert np.array_equal(field.values, np.zeros((10, 10)))
+
+
+def test_lysis_does_not_fire_on_out_of_bounds_death():
+    # No "X_field" Field exists at all: if lysis delivery were (incorrectly)
+    # attempted for a cell killed by enforce_bounds, it would raise
+    # ValueError for the missing field. It doesn't, which confirms
+    # enforce_bounds deaths never trigger lysis delivery.
+    env = Environment("env", wall_map=np.zeros((10, 10)))
+    cell = _make_cell([150.0, 50.0])  # outside the environment's extent
+    cell.set_concentration("X", 2.0)
+    cell.lysis_targets = {"X": "X_field"}
+    cell.set_concentration("A", 0.0)  # would also violate "A" > 0
+
+    colony = Colony([cell], env, survival_conditions=[("A", ">", 0)])
+    colony.step(dt=0.1)  # must not raise
+
+    assert not cell.alive
+
+
+def test_lysis_sums_contributions_at_same_grid_point():
+    field = Field("X_field", np.zeros((10, 10)))
+    env = Environment(
+        "env", wall_map=np.zeros((10, 10)), size=(50.0, 50.0), depth=2.0, fields=[field]
+    )
+    cell1 = _make_cell([25.0, 25.0])
+    cell2 = _make_cell([26.0, 26.0])  # same grid cell as cell1
+    for cell in (cell1, cell2):
+        cell.set_concentration("X", 2.0)
+        cell.lysis_targets = {"X": "X_field"}
+        cell.set_concentration("A", 0.0)
+    expected = (cell1.copy_number("X") + cell2.copy_number("X")) / 50.0
+
+    colony = Colony([cell1, cell2], env, survival_conditions=[("A", ">", 0)])
+    colony.enforce_survival_conditions()
+
+    assert field.values[5, 5] == pytest.approx(expected)
+
+
+def test_lysis_raises_for_unmapped_target_field_without_mutating_fields():
+    env = Environment("env", wall_map=np.zeros((10, 10)))  # no fields at all
+    cell = _make_cell([50.0, 50.0])
+    cell.set_concentration("X", 2.0)
+    cell.lysis_targets = {"X": "X_field"}  # no matching Field exists
+    cell.set_concentration("A", 0.0)  # violates "A" > 0
+
+    colony = Colony([cell], env, survival_conditions=[("A", ">", 0)])
+    with pytest.raises(ValueError):
+        colony.enforce_survival_conditions()
+
+
 def test_step_copies_chemical_field_value_into_cell_concentration():
     values = np.zeros((10, 10))
     values[5, 5] = 7.5  # cell at (50, 50) maps to grid index (5, 5)

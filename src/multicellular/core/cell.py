@@ -31,6 +31,7 @@ class Cell:
         cv_delta=0.10,
         a=1.0,
         cv_f=0.0,
+        lysis_targets=None,
     ):
         """
         Args:
@@ -48,7 +49,25 @@ class Cell:
             cv_f: CV of the division fraction f ~ Normal(0.5, cv_f * 0.5),
                 clipped to (0, 1). Default 0.0 gives a deterministic symmetric
                 split. Set ~0.03 to enable partition noise.
+            lysis_targets: optional dict mapping an intracellular species
+                name to the name of the environment Field species it should
+                be delivered to (its full molecule count, converted to a
+                Δconcentration by Colony) if this cell dies by violating a
+                Colony survival condition. Never fires on death via
+                Colony.enforce_bounds (leaving the environment or entering a
+                death zone represents outflow, not lysis). A source species
+                must map to a *different* target species: reusing the same
+                name would double-count mass, since Colony.apply_chemical_fields
+                already mirrors that Field's value into every living cell's
+                same-named concentration each step without depleting the
+                field.
         """
+        if lysis_targets and any(k == v for k, v in lysis_targets.items()):
+            same = [k for k, v in lysis_targets.items() if k == v]
+            raise ValueError(
+                f"lysis_targets source and target species must differ; got "
+                f"{same} mapped to themselves."
+            )
         self.id = id
         self.position = np.array(position, dtype=float)
         self.orientation = self._normalize(np.array(orientation, dtype=float))
@@ -75,6 +94,7 @@ class Cell:
         # Molecule counts exported (e.g. secreted) by the most recent step,
         # awaiting deposit into the matching Field by Colony.export_chemical_fields.
         self.pending_export = {}
+        self.lysis_targets = dict(lysis_targets) if lysis_targets else {}
 
     def _sample_division_target(self):
         """
@@ -208,6 +228,7 @@ class Cell:
             cv_delta=self.cv_delta,
             a=self.a,
             cv_f=self.cv_f,
+            lysis_targets=self.lysis_targets,
         )
         daughter1 = Cell(
             position=pos1,

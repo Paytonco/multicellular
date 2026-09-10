@@ -212,6 +212,32 @@ def test_daughters_start_with_fresh_pending_export():
     assert d2.pending_export == {}
 
 
+def test_lysis_targets_defaults_to_empty():
+    cell = Cell(id=1, position=[0.0, 0.0], orientation=[1.0, 0.0], network=None)
+    assert cell.lysis_targets == {}
+
+
+def test_lysis_targets_rejects_source_equal_to_target():
+    with pytest.raises(ValueError):
+        Cell(
+            id=1,
+            position=[0.0, 0.0],
+            orientation=[1.0, 0.0],
+            network=None,
+            lysis_targets={"X": "X"},
+        )
+
+
+def test_lysis_targets_propagates_to_daughters():
+    cell = _make_cell(rng=np.random.default_rng(0))
+    cell.lysis_targets = {"reporter_internal": "reporter_field"}
+
+    d1, d2 = cell.divide()
+
+    assert d1.lysis_targets == {"reporter_internal": "reporter_field"}
+    assert d2.lysis_targets == {"reporter_internal": "reporter_field"}
+
+
 def test_divide_conserves_concentration_by_default():
     cell = _make_cell(rng=np.random.default_rng(5))
     cell.concentrations = {"A": 2.5}
