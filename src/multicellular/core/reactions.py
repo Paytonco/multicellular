@@ -3,6 +3,10 @@
 from typing import Callable, Dict, List, Union
 
 import numpy as np
+from scipy.integrate import solve_ivp
+
+# Every numerical method accepted by scipy.integrate.solve_ivp ("ODE" mode).
+ODE_METHODS = ("RK45", "RK23", "DOP853", "Radau", "BDF", "LSODA")
 
 
 class Reaction:
@@ -252,6 +256,7 @@ class ReactionNetwork:
         volume: float,
         method: str = "ODE",
         rng: np.random.Generator = None,
+        ode_method: str = "RK45",
     ) -> Dict[str, float]:
         """
         Advance the chemical state by one time step using the given simulation method.
@@ -260,17 +265,21 @@ class ReactionNetwork:
             state: dict of species → concentration
             dt: timestep size
             volume: cell volume (used for propensities in SSA/CLE)
-            method: one of "ODE" (forward Euler), "SSA" (Gillespie), or
+            method: one of "ODE" (numerical integration via
+                `scipy.integrate.solve_ivp`), "SSA" (Gillespie), or
                 "CLE" (chemical Langevin equation). Case-insensitive.
             rng: random generator used by SSA/CLE (ignored by ODE). Defaults
                 to a fresh `np.random.default_rng()` if not given.
+            ode_method: `solve_ivp` integrator used when method is "ODE" (ignored
+                by SSA/CLE): one of "RK45" (default), "RK23", "DOP853",
+                "Radau", "BDF", or "LSODA". Case-insensitive.
 
         Returns:
             Updated concentration dictionary
         """
         method = method.upper()
         if method == "ODE":
-            return self._simulate_ode_step(state, dt, volume)
+            return self._simulate_ode_step(state, dt, volume, ode_method)
         elif method == "SSA":
             return self._simulate_ssa_step(
                 state, dt, volume, rng or np.random.default_rng()
@@ -318,27 +327,61 @@ class ReactionNetwork:
         return extent
 
     def _simulate_ode_step(
-        self, state: Dict[str, float], dt: float, volume: float
+        self,
+        state: Dict[str, float],
+        dt: float,
+        volume: float,
+        ode_method: str = "RK45",
     ) -> Dict[str, float]:
         """
-        Simple forward Euler ODE step.
+        Integrate the reaction ODEs over `dt` with `scipy.integrate.solve_ivp`.
+
+        The integrated state is the species concentrations followed by the
+        cumulative concentration-equivalent exported through each export
+        species. Export-tagged reactions are one-directional and can't fire
+        without reactant, so their rate is clamped to >= 0 and to 0 whenever
+        a reactant is depleted; the exported total is integrated alongside
+        the intracellular state, so the two stay consistent.
         """
+        method = next(
+            (m for m in ODE_METHODS if m.upper() == str(ode_method).upper()), None
+        )
+        if method is None:
+            raise ValueError(
+                f"Unknown ODE method: {ode_method!r}; expected one of {ODE_METHODS}"
+            )
+
         species_list = self.species
+        n = len(species_list)
         S = self._stoichiometry_matrix
+        S_exp = self._export_stoichiometry_matrix
+        export_flags = [self.reactions[r].exports for r in self._reaction_names]
 
-        v = self._rate_vector(state)  # Reaction rate vector (concentration/time)
-        extent = self._clamp_export_extents(state, dt * v)
+        def rhs(_t, y):
+            conc = {s: max(y[i], 0.0) for i, s in enumerate(species_list)}
+            v = self._rate_vector(conc)
+            for j, name in enumerate(self._reaction_names):
+                if not export_flags[j]:
+                    continue
+                rxn = self.reactions[name]
+                depleted = any(conc.get(s, 0.0) <= 0.0 for s in rxn.reactants)
+                v[j] = 0.0 if depleted else max(v[j], 0.0)
+            return np.concatenate([S @ v, S_exp @ v])
 
-        x = np.array([state.get(s, 0.0) for s in species_list])
-        x_new = x + S @ extent
+        x0 = np.array([state.get(s, 0.0) for s in species_list])
+        y0 = np.concatenate([x0, np.zeros(len(self.exported_species))])
+        sol = solve_ivp(rhs, (0.0, dt), y0, method=method, rtol=1e-6, atol=1e-9)
+        if not sol.success:
+            raise RuntimeError(f"ODE integration failed: {sol.message}")
+        y_new = sol.y[:, -1]
 
-        exported_delta = self._export_stoichiometry_matrix @ extent
+        exported_delta = np.maximum(y_new[n:], 0.0)
         self.last_exported = {
             s: exported_delta[i] * volume for i, s in enumerate(self.exported_species)
         }
 
         return {
-            s: max(x_new[i], 0.0) for i, s in enumerate(species_list)
+            s: max(y_new[i], 0.0) for i, s in enumerate(species_list)
         }  # Prevent negatives
 
     def _simulate_ssa_step(

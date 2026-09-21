@@ -195,7 +195,7 @@ class Colony:
             }
             cell.growth_rate = cell.growth_rate_law(cell.concentrations, extracellular)
 
-    def step(self, dt, method="ODE"):
+    def step(self, dt, method="ODE", ode_method="RK45"):
         """
         Advance all cells by one timestep, then enforce bounds and divisions.
 
@@ -204,13 +204,15 @@ class Colony:
             method: simulation method forwarded to each cell's
                 `Cell.step` and to the environment's `react()` ("ODE",
                 "SSA", or "CLE").
+            ode_method: `scipy.integrate.solve_ivp` method used when
+                `method` is "ODE" (default "RK45").
         """
         self.environment.diffuse(dt)
-        self.environment.react(dt, method)
+        self.environment.react(dt, method, ode_method)
         self.apply_chemical_fields()
         self._update_growth_rates()
         for cell in self.cells:
-            cell.step(dt, method)
+            cell.step(dt, method, ode_method)
         self.export_chemical_fields()
         # Re-apply: a chemical field's value is an externally-imposed boundary
         # condition, not a quantity the cell's own growth should dilute, but
