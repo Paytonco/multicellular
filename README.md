@@ -14,7 +14,7 @@ tested:
   concentrations as volume increases), division, and internal reaction
   networks
 - Chemical reaction networks (mass-action, Michaelis-Menten, Hill-Langmuir,
-  custom rate laws), simulated via forward-Euler ODE, the chemical Langevin
+  custom rate laws), simulated via ODE (`solve_ivp`), the chemical Langevin
   equation (CLE), or Gillespie SSA
 - Environment with spatially-varying diffusivity and viscosity fields, plus
   per-field diffusion (a mass-conserving finite-difference solver) for any
@@ -32,9 +32,9 @@ tested:
   the same Hookean contact model used between cells
 - Simulation loop with full history recording
 - 2D animation of a colony via `Simulation.visualize_colony()`, or of a
-  chemical `Field` over time via `Simulation.visualize_field()`; static
-  heatmaps of one or more `Field`s at a point in time via
-  `Simulation.plot_field()`
+  chemical `Field` over time via `Simulation.visualize_field()`, saved as an
+  animated GIF or an MP4 video; static heatmaps of one or more `Field`s at a
+  point in time via `Simulation.plot_field()`
 - Running independent simulation replicates across multiple CPU cores via
   `run_replicates()`
 
@@ -52,8 +52,11 @@ pip install -e .
 ```
 
 This installs the `multicellular` package (from `src/multicellular`) in
-editable mode, along with its dependencies: `numpy`, `pandas`, `matplotlib`,
-`tqdm`, `pillow`, and `joblib`.
+editable mode, along with its dependencies: `numpy`, `scipy`, `pandas`,
+`matplotlib`, `tqdm`, `pillow`, `joblib`, `imageio`, and `imageio-ffmpeg`.
+
+The last two are what let animations be saved as MP4 video; `imageio-ffmpeg`
+bundles its own copy of `ffmpeg`, so there is nothing to install separately.
 
 ## Usage
 
@@ -96,7 +99,7 @@ contact forces.
 `Reaction` supports `mass_action`, `michaelis_menten`, `hill_langmuir`, and
 `custom` rate laws. `ReactionNetwork` collects reactions, builds a
 stoichiometry matrix, and advances concentrations with one of three
-simulation methods: `"ODE"` (forward Euler; the default), `"CLE"` (chemical
+simulation methods: `"ODE"` (numerical integration via `scipy.integrate.solve_ivp`; the default, with `RK45` as the default solver), `"CLE"` (chemical
 Langevin equation), or `"SSA"` (Gillespie stochastic simulation algorithm).
 The method is chosen per call to `simulate_step` (or, when running a full
 `Colony`/`Simulation`, once via `Simulation`'s `simulation_method` argument —
@@ -1015,7 +1018,7 @@ sim.visualize_colony(
     field=None, field_cmap="YlOrRd", field_vmin=0.0, field_vmax=None,
     interval=200,
     save_path=None, filename="simulation.gif",
-    show_progress=True,
+    show_progress=True, show=True,
 )
 ```
 
@@ -1075,16 +1078,52 @@ Display afterward is just fast image blitting through the pre-rendered
 frames.
 
 To save the animation, pass a directory via `save_path`; it's created if it
-doesn't already exist, and the animation is written there as an animated GIF
-(via Pillow — no external dependencies like `ffmpeg` required):
+doesn't already exist:
 
 ```python
 sim.visualize_colony(red="A", green="B", save_path="./out", filename="colony.gif")
 ```
 
-`filename` defaults to `"simulation.gif"`. The animation is still shown
-interactively afterward; pass `show_progress=False` and close the window
-yourself (or run headlessly) if you only want the saved file.
+#### Choosing GIF or MP4
+
+The extension of `filename` picks the format. Both work out of the box — no
+separate `ffmpeg` install is needed.
+
+| | GIF (`.gif`) | MP4 (`.mp4`) |
+|---|---|---|
+| File size | large | roughly 5–15x smaller |
+| Time to write | slower | several times faster |
+| Where it plays | embeds directly in notebooks, READMEs, chat and slides | any video player or browser; needs an upload or attachment to share |
+
+**Use a GIF when you want to drop the animation straight into a notebook or a
+document.** GIFs are limited to 256 colors, so smooth field heatmaps can look
+slightly banded.
+
+**Use an MP4 for anything long or large** — a few hundred frames of a big
+colony. It writes faster, takes far less disk space, and keeps full color:
+
+```python
+sim.visualize_colony(red="A", green="B", save_path="./out", filename="colony.mp4")
+```
+
+`filename` defaults to `"simulation.gif"`, so the format is unchanged unless
+you ask for `.mp4`.
+
+#### Saving without watching
+
+By default the animation is also shown interactively after saving. For long
+runs — or on a headless machine — pass `show=False` to write the file and skip
+the pop-up:
+
+```python
+sim.visualize_colony(save_path="./out", filename="colony.mp4", show=False)
+```
+
+This also keeps memory use flat: frames are written to the file as they are
+drawn, instead of all being held at once (which is hundreds of megabytes for a
+long animation). `show=False` returns the path of the file written rather than
+an animation object, and requires a `save_path` — without one there would be
+nothing to show and nothing to save.
 
 ### `Simulation.visualize_field`
 
@@ -1095,7 +1134,7 @@ sim.visualize_field(
     vmin=0.0, vmax=None,
     interval=200,
     save_path=None, filename="simulation.gif",
-    show_progress=True,
+    show_progress=True, show=True,
 )
 ```
 
@@ -1122,11 +1161,13 @@ sim.visualize_field("AHL", cmap="YlOrRd", interval=100)
 - Each frame shows the active environment's `name` on the top-left and the
   current time (`t = ...`) on the top-right, exactly as in
   `visualize_colony`.
-- `interval`, `save_path`, `filename`, `show_progress`, and `stride` all
-  behave identically to `visualize_colony` (see above).
+- `interval`, `save_path`, `filename`, `show_progress`, `stride`, and `show`
+  all behave identically to `visualize_colony` (see above) — including the
+  choice between a `.gif` and an `.mp4`.
 
 ```python
 sim.visualize_field("dye", save_path="./out", filename="dye.gif")
+sim.visualize_field("dye", save_path="./out", filename="dye.mp4", show=False)
 ```
 
 ### `Simulation.plot_field`
@@ -1193,6 +1234,6 @@ pytest tests/test_environment.py # Environment/Field construction, wall_map vali
 pytest tests/test_reaction_diffusion.py # Environment.react: validation, ODE/SSA/CLE correctness, wall exclusion, Colony.step coupling, Turing pattern smoke test
 pytest tests/test_colony.py      # Colony bounds enforcement, wall/cell-cell contact forces, division, dead-cell behavior, field sensing/diffusion/export
 pytest tests/test_simulation.py  # Simulation loop and DataFrame export
-pytest tests/test_visualization.py # visualize_colony/visualize_field/plot_field: animation output, GIF export, stride, static plots
+pytest tests/test_visualization.py # visualize_colony/visualize_field/plot_field: animation output, GIF/MP4 export, stride, static plots
 pytest tests/test_parallel.py    # run_replicates: parallel execution, independence, correctness
 ```

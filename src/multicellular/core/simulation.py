@@ -13,17 +13,22 @@ class Simulation:
     every timestep.
     """
 
-    def __init__(self, colony, dt, t_max, simulation_method="ODE"):
+    def __init__(self, colony, dt, t_max, simulation_method="ODE", ode_method="RK45"):
         """
         Args:
             simulation_method: how every cell's reaction network is advanced
-                each step: "ODE" (forward Euler, default), "SSA" (Gillespie),
-                or "CLE" (chemical Langevin equation). Case-insensitive.
+                each step: "ODE" (numerical integration, default), "SSA"
+                (Gillespie), or "CLE" (chemical Langevin equation).
+                Case-insensitive.
+            ode_method: `scipy.integrate.solve_ivp` method used when
+                simulation_method is "ODE": "RK45" (default), "RK23",
+                "DOP853", "Radau", "BDF", or "LSODA".
         """
         self.colony = colony
         self.dt = dt
         self.t_max = t_max
         self.simulation_method = simulation_method.upper()
+        self.ode_method = ode_method
         self.time = 0.0
         self.history = []
         self.env_history = []
@@ -60,7 +65,7 @@ class Simulation:
             record.update(cell.concentrations)
             self.history.append(record)
 
-    def run(self, show_progress=True, t_max=None):
+    def run(self, show_progress=True, t_max=None, ode_method=None):
         """
         Step the colony forward, recording state at every step.
 
@@ -68,12 +73,15 @@ class Simulation:
         `t_max` is not given), recording the initial state first. Calling
         `run` again continues from the current time instead of resetting
         it, appending to the existing history — pass a new, larger `t_max`
-        to extend the simulated window. This supports e.g. switching the
+        to extend the simulated window. `ode_method`, if given, replaces the
+        `solve_ivp` method used for the rest of the simulation. This supports e.g. switching the
         colony's environment (via `colony.switch_environment`) partway
         through a simulation and continuing it.
         """
         if t_max is not None:
             self.t_max = t_max
+        if ode_method is not None:
+            self.ode_method = ode_method
 
         if not self.history:
             self.time = 0.0
@@ -84,7 +92,7 @@ class Simulation:
         for step_index in tqdm(
             range(start_step + 1, n_steps + 1), disable=not show_progress
         ):
-            self.colony.step(self.dt, self.simulation_method)
+            self.colony.step(self.dt, self.simulation_method, self.ode_method)
             self.time = step_index * self.dt
             self.record()
 
@@ -108,6 +116,7 @@ class Simulation:
         filename=_DEFAULT_FILENAME,
         show_progress=True,
         stride=1,
+        show=True,
     ):
         """
         Show a 2D animation of this Simulation's cells over time in a pop-up window.
@@ -137,18 +146,29 @@ class Simulation:
                 diverging `field_cmap` — pass both explicitly for full
                 contrast across the field's actual range.
             interval: Delay between animation frames, in milliseconds.
-            save_path: Optional directory to save the animation into, as an
-                animated GIF. Created if it doesn't already exist. If None
-                (default), the animation is only shown, not saved.
-            filename: File name to save under, within `save_path`. Defaults to
-                "simulation.gif".
+            save_path: Optional directory to save the animation into. Created
+                if it doesn't already exist. If None (default), the animation
+                is only shown, not saved.
+            filename: File name to save under, within `save_path`. Its
+                extension chooses the format: ".mp4" writes an H.264 video,
+                anything else an animated GIF. Defaults to "simulation.gif".
+                Video files are much smaller and faster to write than GIFs,
+                so prefer ".mp4" for long or large animations; GIFs embed
+                directly in notebooks and READMEs, which is what they're good
+                for.
             show_progress: Whether to show a progress bar while rendering frames.
             stride: Only render every `stride`-th recorded time step (default 1 =
-                every step). Use stride > 1 to produce a shorter GIF without
-                re-running the simulation.
+                every step). Use stride > 1 to produce a shorter animation
+                without re-running the simulation.
+            show: Whether to play the animation back in a pop-up window
+                (default True). Pass False together with `save_path` to only
+                write the file: frames are then encoded as they are rendered
+                rather than all held in memory at once, which is what makes
+                very long animations practical.
 
         Returns:
-            The `matplotlib.animation.FuncAnimation` driving the pop-up window.
+            The `matplotlib.animation.FuncAnimation` driving the pop-up
+            window, or — when `show=False` — the path of the file written.
         """
         from ..utils.visualization import _display_and_save, _render_frames
 
@@ -184,7 +204,7 @@ class Simulation:
             field_vmax=field_vmax,
         )
 
-        return _display_and_save(frames, interval, save_path, filename)
+        return _display_and_save(frames, interval, save_path, filename, show=show)
 
     def visualize_field(
         self,
@@ -197,6 +217,7 @@ class Simulation:
         filename=_DEFAULT_FILENAME,
         show_progress=True,
         stride=1,
+        show=True,
     ):
         """
         Show a 2D animation of one Field's values over time in a pop-up window.
@@ -213,18 +234,24 @@ class Simulation:
             vmax: Upper bound of the color scale. If None (default), uses
                 the field's maximum recorded value over the whole simulation.
             interval: Delay between animation frames, in milliseconds.
-            save_path: Optional directory to save the animation into, as an
-                animated GIF. Created if it doesn't already exist. If None
-                (default), the animation is only shown, not saved.
-            filename: File name to save under, within `save_path`. Defaults to
-                "simulation.gif".
+            save_path: Optional directory to save the animation into. Created
+                if it doesn't already exist. If None (default), the animation
+                is only shown, not saved.
+            filename: File name to save under, within `save_path`. Its
+                extension chooses the format: ".mp4" writes an H.264 video,
+                anything else an animated GIF. Defaults to "simulation.gif".
             show_progress: Whether to show a progress bar while rendering frames.
             stride: Only render every `stride`-th recorded time step (default 1 =
-                every step). Use stride > 1 to produce a shorter GIF without
-                re-running the simulation.
+                every step). Use stride > 1 to produce a shorter animation
+                without re-running the simulation.
+            show: Whether to play the animation back in a pop-up window
+                (default True). Pass False together with `save_path` to only
+                write the file, encoding frames as they are rendered instead
+                of holding them all in memory.
 
         Returns:
-            The `matplotlib.animation.FuncAnimation` driving the pop-up window.
+            The `matplotlib.animation.FuncAnimation` driving the pop-up
+            window, or — when `show=False` — the path of the file written.
         """
         from ..utils.visualization import _display_and_save, _render_field_frames
 
@@ -239,7 +266,7 @@ class Simulation:
             times, env_by_time, snapshots, field_name, cmap, vmin, vmax, show_progress
         )
 
-        return _display_and_save(frames, interval, save_path, filename)
+        return _display_and_save(frames, interval, save_path, filename, show=show)
 
     def plot_field(self, field_names, time=None, cmap="viridis", vmin=None, vmax=None):
         """

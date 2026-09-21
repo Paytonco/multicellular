@@ -254,7 +254,7 @@ class Environment:
                 C = np.where(is_wall, C, C + D * sub_dt * laplacian)
             field.values = C
 
-    def react(self, dt, method="ODE"):
+    def react(self, dt, method="ODE", ode_method="RK45"):
         """
         Advance `self.reactions` by dt, independently at every non-wall grid
         cell (voxel), using the given simulation method. No-op if
@@ -273,6 +273,9 @@ class Environment:
         Wall (wall_map == 1) cells are excluded, like `diffuse`: there's no
         medium there for a reaction to occur in. Out-of-bounds (-1) cells
         react normally, also like `diffuse`.
+
+        `ode_method` is the `scipy.integrate.solve_ivp` method used when
+        `method` is "ODE" (default "RK45").
 
         Raises:
             ValueError: if `self.reactions` references a species with no
@@ -303,7 +306,7 @@ class Environment:
                     continue
                 state = {s: float(values[s][i, j]) for s in species_list}
                 new_state = network.simulate_step(
-                    state, dt, volume, method, rng=self.rng
+                    state, dt, volume, method, rng=self.rng, ode_method=ode_method
                 )
                 for s, value in new_state.items():
                     values[s][i, j] = value

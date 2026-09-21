@@ -351,9 +351,8 @@ def test_ode_efflux_conserves_mass_via_last_exported():
 
 
 def test_ode_efflux_caps_export_at_available_pool_for_large_dt():
-    # k*dt = 10 means forward Euler would try to remove 10x the pool in one
-    # step; the per-reaction extent clamp must cap the export at exactly
-    # what's available, not at whatever the (overshooting) raw rate implies.
+    # k*dt = 10: the pool is nearly exhausted within one step. The integrated
+    # export must follow exponential decay and never exceed what's available.
     net = _efflux_network(k=100.0)
     state = {"X": 0.05}
     volume = 1.0
@@ -361,9 +360,12 @@ def test_ode_efflux_caps_export_at_available_pool_for_large_dt():
 
     new_state = net.simulate_step(state, dt, volume)
 
-    assert new_state["X"] == pytest.approx(0.0, abs=1e-9)
-    # All available mass (0.05 * volume) should be exported, not more.
-    assert net.last_exported["X"] == pytest.approx(0.05 * volume, abs=1e-9)
+    remaining = 0.05 * np.exp(-10.0)
+    assert new_state["X"] == pytest.approx(remaining, abs=1e-7)
+    assert net.last_exported["X"] == pytest.approx(
+        (0.05 - remaining) * volume, abs=1e-7
+    )
+    assert net.last_exported["X"] <= 0.05 * volume
 
 
 def test_ssa_efflux_conserves_mass_exactly():
@@ -472,3 +474,43 @@ def test_cell_with_cle_reaction_network():
         pytest.approx(cell.concentrations["A"] + cell.concentrations["B"], abs=1e-6)
         == 1.0
     )
+
+
+def _decay_network(k=0.5):
+    rxn = Reaction(
+        reactants={"A": 1},
+        products={},
+        rate_law_type="mass_action",
+        rate_params={"k": k},
+    )
+    return ReactionNetwork("decay", {"R": rxn})
+
+
+@pytest.mark.parametrize(
+    "ode_method", ["RK45", "RK23", "DOP853", "Radau", "BDF", "LSODA", "rk45"]
+)
+def test_ode_methods_match_analytic_decay(ode_method):
+    net = _decay_network(k=0.5)
+    new_state = net.simulate_step({"A": 2.0}, dt=1.0, volume=1.0, ode_method=ode_method)
+    assert new_state["A"] == pytest.approx(2.0 * np.exp(-0.5), rel=1e-3)
+
+
+@pytest.mark.parametrize("ode_method", ["RK45", "Radau", "LSODA"])
+def test_ode_efflux_mass_conserved_for_each_method(ode_method):
+    net = _efflux_network(k=1.0)
+    new_state = net.simulate_step({"X": 1.0}, dt=0.1, volume=2.0, ode_method=ode_method)
+    assert net.last_exported["X"] == pytest.approx(
+        (1.0 - new_state["X"]) * 2.0, abs=1e-6
+    )
+
+
+def test_ode_default_is_rk45():
+    net = _decay_network()
+    a = net.simulate_step({"A": 2.0}, dt=1.0, volume=1.0)
+    b = net.simulate_step({"A": 2.0}, dt=1.0, volume=1.0, ode_method="RK45")
+    assert a == b
+
+
+def test_unknown_ode_method_raises():
+    with pytest.raises(ValueError):
+        _decay_network().simulate_step({"A": 1.0}, 1.0, 1.0, ode_method="Euler")

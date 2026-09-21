@@ -152,7 +152,7 @@ class Cell:
         volume = self.compute_volume()
         self.concentrations = {s: n / volume for s, n in copy_numbers.items()}
 
-    def step(self, dt, method="ODE"):
+    def step(self, dt, method="ODE", ode_method="RK45"):
         """
         Advance cell internal state (chemical + growth). No-op if dead.
 
@@ -160,12 +160,19 @@ class Cell:
             dt: timestep size.
             method: simulation method forwarded to
                 `ReactionNetwork.simulate_step` ("ODE", "SSA", or "CLE").
+            ode_method: `scipy.integrate.solve_ivp` method used when
+                `method` is "ODE" (default "RK45").
         """
         if not self.alive:
             return
         if self.network:
             self.concentrations = self.network.simulate_step(
-                self.concentrations, dt, self.compute_volume(), method, rng=self.rng
+                self.concentrations,
+                dt,
+                self.compute_volume(),
+                method,
+                rng=self.rng,
+                ode_method=ode_method,
             )
             self.pending_export = self.network.last_exported
         self.grow(dt)

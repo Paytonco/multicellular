@@ -9,9 +9,13 @@ from multicellular.core.colony import Colony
 from multicellular.core.simulation import Simulation
 
 
-def _run_one(build_colony, replicate_id, dt, t_max, simulation_method, show_progress):
+def _run_one(
+    build_colony, replicate_id, dt, t_max, simulation_method, ode_method, show_progress
+):
     colony = build_colony(replicate_id)
-    sim = Simulation(colony, dt, t_max, simulation_method=simulation_method)
+    sim = Simulation(
+        colony, dt, t_max, simulation_method=simulation_method, ode_method=ode_method
+    )
     df = sim.run(show_progress=show_progress)
     df = df.copy()
     df["replicate_id"] = replicate_id
@@ -24,6 +28,7 @@ def run_replicates(
     dt: float,
     t_max: float,
     simulation_method: str = "ODE",
+    ode_method: str = "RK45",
     n_jobs: int = -1,
     show_progress: bool = False,
 ) -> pd.DataFrame:
@@ -44,6 +49,9 @@ def run_replicates(
         dt, t_max: Forwarded to each replicate's `Simulation`.
         simulation_method: Forwarded to each replicate's `Simulation`
             ("ODE", "SSA", or "CLE").
+        ode_method: Forwarded to each replicate's `Simulation`; the
+            `scipy.integrate.solve_ivp` method used when `simulation_method`
+            is "ODE" (default "RK45").
         n_jobs: Forwarded to `joblib.Parallel` (-1 uses all available cores).
         show_progress: Whether each individual `Simulation.run` shows its
             own tqdm bar. Off by default since N bars interleaving across
@@ -56,7 +64,9 @@ def run_replicates(
         identifying which run each row came from.
     """
     results = Parallel(n_jobs=n_jobs)(
-        delayed(_run_one)(build_colony, i, dt, t_max, simulation_method, show_progress)
+        delayed(_run_one)(
+            build_colony, i, dt, t_max, simulation_method, ode_method, show_progress
+        )
         for i in range(n_replicates)
     )
     return pd.concat(results, ignore_index=True)

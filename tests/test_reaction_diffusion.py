@@ -110,11 +110,11 @@ def test_react_raises_for_species_missing_field_without_mutating_anything():
     assert np.array_equal(field_a.values, np.full((3, 3), 5.0))
 
 
-def test_react_ode_matches_hand_computed_forward_euler():
+def test_react_ode_matches_analytic_solution():
     network = _conversion_network(k=0.2)
     values_a = np.array([[3.0, 1.0], [3.0, 1.0]])
-    expected_a = values_a * 0.8
-    expected_b = values_a * 0.2
+    expected_a = values_a * np.exp(-0.2)
+    expected_b = values_a * (1 - np.exp(-0.2))
     field_a = Field("A", values_a.copy())
     field_b = Field("B", np.zeros((2, 2)))
     env = Environment(
@@ -122,8 +122,8 @@ def test_react_ode_matches_hand_computed_forward_euler():
     )
 
     env.react(1.0, method="ODE")
-    assert np.allclose(field_a.values, expected_a)
-    assert np.allclose(field_b.values, expected_b)
+    assert np.allclose(field_a.values, expected_a, rtol=1e-4)
+    assert np.allclose(field_b.values, expected_b, rtol=1e-4)
 
 
 def test_react_excludes_wall_cells():
@@ -137,7 +137,7 @@ def test_react_excludes_wall_cells():
     env.react(1.0)
 
     assert field.values[1, 1] == 2.0
-    assert np.all(field.values[wall_map == 0] == 0.0)
+    assert np.allclose(field.values[wall_map == 0], 2.0 * np.exp(-1.0), rtol=1e-4)
 
 
 def test_react_ssa_conserves_total_copy_number_for_isomerization():
@@ -210,7 +210,7 @@ def test_colony_step_runs_field_reactions_with_zero_cells():
 
     colony.step(1.0)
 
-    assert np.allclose(field.values, 5.0)
+    assert np.allclose(field.values, 10.0 * np.exp(-0.5), rtol=1e-4)
 
 
 def test_gray_scott_turing_pattern_grows_spatial_variance():
