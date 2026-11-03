@@ -122,8 +122,9 @@ class Colony:
                 contact dynamics are only stable while
                 `dt < 2 * drag * length / k_wall`.
             drag: isotropic drag constant for contact dynamics.
-                  Translational drag: ζ_t = drag * length.
-                  Rotational drag:    ζ_r = (drag / 12) * length³.
+                  Rods:    ζ_t = drag * length,  ζ_r = (drag / 12) * length³.
+                  Spheres: ζ_t = 3 * drag * radius (no contact rotation:
+                  every contact force on a sphere passes through its center).
             survival_conditions: optional list of (species, operator, threshold)
                 tuples, e.g. [("A", ">", 0)]. Every step, each living cell's
                 concentration of `species` is compared against `threshold`
@@ -374,7 +375,8 @@ class Colony:
         cell, computing the per-cell drag/diffusion pipeline as batched
         numpy array ops instead of one Python pass per cell.
 
-        Uses slender-body drag for an anisotropic rod. Local viscosity and
+        Uses slender-body drag for an anisotropic rod, and isotropic Stokes
+        drag (γ_t = 6πηr, γ_r = 8πηr³) for a sphere. Local viscosity and
         diffusivity are sampled from the environment grid at each cell's
         position. Spatial units are μm; dt is in seconds. `noise` is the
         (n, 3) array of (parallel, perpendicular, rotational) standard-normal
@@ -391,6 +393,7 @@ class Colony:
         lengths = np.array([cell.length for cell in alive])
         radii = np.array([cell.radius for cell in alive])
         orientations = np.array([cell.orientation for cell in alive])
+        is_sphere = np.array([cell.shape == "sphere" for cell in alive])
         xi = np.asarray(noise)
 
         i_idx, j_idx = self._field_indices(positions)
@@ -406,10 +409,17 @@ class Colony:
         r = radii * 1e-6
         ln_ratio = np.log(L_eff / r)  # ln(total length / radius), always > 0
 
-        # Slender-body drag coefficients
+        # Slender-body drag coefficients (rods)
         gamma_par = 2.0 * np.pi * eta_local * L_eff / ln_ratio  # kg/s
         gamma_perp = 4.0 * np.pi * eta_local * L_eff / ln_ratio  # kg/s
         gamma_rot = np.pi * eta_local * L_eff**3 / (3.0 * ln_ratio)  # kg·m²/s
+
+        # Stokes drag coefficients (spheres)
+        if is_sphere.any():
+            gamma_stokes = 6.0 * np.pi * eta_local * r
+            gamma_par = np.where(is_sphere, gamma_stokes, gamma_par)
+            gamma_perp = np.where(is_sphere, gamma_stokes, gamma_perp)
+            gamma_rot = np.where(is_sphere, 8.0 * np.pi * eta_local * r**3, gamma_rot)
 
         # Diffusion coefficients via Einstein relation
         D_par = _kBT / gamma_par  # m²/s
@@ -473,6 +483,10 @@ class Colony:
         so both contact types go through one overdamped update:
           Δc = F / ζ_t * dt,  ζ_t = drag * length
           Δθ = τ / ζ_r * dt,  ζ_r = (drag / 12) * length³
+        A sphere is the length-0 case: its axis segment is a single point, so
+        the same segment-distance math covers sphere-sphere and sphere-rod
+        contacts. Its contact torque is identically zero, so it uses
+        ζ_t = 3 * drag * radius and is never rotated here.
 
         Candidate cell-cell pairs are restricted to cells sharing a grid bin
         or an adjacent one (see _build_spatial_grid), which avoids the O(n²)
@@ -561,6 +575,11 @@ class Colony:
         self._apply_wall_forces(alive, endpoints, forces_x, forces_y, torques)
 
         for i, cell in enumerate(alive):
+            if cell.shape == "sphere":
+                zeta_t = 3.0 * self.drag * cell.radius
+                cell.position[0] += forces_x[i] / zeta_t * dt
+                cell.position[1] += forces_y[i] / zeta_t * dt
+                continue
             zeta_t = self.drag * cell.length
             zeta_r = (self.drag / 12.0) * cell.length**3
             cell.position[0] += forces_x[i] / zeta_t * dt
@@ -595,6 +614,10 @@ class Colony:
         face: the near one for a thick block, and still the only one for a
         thin wall no matter how deep the penetration.
 
+        A sphere's two axis endpoints coincide at its center, so it samples
+        that single point against the faces (sampling both would double the
+        face force).
+
         Corner points (sec 3): point contact between the cell's axis
         segment and the corner, reusing `_segment_point_closest` (the
         cell-cell segment-distance routine with one segment collapsed to a
@@ -610,7 +633,10 @@ class Colony:
             a1x, a1y, b1x, b1y, cix, ciy = endpoints[i]
             R = ci.radius
 
-            for ex, ey in ((a1x, a1y), (b1x, b1y)):
+            sample_points = (
+                ((cix, ciy),) if ci.shape == "sphere" else ((a1x, a1y), (b1x, b1y))
+            )
+            for ex, ey in sample_points:
                 best_h = best_nx = best_ny = None
                 for x0, y0, x1, y1, nx, ny in faces:
                     tx, ty = x1 - x0, y1 - y0

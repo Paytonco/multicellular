@@ -214,3 +214,86 @@ def test_plot_field_unknown_field_raises_key_error():
     sim = _diffusion_sim()
     with pytest.raises(KeyError):
         sim.plot_field("nonexistent")
+
+
+def test_zero_length_capsule_outline_is_a_circle():
+    from multicellular.utils.visualization import _capsule_outline
+
+    outline = _capsule_outline([3.0, 4.0], [0.6, 0.8], 0.0, 0.7)
+    dist = np.hypot(outline[:, 0] - 3.0, outline[:, 1] - 4.0)
+    assert dist == pytest.approx(np.full(len(outline), 0.7))
+
+
+def test_visualize_colony_renders_spherical_cells():
+    env = Environment("open", wall_map=np.zeros((5, 5)), size=(20.0, 20.0))
+    cells = [
+        Cell(id=0, position=[8.0, 10.0], orientation=[1.0, 0.0], shape="sphere"),
+        Cell(id=1, position=[12.0, 10.0], orientation=[1.0, 0.0]),
+    ]
+    sim = Simulation(Colony(cells, env), dt=0.01, t_max=0.03)
+    sim.run(show_progress=False)
+    assert set(sim.to_dataframe()["shape"]) == {"sphere", "rod"}
+    anim = sim.visualize_colony(show_progress=False)
+    assert isinstance(anim, FuncAnimation)
+
+
+def test_cell_colors_uniform_gray_when_no_channel_is_used():
+    import pandas as pd
+
+    from multicellular.utils.visualization import _cell_colors
+
+    df = pd.DataFrame({"A": [0.0, 2.0]})
+    colors = _cell_colors(df, None, None, None, {})
+    assert colors == pytest.approx(np.full((2, 3), 0.3))
+
+
+def test_cell_colors_unused_channels_are_zero():
+    import pandas as pd
+
+    from multicellular.utils.visualization import _cell_colors
+
+    df = pd.DataFrame({"A": [0.0, 1.0, 2.0], "B": [2.0, 2.0, np.nan]})
+    colors = _cell_colors(df, "A", None, None, {"A": 2.0})
+    assert colors == pytest.approx(np.array([[0.0, 0, 0], [0.5, 0, 0], [1.0, 0, 0]]))
+
+    colors = _cell_colors(df, "A", "B", None, {"A": 2.0, "B": 2.0})
+    assert colors == pytest.approx(np.array([[0.0, 1, 0], [0.5, 1, 0], [1.0, 0, 0]]))
+
+
+def _render_first_frame(sim, red=None, green=None, blue=None):
+    from multicellular.utils.visualization import _render_frames
+
+    df = sim.to_dataframe()
+    scales = {s: df[s].max() for s in (red, green, blue) if s is not None}
+    times = sorted(df["time"].unique())
+    env_by_time = {t: env for t, env in sim.env_history}
+    frame = next(
+        iter(_render_frames(df, times, env_by_time, red, green, blue, scales, False))
+    )
+    return np.asarray(frame)[..., :3].reshape(-1, 3).astype(int)
+
+
+def _single_cell_sim():
+    env = Environment("open", wall_map=np.zeros((5, 5)), size=(20.0, 20.0))
+    cell = Cell(id=0, position=[10.0, 10.0], orientation=[1.0, 0.0], growth_rate=0.0)
+    cell.set_concentration("A", 1.0)
+    sim = Simulation(Colony([cell], env, brownian_motion=False), dt=0.1, t_max=0.1)
+    sim.run(show_progress=False)
+    return sim
+
+
+def _count(rgb, color, tol=3):
+    return int((abs(rgb - np.array(color)) < tol).all(axis=1).sum())
+
+
+def test_red_only_cell_renders_pure_red():
+    rgb = _render_first_frame(_single_cell_sim(), red="A")
+    # The cell's fill is pure red (no green/blue mixed in), not gray.
+    assert _count(rgb, (255, 0, 0)) > 100
+    assert _count(rgb, (77, 77, 77)) < 50
+
+
+def test_uncolored_cell_renders_mid_gray():
+    rgb = _render_first_frame(_single_cell_sim())
+    assert _count(rgb, (77, 77, 77)) > 100  # 0.3 * 255 ≈ 77
+    assert _count(rgb, (255, 0, 0)) == 0

@@ -4,11 +4,18 @@ import math
 
 import numpy as np
 
+SHAPES = ("rod", "sphere")
+
 
 class Cell:
     """
-    Represents a rod-shaped bacterial cell with
-    cylindrical body and spherical end caps.
+    Represents a bacterial cell as a spherocylinder: a cylindrical body of
+    `length` with hemispherical end caps of `radius`.
+
+    `shape="rod"` (default) is a rod-shaped cell that grows in length.
+    `shape="sphere"` is a coccoid cell: the same geometry with `length`
+    fixed at 0 (the axis segment collapses to a point, leaving a sphere of
+    `radius`), which grows by increasing its radius instead.
     """
 
     # Above this copy number, partition by sampling from the Gaussian
@@ -20,27 +27,37 @@ class Cell:
         id,
         position,
         orientation,
-        length=2.0,
+        length=None,
         radius=0.5,
         species="default",
         network=None,
         rng=None,
         growth_rate=np.log(2),
         growth_rate_law=None,
-        delta_bar=1.0,
+        delta_bar=None,
         cv_delta=0.10,
         a=1.0,
         cv_f=0.0,
         lysis_targets=None,
+        shape="rod",
     ):
         """
         Args:
+            length: Cylinder length (μm), excluding the caps. Defaults to 2.0
+                for rods and 0.0 for spheres; a sphere's length must be 0.
+            shape: "rod" (default) or "sphere". A sphere is a spherocylinder
+                of zero length: it grows by scaling its radius so that its
+                volume grows at `growth_rate`, its adder size variable is
+                volume (see `delta_bar`), and it divides into two spheres
+                along its orientation.
             growth_rate: Exponential elongation rate λ. Length evolves as
                 L(t) = L_b * exp(λ * t). Default ln(2) gives a mean doubling
                 time of 1 time unit.
-            delta_bar: Mean added length per generation (ΔL̄). Sets the size
-                scale: at steady state the mean birth length is delta_bar and
-                the mean division length is 2 * delta_bar.
+            delta_bar: Mean added size per generation (ΔL̄). Sets the size
+                scale: at steady state the mean birth size is delta_bar and
+                the mean division size is 2 * delta_bar. Size is length (μm)
+                for rods (default 1.0) and volume (μm³) for spheres (default:
+                the sphere's initial volume, (4/3)πr³).
             cv_delta: Coefficient of variation of the added increment. This is
                 the primary stochasticity parameter; must be > 0 for the adder
                 model. Literature range for E. coli: 0.10–0.15.
@@ -61,6 +78,18 @@ class Cell:
                 (see `step`'s `external`), so the cell holds no intracellular
                 copies of it to deliver.
         """
+        if shape not in SHAPES:
+            raise ValueError(f"shape must be one of {SHAPES}, got {shape!r}.")
+        if shape == "sphere":
+            if length is None:
+                length = 0.0
+            elif length != 0:
+                raise ValueError(
+                    f"A spherical cell has length 0 (its radius sets its size); "
+                    f"got length={length}."
+                )
+        elif length is None:
+            length = 2.0
         if lysis_targets and any(k == v for k, v in lysis_targets.items()):
             same = [k for k, v in lysis_targets.items() if k == v]
             raise ValueError(
@@ -68,6 +97,7 @@ class Cell:
                 f"{same} mapped to themselves."
             )
         self.id = id
+        self.shape = shape
         self.position = np.array(position, dtype=float)
         self.orientation = self._normalize(np.array(orientation, dtype=float))
         self.length = length
@@ -80,12 +110,14 @@ class Cell:
 
         self.growth_rate = growth_rate
         self.growth_rate_law = growth_rate_law
+        if delta_bar is None:
+            delta_bar = self.compute_volume() if shape == "sphere" else 1.0
         self.delta_bar = delta_bar
         self.cv_delta = cv_delta
         self.a = a
         self.cv_f = cv_f
 
-        self.length_at_birth = length
+        self.size_at_birth = self._size()
         self._division_target = self._sample_division_target()
 
         self.low_copy_species = set()
@@ -99,21 +131,33 @@ class Cell:
         self.extracellular = {}
         self.lysis_targets = dict(lysis_targets) if lysis_targets else {}
 
+    @property
+    def length_at_birth(self):
+        """Birth size of a rod (alias of `size_at_birth`)."""
+        return self.size_at_birth
+
+    def _size(self):
+        """The adder's size variable: length for rods, volume for spheres."""
+        return self.compute_volume() if self.shape == "sphere" else self.length
+
     def _sample_division_target(self):
         """
-        Sample the division target for this generation.
+        Sample the division target (in `_size` units) for this generation.
 
-        L_d = a * L_b + Delta,  Delta ~ Normal(delta_bar, cv_delta * delta_bar).
+        S_d = a * S_b + Delta,  Delta ~ Normal(delta_bar, cv_delta * delta_bar).
         Resamples until Delta > 0 to keep the target above the birth size.
         """
         while True:
             delta = self.rng.normal(self.delta_bar, self.cv_delta * self.delta_bar)
             if delta > 0:
                 break
-        return self.a * self.length_at_birth + delta
+        return self.a * self.size_at_birth + delta
 
     def compute_volume(self):
-        """Compute volume of cylindrical rod with hemispherical caps."""
+        """
+        Compute volume of a cylinder with hemispherical caps. For a sphere
+        (length 0) this is exactly (4/3)πr³.
+        """
         cylinder_volume = np.pi * self.radius**2 * self.length
         cap_volume = (4 / 3) * np.pi * self.radius**3
         return cylinder_volume + cap_volume
@@ -150,7 +194,11 @@ class Cell:
         thing that changes copy number.
         """
         copy_numbers = {s: self.copy_number(s) for s in self.concentrations}
-        self.length *= np.exp(self.growth_rate * dt)
+        if self.shape == "sphere":
+            # Volume ∝ r³, so r grows at λ/3 for volume to grow at λ.
+            self.radius *= np.exp(self.growth_rate * dt / 3.0)
+        else:
+            self.length *= np.exp(self.growth_rate * dt)
         self.age += dt
         volume = self.compute_volume()
         self.concentrations = {s: n / volume for s, n in copy_numbers.items()}
@@ -214,7 +262,7 @@ class Cell:
 
     def ready_to_divide(self):
         """Return True if the cell has reached its sampled division target."""
-        return self.length >= self._division_target
+        return self._size() >= self._division_target
 
     def _partition_copies(self, n):
         """
@@ -237,10 +285,13 @@ class Cell:
         """
         Split into two daughter cells along the longitudinal axis.
 
-        Daughter lengths are f * L_d and (1 - f) * L_d, where L_d is this
+        Daughter sizes are f * S_d and (1 - f) * S_d, where S_d is this
         cell's sampled division target and f is the division fraction (0.5 by
         default; optionally noisy when cv_f > 0). Each daughter samples its
         own division target at construction, continuing the adder lineage.
+
+        Rods split their length; spheres split their volume into two spheres
+        placed along the cell's orientation, touching at the division plane.
         """
         if not self.ready_to_divide():
             return None
@@ -250,18 +301,28 @@ class Cell:
         else:
             f = 0.5
 
-        L_d = self._division_target
-        length1 = f * L_d
-        length2 = (1.0 - f) * L_d
-
-        # Place daughters so their surfaces just touch at the division plane.
-        pos1 = self.position - ((1.0 - f) * L_d / 2.0 + self.radius) * self.orientation
-        pos2 = self.position + (f * L_d / 2.0 + self.radius) * self.orientation
+        S_d = self._division_target
+        if self.shape == "sphere":
+            # Daughter radii from volumes f*V_d and (1-f)*V_d.
+            radius1 = (3.0 * f * S_d / (4.0 * np.pi)) ** (1.0 / 3.0)
+            radius2 = (3.0 * (1.0 - f) * S_d / (4.0 * np.pi)) ** (1.0 / 3.0)
+            length1 = length2 = 0.0
+            pos1 = self.position - radius1 * self.orientation
+            pos2 = self.position + radius2 * self.orientation
+        else:
+            radius1 = radius2 = self.radius
+            length1 = f * S_d
+            length2 = (1.0 - f) * S_d
+            # Place daughters so their surfaces just touch at the division plane.
+            pos1 = (
+                self.position - ((1.0 - f) * S_d / 2.0 + self.radius) * self.orientation
+            )
+            pos2 = self.position + (f * S_d / 2.0 + self.radius) * self.orientation
 
         daughter_kw = dict(
             id=None,
             orientation=self.orientation,
-            radius=self.radius,
+            shape=self.shape,
             species=self.species,
             rng=self.rng,
             growth_rate=self.growth_rate,
@@ -275,12 +336,14 @@ class Cell:
         daughter1 = Cell(
             position=pos1,
             length=length1,
+            radius=radius1,
             network=self.network.clone() if self.network else None,
             **daughter_kw,
         )
         daughter2 = Cell(
             position=pos2,
             length=length2,
+            radius=radius2,
             network=self.network.clone() if self.network else None,
             **daughter_kw,
         )
@@ -348,6 +411,7 @@ class Cell:
     def to_dict(self):
         return {
             "id": self.id,
+            "shape": self.shape,
             "position": self.position.tolist(),
             "orientation": self.orientation.tolist(),
             "length": self.length,

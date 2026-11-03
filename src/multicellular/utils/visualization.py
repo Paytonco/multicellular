@@ -17,7 +17,9 @@ from tqdm import tqdm
 # needed); anything else is written as an animated GIF by Pillow.
 _VIDEO_EXTENSIONS = {".mp4"}
 
-# Default color used for any RGB channel that isn't tied to a chemical species.
+# Gray level (in every RGB channel) of cells when no channel is tied to a
+# chemical species. Once any channel is in use, unused channels are 0 instead,
+# so a cell colored only by `red` is pure red.
 _DEFAULT_CHANNEL_VALUE = 0.3
 
 # Transparency and stacking order for the optional field heatmap drawn
@@ -120,14 +122,12 @@ def _channel_column(df, species, scale):
     to [0, 1] by `scale`.
 
     The array counterpart of reading one species' concentration out of a
-    single row: channels not tied to a species are a constant, and a species
-    with no column (or a non-positive scale) contributes nothing. Rows where
-    the species is absent — a colony whose cells carry different networks
-    gives those rows NaN — are treated as zero concentration.
+    single row: a channel not tied to a species, or a species with no column
+    (or a non-positive scale), contributes nothing. Rows where the species
+    is absent — a colony whose cells carry different networks gives those
+    rows NaN — are treated as zero concentration.
     """
-    if species is None:
-        return np.full(len(df), _DEFAULT_CHANNEL_VALUE)
-    if species not in df.columns or scale <= 0:
+    if species is None or species not in df.columns or scale <= 0:
         return np.zeros(len(df))
     values = np.nan_to_num(df[species].to_numpy(dtype=float))
     return np.clip(values / scale, 0.0, 1.0)
@@ -239,6 +239,25 @@ def _blit_frame(fig, ax, draw_order, background):
     return np.asarray(canvas.buffer_rgba()).copy()
 
 
+def _cell_colors(df, red, green, blue, scales):
+    """
+    The (n_rows, 3) RGB color of every row of `df`.
+
+    Each channel named by a species is that species' normalized
+    concentration (see `_channel_column`), and unused channels are 0, so a
+    cell colored only by `red` is pure red. With no channel in use, every
+    cell is a uniform gray (`_DEFAULT_CHANNEL_VALUE` in all three channels).
+    """
+    if red is None and green is None and blue is None:
+        return np.full((len(df), 3), _DEFAULT_CHANNEL_VALUE)
+    return np.column_stack(
+        [
+            _channel_column(df, species, scales.get(species, 1.0))
+            for species in (red, green, blue)
+        ]
+    )
+
+
 def _render_frames(
     df,
     times,
@@ -338,13 +357,7 @@ def _render_frames(
         alive["radius"].to_numpy(dtype=float),
         n_points=n_points,
     )
-    colors = np.column_stack(
-        [
-            _channel_column(alive, red, scales.get(red, 1.0)),
-            _channel_column(alive, green, scales.get(green, 1.0)),
-            _channel_column(alive, blue, scales.get(blue, 1.0)),
-        ]
-    )
+    colors = _cell_colors(alive, red, green, blue, scales)
     alive_times = alive["time"].to_numpy(dtype=float)
     frame_starts = np.searchsorted(alive_times, times, side="left")
     frame_stops = np.searchsorted(alive_times, times, side="right")

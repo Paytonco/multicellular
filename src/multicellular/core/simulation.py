@@ -61,6 +61,7 @@ class Simulation:
                 "orientation_y": cell.orientation[1],
                 "length": cell.length,
                 "radius": cell.radius,
+                "shape": cell.shape,
             }
             record.update(cell.concentrations)
             # After concentrations: a field-backed species is extracellular,
@@ -135,7 +136,9 @@ class Simulation:
             red, green, blue: Optional chemical species names. Each cell's color
                 in that channel is its concentration of the given species,
                 normalized by the species' maximum value over the simulation.
-                Channels left as None default to a constant mid-gray value.
+                Channels left as None are 0, so a cell colored only by `red`
+                is pure red. If all three are None, every cell is drawn a
+                uniform mid-gray (0.3 in each channel).
             field: Optional `Field` name (e.g. "temperature") to draw as a
                 light, semi-transparent heatmap behind the cells, with a
                 colorbar labeled with the field's name. The heatmap is

@@ -978,3 +978,161 @@ def test_wall_forces_apply_even_with_a_single_living_cell():
     colony._apply_contact_forces(dt=0.01, alive=[cell])
 
     assert cell.position[0] != pytest.approx(40.7)
+
+
+# --- Spherical cells ---------------------------------------------------------
+
+
+def _make_sphere(position, radius=0.5, orientation=(1.0, 0.0)):
+    return Cell(
+        id=None,
+        position=position,
+        orientation=list(orientation),
+        radius=radius,
+        shape="sphere",
+        growth_rate=0.0,
+    )
+
+
+def _open_env():
+    return Environment("open", wall_map=np.zeros((10, 10)), size=(100.0, 100.0))
+
+
+def test_overlapping_spheres_push_apart_symmetrically_without_rotation():
+    a = _make_sphere([50.0, 50.0], orientation=(0.6, 0.8))
+    b = _make_sphere([50.8, 50.0], orientation=(0.0, 1.0))
+    colony = Colony([a, b], _open_env(), k=10.0, drag=1.0)
+
+    dt = 0.01
+    colony._apply_contact_forces(dt)
+
+    # δ = 1.0 - 0.8 = 0.2; F = k δ = 2; ζ_t = 3 * drag * r = 1.5.
+    step = 10.0 * 0.2 / 1.5 * dt
+    assert a.position == pytest.approx([50.0 - step, 50.0])
+    assert b.position == pytest.approx([50.8 + step, 50.0])
+    assert a.orientation == pytest.approx([0.6, 0.8])
+    assert b.orientation == pytest.approx([0.0, 1.0])
+
+
+def test_overlapping_spheres_separate_to_contact_distance():
+    a = _make_sphere([50.0, 50.0])
+    b = _make_sphere([50.3, 50.4])
+    colony = Colony([a, b], _open_env(), k=10.0)
+    for _ in range(500):
+        colony._apply_contact_forces(0.01)
+    assert np.linalg.norm(a.position - b.position) == pytest.approx(1.0, abs=1e-3)
+
+
+def test_sphere_rod_contact_moves_both_and_rotates_only_the_rod():
+    rod = Cell(
+        id=None,
+        position=[50.0, 50.0],
+        orientation=[1.0, 0.0],
+        length=2.0,
+        radius=0.5,
+        growth_rate=0.0,
+    )
+    # Sphere pressing on the rod off-center (above its right half).
+    sphere = _make_sphere([50.6, 50.8])
+    colony = Colony([rod, sphere], _open_env(), k=10.0)
+
+    rod_pos, sphere_pos = rod.position.copy(), sphere.position.copy()
+    colony._apply_contact_forces(0.01)
+
+    # Sphere is pushed straight up (contact normal is the rod's perpendicular).
+    assert sphere.position[1] > sphere_pos[1]
+    assert sphere.position[0] == pytest.approx(sphere_pos[0])
+    assert sphere.orientation == pytest.approx([1.0, 0.0])
+    assert rod.position[1] < rod_pos[1]
+    # Downward force on the right half rotates the rod clockwise.
+    assert rod.orientation[1] < 0.0
+
+
+def test_sphere_wall_force_is_not_double_counted():
+    env = _wall_block_env()
+    # Sphere centered 0.3 μm left of the west face (x=40): δ = 0.5 - 0.3.
+    sphere = _make_sphere([39.7, 50.0])
+    colony = Colony([sphere], env, k=10.0)
+
+    dt = 1e-3
+    colony._apply_contact_forces(dt, alive=[sphere])
+
+    expected = colony.k_wall * 0.2 / (3.0 * colony.drag * 0.5) * dt
+    assert sphere.position[0] == pytest.approx(39.7 - expected)
+    assert sphere.position[1] == pytest.approx(50.0)
+
+
+def test_sphere_is_pushed_off_a_wall_face():
+    env = _wall_block_env()
+    sphere = _make_sphere([39.8, 50.0])
+    colony = Colony([sphere], env, k=10.0)
+    for _ in range(500):
+        colony._apply_contact_forces(0.01, alive=[sphere])
+    assert sphere.position[0] == pytest.approx(39.5, abs=1e-3)
+
+
+def test_sphere_brownian_motion_uses_stokes_drag():
+    env = _open_env()
+    sphere = _make_sphere([50.0, 50.0], radius=0.7, orientation=(0.6, 0.8))
+    colony = Colony([sphere], env)
+    xi = np.array([0.3, -1.2, 0.8])
+    dt = 0.05
+
+    colony._apply_brownian_motion(dt, [sphere], [xi])
+
+    i, j = env.grid_indices(np.array([[50.0, 50.0]]))
+    eta = env.eta[i[0], j[0]] * (WATER_DIFFUSIVITY_37C / env.diffusivity[i[0], j[0]])
+    r = 0.7e-6
+    s = math.sqrt(2.0 * _KBT / (6.0 * math.pi * eta * r) * dt) * 1e6
+    ux, uy = 0.6, 0.8
+    expected_x = 50.0 + (ux * xi[0] - uy * xi[1]) * s
+    expected_y = 50.0 + (uy * xi[0] + ux * xi[1]) * s
+    assert sphere.position == pytest.approx([expected_x, expected_y])
+
+    angle = xi[2] * math.sqrt(2.0 * _KBT / (8.0 * math.pi * eta * r**3) / dt) * dt
+    expected_o = [
+        math.cos(angle) * ux - math.sin(angle) * uy,
+        math.sin(angle) * ux + math.cos(angle) * uy,
+    ]
+    assert sphere.orientation == pytest.approx(expected_o)
+
+
+def test_brownian_motion_mixed_rods_and_spheres_matches_reference_for_rods():
+    env = _open_env()
+    rod = _make_cell([30.0, 30.0])
+    ref = copy.deepcopy(rod)
+    sphere = _make_sphere([60.0, 60.0])
+    colony = Colony([rod, sphere], env)
+    xi = [np.array([0.5, -0.2, 1.1]), np.array([0.1, 0.4, -0.3])]
+
+    colony._apply_brownian_motion(0.05, [rod, sphere], xi)
+    _reference_brownian_step(env, ref, 0.05, xi[0])
+
+    assert rod.position == pytest.approx(ref.position)
+    assert rod.orientation == pytest.approx(ref.orientation)
+
+
+def test_mixed_colony_steps_and_divides():
+    rng = np.random.default_rng(5)
+    cells = [
+        Cell(
+            id=i,
+            position=[40.0 + 2.0 * i, 50.0],
+            orientation=[1.0, 0.0],
+            shape="sphere" if i % 2 else "rod",
+            growth_rate=1.0,
+            rng=rng,
+        )
+        for i in range(4)
+    ]
+    colony = Colony(cells, _open_env(), brownian_motion=False)
+    for _ in range(150):
+        colony.step(0.01)
+
+    shapes = [c.shape for c in colony.cells]
+    assert len(colony.cells) > 4
+    assert "sphere" in shapes and "rod" in shapes
+    for c in colony.cells:
+        assert np.all(np.isfinite(c.position))
+        if c.shape == "sphere":
+            assert c.length == 0.0
