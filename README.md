@@ -23,7 +23,9 @@ tested:
   other by a `ReactionNetwork`, stepped forward independently at every
   non-wall grid cell (ODE, CLE, or SSA, same as inside a `Cell`)
 - Colony with overdamped-Langevin Brownian motion, Hookean cell-cell and
-  cell-wall contact forces and torques, chemical field sensing and export
+  cell-wall contact forces and torques, mass-conserving exchange between
+  cells and chemical `Field`s (sensing, uptake, and membrane-bound
+  extracellular chemistry all draw on the real local pool), export
   (secretion), optional chemical survival conditions, and lysis-based
   delivery (a bulk one-time intracellular-to-`Field` deposit when a cell
   dies from a violated survival condition)
@@ -170,7 +172,53 @@ Michaelis-Menten and Hill-Langmuir.
   concentrations before returning. This conversion is invisible to callers:
   `Cell.step` and `Cell.grow`'s dilution logic (see
   [Dilution by growth](#dilution-by-growth) above) work identically
-  regardless of `simulation_method`.
+  regardless of `simulation_method`. A firing that would drive any count
+  negative (possible only with custom rate laws, or with a fractional
+  extracellular pool; see below) is rejected rather than clipped, so SSA
+  never creates mass.
+
+#### Species in another compartment (`compartment_volumes`)
+
+`simulate_step` takes an optional `compartment_volumes` dict mapping a
+species to the volume of the compartment it lives in, for species that
+don't live in `volume`, such as an extracellular species living in an
+environment voxel. Rate laws are unchanged: they're still evaluated
+against concentrations and scaled by `volume`, so reaction `j` moves
+`v_j * volume` molecules per unit time. Each species' concentration,
+though, changes by those molecules divided by *its own* compartment's
+volume:
+
+```
+d[intracellular]/dt = S @ v
+d[extracellular]/dt = (volume / V_compartment) * (S @ v)
+```
+
+Molecule counts are therefore conserved across compartments. Rates also
+respond to depletion within the step (e.g. a transporter slows as it
+drains its voxel). Per method:
+
+- **`"ODE"`** integrates the weighted system directly.
+- **`"SSA"`** counts each species in its own compartment's volume. It
+  doesn't round other-compartment counts to whole molecules, so the
+  owning pool's fractional amount is never created or destroyed by
+  rounding; each firing still moves whole molecules.
+- **`"CLE"`** clamps each cross-compartment reaction's extent so that it
+  can't drive any species it touches negative. Clipping afterwards would
+  create mass in the other pool.
+
+```python
+uptake = Reaction({"A_ext": 1}, {"A_int": 1}, rate_law_type="mass_action", rate_params={"k": 1.0})
+network = ReactionNetwork("uptake", {"R": uptake})
+new_state = network.simulate_step(
+    {"A_ext": 2.0, "A_int": 0.0}, dt=0.1, volume=2.0,
+    compartment_volumes={"A_ext": 20.0},   # A_ext lives in a 20 um^3 voxel
+)
+```
+
+You rarely call this directly. `Colony` passes it automatically for every
+network species backed by a chemical `Field`; see
+[Extracellular species](#extracellular-species-uptake-and-membrane-bound-enzymes)
+below.
 
 #### Exporting species (secretion)
 
@@ -208,6 +256,13 @@ afterward instead could let CLE noise (or a forward-Euler overshoot at large
 `dt`) silently create or destroy mass. For `"SSA"`, exported counts are
 tracked exactly during the same firing loop that updates intracellular
 counts, so they're exact by construction.
+
+If the destination is a chemical (`is_chemical=True`) `Field`, an ordinary
+reaction producing the field-backed species (e.g. `X -> X_ext`, with a
+`Field` named `X_ext`) is equivalent to an export; see
+[Extracellular species](#extracellular-species-uptake-and-membrane-bound-enzymes)
+below. Exports remain the way to deposit into a `Field` that isn't
+chemical.
 
 ### Cell with an internal reaction network
 
@@ -321,21 +376,98 @@ env.get_field("glucose")
 Every `Field` added to an `Environment` must have a `values` matrix matching
 the environment's `shape`; adding a mismatched field raises `ValueError`.
 
-A `Field` also carries an `is_chemical` flag (default `False`). Fields marked
-`is_chemical=True` are treated as diffusible chemical species: at each
-timestep, `Colony` samples the field's local value at every living cell's
-position and writes it into that cell's `concentrations` under the field's
-`name`, overwriting any existing value for that species (see
-[`Colony`](#colony) below). This sampling happens both before and after each
-cell's internal step, so a chemical field's value is treated as an
-externally-imposed boundary condition: the cell's own growth (see
-[Dilution by growth](#dilution-by-growth) below) never dilutes it. Every living
-cell's position is looked up in the field grid in one batched (vectorized)
-operation per field, rather than one Python-level lookup per cell.
+A `Field` also carries an `is_chemical` flag (default `False`). A field
+marked `is_chemical=True` holds an extracellular chemical species: any
+species in a cell's `ReactionNetwork` that shares the field's `name` *is*
+that extracellular species, and it exchanges real mass with the field (see
+[Extracellular species](#extracellular-species-uptake-and-membrane-bound-enzymes)
+below). After every step, each living cell's local value of every chemical
+field is also recorded in `cell.extracellular` (a read-only snapshot,
+keyed by field name). `Simulation` records it into the history DataFrame
+under the field's name, and survival conditions can test it.
 
 ```python
 glucose = Field("glucose", np.ones((10, 10)), is_chemical=True)
 ```
+
+#### Extracellular species: uptake and membrane-bound enzymes
+
+Intracellular and extracellular forms of a molecule are distinct species
+with distinct names: `glucose` (backed by a chemical `Field`) versus
+`glucose_int` (an ordinary intracellular species). Moving between them, or
+reacting outside the cell, is just ordinary reactions. There's no special
+"import" mechanism. Each step, for every living cell, `Colony`:
+
+1. reads each field-backed species' concentration at the voxel containing
+   the cell's center;
+2. steps the cell's network with those species living in the voxel
+   (`compartment_volumes={species: environment.grid_cell_volume}`; see
+   [Species in another compartment](#species-in-another-compartment-compartment_volumes)
+   above);
+3. writes the voxel's updated concentrations straight back into the fields.
+
+So any reaction that consumes or produces a field-backed species draws
+from or adds to the local pool, and molecules are conserved between cells
+and medium. A reaction moving `n` molecules changes the cell's own species
+by `n / V_cell`, and the voxel's by `n / V_voxel`.
+
+```python
+import numpy as np
+from multicellular import Cell, Colony, Environment, Field, ReactionNetwork
+from multicellular.core.reactions import Reaction
+
+# Transporter: extracellular glucose -> intracellular glucose_int.
+transport = Reaction({"glucose": 1}, {"glucose_int": 1}, catalysts=["PtsG"],
+                     rate_law_type="michaelis_menten", rate_params={"Vmax": 4.0, "Km": 0.5})
+# Membrane-bound enzyme acting outside the cell: glucose -> gluconate, both
+# extracellular, catalysed by the cell's own (intracellular) Gdh.
+oxidation = Reaction({"glucose": 1}, {"gluconate": 1}, catalysts=["Gdh"],
+                     rate_law_type="michaelis_menten", rate_params={"Vmax": 2.0, "Km": 0.5})
+
+cell = Cell(id=0, position=[12.0, 12.0], orientation=[1.0, 0.0],
+            network=ReactionNetwork("glucose", {"transport": transport, "oxidation": oxidation}))
+cell.set_concentration("PtsG", 1.0)
+cell.set_concentration("Gdh", 1.0)
+
+env = Environment("closed chamber", wall_map=np.zeros((12, 12)), size=(24.0, 24.0), fields=[
+    Field("glucose", np.ones((12, 12)), is_chemical=True, diffuses=True, diffusivity=1e-12),
+    Field("gluconate", np.zeros((12, 12)), is_chemical=True, diffuses=True, diffusivity=1e-12),
+])
+colony = Colony([cell], env)
+for _ in range(100):
+    colony.step(dt=0.1)
+# glucose field + gluconate field + glucose_int in the cell is conserved exactly.
+```
+
+Details:
+
+- **Catalyst-only sensing is free.** A species that only ever appears as a
+  catalyst (an inducer like IPTG, or a constant `RNAP` field) is read but
+  never consumed, so sensing it doesn't change the field.
+- **Not part of the cell.** Field-backed species are kept out of
+  `cell.concentrations` (the zero entries a new cell seeds for every
+  network species are dropped on its first step), so growth never dilutes
+  them and division never partitions them. A species is field-backed only
+  while the current environment has a chemical `Field` of that name. After
+  `switch_environment` to an environment without it, the name is an
+  ordinary intracellular species again.
+- **Shared voxels.** Coupled cells are stepped one at a time, in an order
+  shuffled by `environment.rng` each step, and each reads its voxel after
+  the previous cells' writes. Cells sharing a voxel therefore share one
+  pool and can't jointly overdraw it, and no cell gets systematic first
+  access.
+- **Voxel volume matters.** `environment.grid_cell_volume` (`dx * dy *
+  depth`) is the extracellular compartment volume. A voxel smaller than
+  the cell drains (and refills) faster than the cell's own species
+  change; one much larger barely notices a single cell.
+  `examples/danino_oscillator_demo.ipynb` uses this deliberately, sizing
+  each voxel to one cell's share of free medium so that
+  `V_cell / V_voxel = d/(1-d)`, the density factor in the Danino et al.
+  model.
+- **Don't export into a field-backed reactant's own field.** An export
+  reaction whose reactant `X` is itself field-backed (because a chemical
+  `Field` named `X` exists) consumes extracellular `X` and deposits it right
+  back. Use a distinct intracellular name (`X_int`) for the cell's pool.
 
 #### Field diffusion
 
@@ -557,10 +689,11 @@ print(cell.concentrations["X"], field.values[5, 5])  # X left the cell, appeared
 If a cell exports a species with no matching `Field` in the environment,
 `export_chemical_fields` raises `ValueError` — validated for every exporting
 cell before any field is mutated, so a missing field never causes a partial
-deposit. The target field doesn't need `is_chemical=True` (that flag only
-controls whether `Colony` *senses* the field back into cells — an orthogonal
-concern from whether it can receive secretion) or `diffuses=True`, though
-combining both lets secreted material spread spatially on subsequent steps.
+deposit. The target field doesn't need `is_chemical=True` (that flag makes
+the field's name an extracellular species of any network that references
+it, an orthogonal concern from whether it can receive secretion) or
+`diffuses=True`, though combining both lets secreted material spread
+spatially and be sensed or taken up by other cells.
 
 #### Lysis-based delivery
 
@@ -610,18 +743,13 @@ as `export_chemical_fields` above.
 
 A source species must map to a **different** target species name —
 `Cell.__init__` raises `ValueError` if any source equals its own target.
-This isn't just a naming nicety: `Colony.apply_chemical_fields` mirrors a
-chemical `Field`'s value into every living cell's same-named concentration
-every step, but that's a non-conservative copy, not a depleting transfer —
-the field's mass is never actually removed from the field when a cell reads
-it. If a cell then lysed that mirrored value straight back into the
-same-named field, it would inject mass that was never taken out in the
-first place, compounding with every cell that dies. Deliver into a
-distinct species instead — the same discipline already used on the import
-side, where a `Field`-mirrored species is converted into a separate,
-truly-intracellular pool via a reaction (see
-[`Reaction` and `ReactionNetwork`](#reaction-and-reactionnetwork) above)
-before it's consumed.
+This isn't just a naming nicety. A species named after a chemical `Field`
+*is* that field's extracellular pool (see
+[Extracellular species](#extracellular-species-uptake-and-membrane-bound-enzymes)
+above): the cell reads it and exchanges mass with it, but holds no copies
+of it itself, so there's nothing intracellular to release. Deliver an
+intracellular species into a distinct, field-backed one instead, the same
+intracellular/extracellular naming discipline used for uptake.
 
 `lysis_targets` is inherited by both daughters at division, the same way
 `species` and `growth_rate_law` are.
@@ -669,8 +797,10 @@ It also accepts an optional **`survival_conditions`** parameter: a list of
 `(species, operator, threshold)` tuples, e.g. `[("A", ">", 0)]`. Every step,
 each living cell's concentration of `species` is compared against
 `threshold` using `operator` — one of `">"`, `">="`, `"<"`, `"<="`, `"=="`,
-`"!="` — and the cell dies as soon as any condition is violated. A species
-missing from a cell's concentrations is treated as `0.0`. With multiple
+`"!="` — and the cell dies as soon as any condition is violated. `species`
+may be intracellular or the name of a chemical `Field` (read from the
+cell's local `extracellular` snapshot, e.g. a toxin in the medium); a
+species missing from both is treated as `0.0`. With multiple
 conditions, a cell dies if *any* of them is violated. A cell killed this way
 that also has `lysis_targets` set delivers its lysis payload to the
 environment — see [Lysis-based delivery](#lysis-based-delivery) above:
@@ -693,23 +823,21 @@ above — and defaults to `"ODE"`, same as `Cell.step`):
    non-wall grid cell (no-op if `reactions` is `None`; see
    [Field reactions (reaction-diffusion)](#field-reactions-reaction-diffusion)
    above).
-3. **Chemical fields** — for every `Field` on the environment with
-   `is_chemical=True`, samples its local value at each living cell's
-   position and sets that cell's concentration of the same-named species
-   (no-op if there are no chemical fields).
-4. **Internal step** — calls `cell.step(dt)` for every cell (chemistry +
-   growth). Growth dilutes every species in `concentrations`, including
-   ones just set from a chemical field in step 3.
+3. **Growth rates** — calls each living cell's `growth_rate_law` (if any)
+   with its concentrations and the local value of every field.
+4. **Internal step** — calls `cell.step` for every cell (chemistry +
+   growth). Cells whose network references a chemical `Field` exchange
+   mass with their voxel as part of this step, one cell at a time in a
+   shuffled order (see
+   [Extracellular species](#extracellular-species-uptake-and-membrane-bound-enzymes)
+   above). Growth dilutes only intracellular species.
 5. **Chemical export** — calls `export_chemical_fields()`, depositing
    whatever each cell exported this step into the matching `Field` (no-op if
    no cell exported anything; see
    [Secretion (chemical export)](#secretion-chemical-export) above).
-6. **Chemical fields (re-applied)** — repeats step 3, so each chemical
-   field's value overwrites whatever growth diluted it to in step 4. This
-   keeps the field's value pinned to the environment between steps; reactions
-   in step 4 already saw the correct, freshly-sampled value from step 3.
-   Running after step 5 means a cell sensing the same field it just exported
-   into sees this step's freshly-deposited mass.
+6. **Sampling** — calls `sample_chemical_fields()`, refreshing every living
+   cell's read-only `extracellular` snapshot of its local chemical-field
+   values (for recording and survival conditions; moves no mass).
 7. **Bounds enforcement** — kills any living cell whose center of mass lies
    outside `environment.size`'s physical extent or on a `wall_map`
    out-of-bounds (`-1`) cell (see
@@ -932,8 +1060,10 @@ cell remaining in the colony — including any new daughter cells produced by
 division — until `t_max` is reached. The
 returned DataFrame has columns `time`, `cell_id`, `alive`, `position_x`,
 `position_y`, `orientation_x`, `orientation_y`, `length`, `radius`, plus one
-column per chemical species seen in any cell's `concentrations` (missing
-values are `NaN` for cells/species that don't have that entry). The same data
+column per chemical species seen in any cell's `concentrations` or
+`extracellular` snapshot. A chemical `Field`'s column holds the field's
+value at that cell's location. Missing values are `NaN` for cells/species
+that don't have that entry. The same data
 is also available via `sim.history` (a list of per-cell-per-timestep dicts)
 and `sim.to_dataframe()`.
 

@@ -288,7 +288,7 @@ def test_lysis_raises_for_unmapped_target_field_without_mutating_fields():
         colony.enforce_survival_conditions()
 
 
-def test_step_copies_chemical_field_value_into_cell_concentration():
+def test_step_samples_chemical_field_value_into_cell_extracellular():
     values = np.zeros((10, 10))
     values[5, 5] = 7.5  # cell at (50, 50) maps to grid index (5, 5)
     field = Field("glucose", values, is_chemical=True)
@@ -298,7 +298,8 @@ def test_step_copies_chemical_field_value_into_cell_concentration():
     colony = Colony([cell], env)
     colony.step(dt=0.1)
 
-    assert cell.concentrations["glucose"] == pytest.approx(7.5)
+    assert cell.extracellular["glucose"] == pytest.approx(7.5)
+    assert "glucose" not in cell.concentrations
 
 
 def test_step_chemical_field_concentration_is_not_diluted_by_growth():
@@ -314,7 +315,7 @@ def test_step_chemical_field_concentration_is_not_diluted_by_growth():
     volume_after = cell.compute_volume()
 
     assert volume_after > volume_before  # sanity check: cell actually grew
-    assert cell.concentrations["glucose"] == pytest.approx(7.5)
+    assert cell.extracellular["glucose"] == pytest.approx(7.5)
 
 
 def test_step_diffuses_diffusive_fields():
@@ -342,18 +343,223 @@ def test_step_does_not_copy_non_chemical_field_into_concentrations():
     colony.step(dt=0.1)
 
     assert "temperature" not in cell.concentrations
+    assert "temperature" not in cell.extracellular
 
 
-def test_step_chemical_field_overwrites_existing_concentration():
+def test_step_removes_field_backed_species_from_intracellular_concentrations():
     field = Field("A", np.full((10, 10), 3.0), is_chemical=True)
     env = Environment("env", wall_map=np.zeros((10, 10)), fields=[field])
-    cell = _make_cell([50.0, 50.0])
-    cell.set_concentration("A", 0.0)
+    cell = _make_uptake_cell([50.0, 50.0], k=0.0)
+    assert "A" in cell.concentrations  # seeded at construction
 
     colony = Colony([cell], env)
     colony.step(dt=0.1)
 
-    assert cell.concentrations["A"] == pytest.approx(3.0)
+    assert "A" not in cell.concentrations
+    assert cell.extracellular["A"] == pytest.approx(3.0)
+    assert field.values[5, 5] == pytest.approx(3.0)
+
+
+def _make_uptake_cell(position, k=1.0, growth_rate=0.0, rng=None, **kwargs):
+    """Cell with a transporter moving extracellular A into intracellular A_int."""
+    uptake = Reaction(
+        {"A": 1}, {"A_int": 1}, rate_law_type="mass_action", rate_params={"k": k}
+    )
+    return Cell(
+        id=1,
+        position=position,
+        orientation=[1.0, 0.0],
+        length=2.0,
+        radius=0.5,
+        network=ReactionNetwork("uptake", {"uptake": uptake}),
+        growth_rate=growth_rate,
+        rng=rng,
+        **kwargs,
+    )
+
+
+def _total_copies(env, cells, field_name, species):
+    field_copies = env.get_field(field_name).values.sum() * env.grid_cell_volume
+    return field_copies + sum(cell.copy_number(species) for cell in cells)
+
+
+@pytest.mark.parametrize("method", ["ODE", "SSA", "CLE"])
+def test_uptake_depletes_field_at_cell_voxel_and_conserves_mass(method):
+    values = np.full((10, 10), 2.0)
+    field = Field("A", values, is_chemical=True)
+    env = Environment(
+        "env",
+        wall_map=np.zeros((10, 10)),
+        size=(50.0, 50.0),
+        depth=2.0,
+        fields=[field],
+        rng=np.random.default_rng(0),
+    )
+    cell = _make_uptake_cell([25.0, 25.0], k=5.0, rng=np.random.default_rng(1))
+    initial = _total_copies(env, [cell], "A", "A_int")
+
+    colony = Colony([cell], env, brownian_motion=False)
+    for _ in range(20):
+        colony.step(dt=0.1, method=method)
+
+    assert field.values[5, 5] < 2.0
+    assert cell.concentrations["A_int"] > 0.0
+    untouched = np.ones((10, 10), dtype=bool)
+    untouched[5, 5] = False
+    assert np.all(field.values[untouched] == 2.0)  # only the cell's own voxel
+    assert field.values.min() >= 0.0
+    assert _total_copies(env, [cell], "A", "A_int") == pytest.approx(initial, rel=1e-9)
+
+
+@pytest.mark.parametrize("method", ["ODE", "SSA", "CLE"])
+def test_uptake_conserves_mass_with_diffusion_and_growth(method):
+    field = Field(
+        "A", np.full((10, 10), 1.0), is_chemical=True, diffuses=True, diffusivity=1e-11
+    )
+    env = Environment(
+        "env",
+        wall_map=np.zeros((10, 10)),
+        size=(50.0, 50.0),
+        fields=[field],
+        rng=np.random.default_rng(0),
+    )
+    # delta_bar large enough that the cell grows without dividing.
+    cell = _make_uptake_cell(
+        [25.0, 25.0],
+        k=2.0,
+        growth_rate=0.5,
+        rng=np.random.default_rng(2),
+        delta_bar=10.0,
+    )
+    initial = _total_copies(env, [cell], "A", "A_int")
+
+    colony = Colony([cell], env, brownian_motion=False)
+    for _ in range(20):
+        colony.step(dt=0.1, method=method)
+
+    assert colony.cells == [cell]
+    assert cell.length > 2.0
+    assert _total_copies(env, [cell], "A", "A_int") == pytest.approx(initial, rel=1e-6)
+
+
+def test_membrane_bound_enzyme_converts_extracellular_species_in_voxel():
+    # S -> P entirely outside the cell, catalysed by intracellular enzyme E.
+    conversion = Reaction(
+        {"S": 1},
+        {"P": 1},
+        catalysts=["E"],
+        rate_law_type="michaelis_menten",
+        rate_params={"Vmax": 2.0, "Km": 1.0},
+    )
+    cell = Cell(
+        id=1,
+        position=[25.0, 25.0],
+        orientation=[1.0, 0.0],
+        length=2.0,
+        network=ReactionNetwork("ext_enzyme", {"conversion": conversion}),
+        growth_rate=0.0,
+    )
+    cell.set_concentration("E", 1.0)
+    env = Environment(
+        "env",
+        wall_map=np.zeros((10, 10)),
+        size=(50.0, 50.0),
+        fields=[
+            Field("S", np.full((10, 10), 3.0), is_chemical=True),
+            Field("P", np.zeros((10, 10)), is_chemical=True),
+        ],
+    )
+    colony = Colony([cell], env, brownian_motion=False)
+    for _ in range(10):
+        colony.step(dt=0.1)
+
+    S, P = env.get_field("S").values, env.get_field("P").values
+    assert S[5, 5] < 3.0
+    assert S[5, 5] + P[5, 5] == pytest.approx(3.0)
+    assert cell.concentrations == {"E": pytest.approx(1.0)}
+    # The conversion is diluted by the voxel/cell volume ratio.
+    expected_rate = (
+        2.0 * 3.0 / (1.0 + 3.0) * cell.compute_volume() / env.grid_cell_volume
+    )
+    assert P[5, 5] == pytest.approx(expected_rate * 1.0, rel=0.05)
+
+
+def test_catalyst_only_sensing_does_not_change_field():
+    sensing = Reaction(
+        {},
+        {"GFP": 1},
+        catalysts=["RNAP", "IPTG"],
+        rate_law_type="hill_langmuir",
+        rate_params={"alpha": 50.0, "beta": 0.5, "C": 1.0, "n": 2},
+    )
+    cell = Cell(
+        id=1,
+        position=[50.0, 50.0],
+        orientation=[1.0, 0.0],
+        network=ReactionNetwork("sensor", {"sensing": sensing}),
+        growth_rate=0.0,
+    )
+    env = Environment(
+        "env",
+        wall_map=np.zeros((10, 10)),
+        fields=[
+            Field("RNAP", np.ones((10, 10)), is_chemical=True),
+            Field("IPTG", np.full((10, 10), 2.0), is_chemical=True),
+        ],
+    )
+    colony = Colony([cell], env, brownian_motion=False)
+    for _ in range(5):
+        colony.step(dt=0.1)
+
+    assert np.all(env.get_field("IPTG").values == 2.0)
+    assert np.all(env.get_field("RNAP").values == 1.0)
+    assert cell.concentrations["GFP"] > 0.0
+
+
+@pytest.mark.parametrize("method", ["ODE", "SSA", "CLE"])
+def test_cells_sharing_a_voxel_jointly_deplete_it_without_going_negative(method):
+    # Tiny voxel (smaller than one cell) and fast uptake: the pool can't
+    # cover every cell's demand, so cells must share it.
+    field = Field("A", np.full((10, 10), 20.0), is_chemical=True)
+    env = Environment(
+        "env",
+        wall_map=np.zeros((10, 10)),
+        size=(10.0, 10.0),
+        depth=0.5,
+        fields=[field],
+        rng=np.random.default_rng(0),
+    )
+    cells = [
+        _make_uptake_cell([5.2, 5.2], k=50.0, rng=np.random.default_rng(3)),
+        _make_uptake_cell([5.6, 5.6], k=50.0, rng=np.random.default_rng(4)),
+    ]
+    initial = _total_copies(env, cells, "A", "A_int")
+
+    colony = Colony(cells, env, brownian_motion=False)
+    colony.step(dt=0.5, method=method)
+
+    assert field.values.min() >= 0.0
+    assert _total_copies(env, cells, "A", "A_int") == pytest.approx(initial, rel=1e-6)
+    assert field.values[5, 5] < 20.0 * 0.01  # pool essentially exhausted
+
+
+def test_survival_condition_on_extracellular_species():
+    field = Field("toxin", np.zeros((10, 10)), is_chemical=True)
+    field.values[5, 5] = 5.0
+    env = Environment("env", wall_map=np.zeros((10, 10)), fields=[field])
+    exposed = _make_cell([50.0, 50.0])
+    safe = _make_cell([15.0, 15.0])
+
+    colony = Colony(
+        [exposed, safe],
+        env,
+        brownian_motion=False,
+        survival_conditions=[("toxin", "<", 1.0)],
+    )
+    colony.step(dt=0.1)
+
+    assert not exposed.alive
+    assert safe.alive
 
 
 def _efflux_network(k=1.0, species="X"):
@@ -470,16 +676,16 @@ def test_step_conserves_mass_across_cell_and_field():
     )
 
 
-def test_apply_chemical_fields_skips_dead_cells():
+def test_sample_chemical_fields_skips_dead_cells():
     field = Field("A", np.full((10, 10), 3.0), is_chemical=True)
     env = Environment("env", wall_map=np.zeros((10, 10)), fields=[field])
     cell = _make_cell([50.0, 50.0])
     cell.kill()
 
     colony = Colony([cell], env)
-    colony.apply_chemical_fields()
+    colony.sample_chemical_fields()
 
-    assert "A" not in cell.concentrations
+    assert "A" not in cell.extracellular
 
 
 def test_apply_brownian_motion_matches_reference_per_cell_formula():
@@ -573,14 +779,14 @@ def test_switch_environment_changes_chemical_field_sampled_on_next_step():
     cell = _make_cell([50.0, 50.0])
     colony = Colony([cell], env_before)
     colony.step(dt=0.1)
-    assert cell.concentrations["A"] == pytest.approx(1.0)
+    assert cell.extracellular["A"] == pytest.approx(1.0)
 
     after = Field("A", np.full((10, 10), 9.0), is_chemical=True)
     env_after = Environment("after", wall_map=np.zeros((10, 10)), fields=[after])
     colony.switch_environment(env_after)
     colony.step(dt=0.1)
 
-    assert cell.concentrations["A"] == pytest.approx(9.0)
+    assert cell.extracellular["A"] == pytest.approx(9.0)
 
 
 def test_step_replaces_dividing_cell_with_daughters():

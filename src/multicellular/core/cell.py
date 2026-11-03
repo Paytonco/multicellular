@@ -56,11 +56,10 @@ class Cell:
                 Colony survival condition. Never fires on death via
                 Colony.enforce_bounds (leaving the environment or entering a
                 death zone represents outflow, not lysis). A source species
-                must map to a *different* target species: reusing the same
-                name would double-count mass, since Colony.apply_chemical_fields
-                already mirrors that Field's value into every living cell's
-                same-named concentration each step without depleting the
-                field.
+                must map to a *different* target species: a species named
+                after a chemical Field is that Field's extracellular species
+                (see `step`'s `external`), so the cell holds no intracellular
+                copies of it to deliver.
         """
         if lysis_targets and any(k == v for k, v in lysis_targets.items()):
             same = [k for k, v in lysis_targets.items() if k == v]
@@ -94,6 +93,10 @@ class Cell:
         # Molecule counts exported (e.g. secreted) by the most recent step,
         # awaiting deposit into the matching Field by Colony.export_chemical_fields.
         self.pending_export = {}
+        # Snapshot of the local value of every chemical Field (keyed by field
+        # name), refreshed by Colony each step for recording and survival
+        # checks. Read-only: the Field itself owns this mass.
+        self.extracellular = {}
         self.lysis_targets = dict(lysis_targets) if lysis_targets else {}
 
     def _sample_division_target(self):
@@ -152,7 +155,9 @@ class Cell:
         volume = self.compute_volume()
         self.concentrations = {s: n / volume for s, n in copy_numbers.items()}
 
-    def step(self, dt, method="ODE", ode_method="RK45"):
+    def step(
+        self, dt, method="ODE", ode_method="RK45", external=None, external_volume=None
+    ):
         """
         Advance cell internal state (chemical + growth). No-op if dead.
 
@@ -162,20 +167,50 @@ class Cell:
                 `ReactionNetwork.simulate_step` ("ODE", "SSA", or "CLE").
             ode_method: `scipy.integrate.solve_ivp` method used when
                 `method` is "ODE" (default "RK45").
+            external: optional dict of extracellular species → concentration
+                in the cell's surrounding volume (e.g. its environment
+                voxel), for network species that live outside the cell.
+                Reactions see them alongside intracellular species, but any
+                molecules they consume or produce are drawn from/added to
+                that `external_volume` rather than the cell's own volume,
+                so mass is conserved. External species are never stored in
+                `concentrations` (so growth never dilutes them, and division
+                never partitions them).
+            external_volume: volume (μm³) of the compartment holding the
+                `external` species. Required if `external` is given.
+
+        Returns:
+            dict of `external` species → updated concentration (empty if
+            `external` is None, the cell is dead, or it has no network).
         """
         if not self.alive:
-            return
+            return {}
+        external = external or {}
+        if external and external_volume is None:
+            raise ValueError("external_volume is required when external is given.")
+        for s in external:
+            self.concentrations.pop(s, None)
+        updated_external = dict(external)
         if self.network:
-            self.concentrations = self.network.simulate_step(
-                self.concentrations,
+            state = {**self.concentrations, **external}
+            new_state = self.network.simulate_step(
+                state,
                 dt,
                 self.compute_volume(),
                 method,
                 rng=self.rng,
                 ode_method=ode_method,
+                compartment_volumes={s: external_volume for s in external},
+            )
+            self.concentrations = {
+                s: c for s, c in new_state.items() if s not in external
+            }
+            updated_external.update(
+                {s: c for s, c in new_state.items() if s in external}
             )
             self.pending_export = self.network.last_exported
         self.grow(dt)
+        return updated_external
 
     def ready_to_divide(self):
         """Return True if the cell has reached its sampled division target."""
@@ -269,6 +304,10 @@ class Cell:
 
         daughter1.concentrations = conc1
         daughter2.concentrations = conc2
+        # Daughters sit where the parent did until Colony next samples the
+        # fields, so start from the parent's view of its surroundings.
+        daughter1.extracellular = dict(self.extracellular)
+        daughter2.extracellular = dict(self.extracellular)
 
         return daughter1, daughter2
 
@@ -318,4 +357,5 @@ class Cell:
             "age": self.age,
             "alive": self.alive,
             "concentrations": self.concentrations.copy(),
+            "extracellular": self.extracellular.copy(),
         }

@@ -63,6 +63,10 @@ class Simulation:
                 "radius": cell.radius,
             }
             record.update(cell.concentrations)
+            # After concentrations: a field-backed species is extracellular,
+            # overriding the placeholder a cell seeds for every network
+            # species before its first step.
+            record.update(cell.extracellular)
             self.history.append(record)
 
     def run(self, show_progress=True, t_max=None, ode_method=None):
@@ -85,6 +89,7 @@ class Simulation:
 
         if not self.history:
             self.time = 0.0
+            self.colony.sample_chemical_fields()
             self.record()
 
         start_step = round(self.time / self.dt)

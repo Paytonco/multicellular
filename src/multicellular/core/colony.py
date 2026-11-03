@@ -128,8 +128,10 @@ class Colony:
                 tuples, e.g. [("A", ">", 0)]. Every step, each living cell's
                 concentration of `species` is compared against `threshold`
                 using `operator` (one of ">", ">=", "<", "<=", "==", "!=");
-                a cell dies as soon as any condition is violated. A species
-                missing from a cell's concentrations is treated as 0.0. A
+                a cell dies as soon as any condition is violated. `species`
+                may be intracellular or the name of a chemical Field (read
+                from the cell's local `extracellular` snapshot); a species
+                missing from both is treated as 0.0. A
                 dying cell with `lysis_targets` set (see `Cell`) also has its
                 lysis payload delivered to the environment; see
                 `_deliver_lysis_payloads`.
@@ -209,21 +211,10 @@ class Colony:
         """
         self.environment.diffuse(dt)
         self.environment.react(dt, method, ode_method)
-        self.apply_chemical_fields()
         self._update_growth_rates()
-        for cell in self.cells:
-            cell.step(dt, method, ode_method)
+        self._step_cells(dt, method, ode_method)
         self.export_chemical_fields()
-        # Re-apply: a chemical field's value is an externally-imposed boundary
-        # condition, not a quantity the cell's own growth should dilute, but
-        # cell.step's growth phase dilutes every entry in `concentrations`
-        # indiscriminately. Re-sampling here corrects field-backed species
-        # back to the true environment value for this step's recorded state,
-        # while leaving the (correct, freshly-sampled) value reactions saw
-        # during this same step untouched. Running after export_chemical_fields
-        # means a cell sensing the same field it just exported into sees this
-        # step's freshly-deposited mass.
-        self.apply_chemical_fields()
+        self.sample_chemical_fields()
         self.enforce_bounds()
         self.enforce_survival_conditions()
         alive = self.living_cells
@@ -237,25 +228,80 @@ class Colony:
         """Vectorized nearest-grid-point (row, col) indices for an (n, 2) array of positions in μm."""
         return self.environment.grid_indices(positions)
 
-    def apply_chemical_fields(self):
+    def _step_cells(self, dt, method, ode_method):
         """
-        Copy each chemical field's local value into every living cell as the
-        concentration of the chemical species sharing the field's name.
+        Step every cell, exchanging mass with the chemical Fields its
+        reaction network references.
+
+        Any network species sharing a chemical (`is_chemical=True`) Field's
+        name is that Field's extracellular species: the cell's reactions
+        read it at the voxel containing the cell's center and consume or
+        produce it there, via `Cell.step`'s `external` (with the voxel's
+        `grid_cell_volume` as its compartment volume), and the result is
+        written straight back into the Field. Molecules are conserved
+        between the cell and the Field.
+
+        Coupled cells are stepped one at a time, in an order shuffled by
+        `environment.rng` each step, each reading its voxel after the
+        previous cells' writes. Cells sharing a voxel therefore share (and
+        can jointly deplete) one pool, without any cell getting systematic
+        first access to it. Uncoupled cells step in list order first.
         """
+        chemical = {
+            name: field
+            for name, field in self.environment.fields.items()
+            if field.is_chemical
+        }
+        coupled, coupled_species = [], []
+        for cell in self.cells:
+            species = (
+                [s for s in cell.network.species if s in chemical]
+                if cell.alive and cell.network and chemical
+                else []
+            )
+            if species:
+                coupled.append(cell)
+                coupled_species.append(species)
+            else:
+                cell.step(dt, method, ode_method)
+        if not coupled:
+            return
+
+        positions = np.array([cell.position for cell in coupled])
+        i_idx, j_idx = self._field_indices(positions)
+        voxel_volume = self.environment.grid_cell_volume
+        for k in self.environment.rng.permutation(len(coupled)):
+            i, j = i_idx[k], j_idx[k]
+            external = {s: float(chemical[s].values[i, j]) for s in coupled_species[k]}
+            updated = coupled[k].step(dt, method, ode_method, external, voxel_volume)
+            for s, value in updated.items():
+                chemical[s].values[i, j] = value
+
+    def sample_chemical_fields(self):
+        """
+        Refresh every living cell's `extracellular` snapshot with each
+        chemical field's value at the cell's position.
+
+        Read-only: this records what the cell's surroundings look like (for
+        `Simulation` history and survival conditions) and never moves mass;
+        mass exchange happens in `_step_cells`.
+        """
+        living = [cell for cell in self.cells if cell.alive]
+        if not living:
+            return
         chemical_fields = [
             field for field in self.environment.fields.values() if field.is_chemical
         ]
+        for cell in living:
+            cell.extracellular = {}
         if not chemical_fields:
-            return
-        living = [cell for cell in self.cells if cell.alive]
-        if not living:
             return
         positions = np.array([cell.position for cell in living])
         i_idx, j_idx = self._field_indices(positions)
         for field in chemical_fields:
             values = field.values[i_idx, j_idx]
             for cell, value in zip(living, values):
-                cell.concentrations[field.name] = float(value)
+                cell.extracellular[field.name] = float(value)
 
     def export_chemical_fields(self):
         """
@@ -626,7 +672,9 @@ class Colony:
             if not cell.alive:
                 continue
             for species, op, threshold in self.survival_conditions:
-                value = cell.concentrations.get(species, 0.0)
+                value = cell.concentrations.get(
+                    species, cell.extracellular.get(species, 0.0)
+                )
                 if not _COMPARISONS[op](value, threshold):
                     cell.kill()
                     lysed.append(cell)

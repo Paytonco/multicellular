@@ -411,3 +411,61 @@ def test_adder_homeostasis():
 
 if __name__ == "__main__":
     test_basic_cell_behavior()
+
+
+def _uptake_cell(growth_rate=0.0):
+    uptake = Reaction(
+        {"A": 1}, {"A_int": 1}, rate_law_type="mass_action", rate_params={"k": 1.0}
+    )
+    return Cell(
+        id=1,
+        position=[0.0, 0.0],
+        orientation=[1.0, 0.0],
+        network=ReactionNetwork("uptake", {"R": uptake}),
+        growth_rate=growth_rate,
+        rng=np.random.default_rng(0),
+    )
+
+
+def test_step_with_external_returns_updated_external_and_conserves_mass():
+    cell = _uptake_cell()
+    v_ext = 20.0
+    volume = cell.compute_volume()
+
+    updated = cell.step(0.1, external={"A": 2.0}, external_volume=v_ext)
+
+    assert set(updated) == {"A"}
+    assert updated["A"] < 2.0
+    assert "A" not in cell.concentrations
+    taken = (2.0 - updated["A"]) * v_ext
+    assert cell.copy_number("A_int") == pytest.approx(taken, rel=1e-6)
+    assert cell.concentrations["A_int"] * volume == pytest.approx(taken, rel=1e-6)
+
+
+def test_step_external_species_not_diluted_by_growth():
+    cell = _uptake_cell(growth_rate=np.log(2))
+    cell.network.reactions["R"].rate_params["k"] = 0.0
+
+    updated = cell.step(0.5, external={"A": 2.0}, external_volume=20.0)
+
+    assert updated["A"] == pytest.approx(2.0)
+
+
+def test_step_external_requires_external_volume():
+    cell = _uptake_cell()
+    with pytest.raises(ValueError):
+        cell.step(0.1, external={"A": 2.0})
+
+
+def test_step_without_external_returns_empty_dict():
+    cell = _uptake_cell()
+    assert cell.step(0.1) == {}
+
+
+def test_daughters_inherit_extracellular_snapshot():
+    cell = _make_cell()
+    cell.extracellular = {"AHL": 0.4}
+    d1, d2 = cell.divide()
+    assert d1.extracellular == {"AHL": 0.4} and d2.extracellular == {"AHL": 0.4}
+    d1.extracellular["AHL"] = 1.0
+    assert d2.extracellular["AHL"] == 0.4  # independent copies

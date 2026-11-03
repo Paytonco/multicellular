@@ -514,3 +514,126 @@ def test_ode_default_is_rk45():
 def test_unknown_ode_method_raises():
     with pytest.raises(ValueError):
         _decay_network().simulate_step({"A": 1.0}, 1.0, 1.0, ode_method="Euler")
+
+
+# --- compartment_volumes (extracellular species) ---
+
+
+def _uptake_network(k=1.0):
+    rxn = Reaction(
+        {"A_ext": 1}, {"A_int": 1}, rate_law_type="mass_action", rate_params={"k": k}
+    )
+    return ReactionNetwork("uptake", {"R": rxn})
+
+
+@pytest.mark.parametrize("method", ["ODE", "SSA", "CLE"])
+def test_compartment_volumes_none_matches_default(method):
+    net = _linear_ab_network(k=1.0)
+    state = {"A": 3.0, "B": 0.5}
+    default = net.simulate_step(state, 0.1, 10.0, method, rng=np.random.default_rng(0))
+    explicit = net.simulate_step(
+        state,
+        0.1,
+        10.0,
+        method,
+        rng=np.random.default_rng(0),
+        compartment_volumes={},
+    )
+    assert explicit == default
+
+
+def test_ode_compartment_volumes_scale_external_change_and_conserve_mass():
+    net = _uptake_network(k=2.0)
+    volume, v_ext = 2.0, 20.0
+    state = {"A_ext": 5.0, "A_int": 0.0}
+
+    new = net.simulate_step(
+        state, 0.5, volume, "ODE", compartment_volumes={"A_ext": v_ext}
+    )
+
+    d_int = new["A_int"] - state["A_int"]
+    d_ext = new["A_ext"] - state["A_ext"]
+    assert d_int > 0.0
+    assert d_ext == pytest.approx(-d_int * volume / v_ext, rel=1e-5)
+    # Analytic: d[A_ext]/dt = -(volume/v_ext) * k * [A_ext]
+    assert new["A_ext"] == pytest.approx(5.0 * np.exp(-0.1 * 2.0 * 0.5), rel=1e-5)
+
+
+def test_ssa_compartment_volumes_conserve_counts_and_keep_external_fraction():
+    net = _uptake_network(k=1.0)
+    volume, v_ext = 2.0, 13.7
+    state = {"A_ext": 3.3, "A_int": 1.0}  # 45.21 extracellular molecules
+    initial = state["A_ext"] * v_ext + state["A_int"] * volume
+
+    for seed in range(20):
+        new = net.simulate_step(
+            state,
+            0.5,
+            volume,
+            "SSA",
+            rng=np.random.default_rng(seed),
+            compartment_volumes={"A_ext": v_ext},
+        )
+        n_int = new["A_int"] * volume
+        n_ext = new["A_ext"] * v_ext
+        assert n_int == pytest.approx(round(n_int), abs=1e-9)
+        # The external pool keeps its fractional part: whole molecules move.
+        assert n_ext % 1.0 == pytest.approx(0.21, abs=1e-9)
+        assert n_int + n_ext == pytest.approx(initial, abs=1e-9)
+
+
+def test_ssa_rejects_firing_that_would_overdraw_external_pool():
+    net = _uptake_network(k=100.0)
+    volume, v_ext = 2.0, 1.0
+    state = {"A_ext": 0.5, "A_int": 0.0}  # half a molecule outside
+
+    new = net.simulate_step(
+        state,
+        1.0,
+        volume,
+        "SSA",
+        rng=np.random.default_rng(0),
+        compartment_volumes={"A_ext": v_ext},
+    )
+    assert new == {"A_ext": 0.5, "A_int": 0.0}
+
+
+def test_cle_compartment_volumes_conserve_mass_and_stay_nonnegative():
+    net = _uptake_network(k=5.0)
+    volume, v_ext = 2.0, 1.0
+    state = {"A_ext": 0.3, "A_int": 0.05}
+    initial = state["A_ext"] * v_ext + state["A_int"] * volume
+
+    for seed in range(200):
+        new = net.simulate_step(
+            state,
+            0.5,
+            volume,
+            "CLE",
+            rng=np.random.default_rng(seed),
+            compartment_volumes={"A_ext": v_ext},
+        )
+        assert new["A_ext"] >= 0.0 and new["A_int"] >= 0.0
+        total = new["A_ext"] * v_ext + new["A_int"] * volume
+        assert total == pytest.approx(initial, abs=1e-12)
+
+
+def test_external_only_reaction_changes_only_external_species():
+    conversion = Reaction(
+        {"S": 1},
+        {"P": 1},
+        catalysts=["E"],
+        rate_law_type="mass_action",
+        rate_params={"k": 1.0},
+    )
+    net = ReactionNetwork("ext_enzyme", {"R": conversion})
+    volume, v_ext = 1.0, 10.0
+    state = {"S": 2.0, "P": 0.0, "E": 1.0}
+
+    new = net.simulate_step(
+        state, 0.1, volume, "ODE", compartment_volumes={"S": v_ext, "P": v_ext}
+    )
+
+    assert new["E"] == pytest.approx(1.0)
+    assert new["S"] + new["P"] == pytest.approx(2.0)
+    assert new["S"] == pytest.approx(2.0 * np.exp(-0.1 * 0.1), rel=1e-5)
