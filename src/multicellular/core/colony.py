@@ -122,14 +122,17 @@ class Colony:
                 contact dynamics are only stable while
                 `dt < 2 * drag * length / k_wall`.
             drag: isotropic drag constant for contact dynamics.
-                  Translational drag: ζ_t = drag * length.
-                  Rotational drag:    ζ_r = (drag / 12) * length³.
+                  Rods:    ζ_t = drag * length,  ζ_r = (drag / 12) * length³.
+                  Spheres: ζ_t = 3 * drag * radius (no contact rotation:
+                  every contact force on a sphere passes through its center).
             survival_conditions: optional list of (species, operator, threshold)
                 tuples, e.g. [("A", ">", 0)]. Every step, each living cell's
                 concentration of `species` is compared against `threshold`
                 using `operator` (one of ">", ">=", "<", "<=", "==", "!=");
-                a cell dies as soon as any condition is violated. A species
-                missing from a cell's concentrations is treated as 0.0. A
+                a cell dies as soon as any condition is violated. `species`
+                may be intracellular or the name of a chemical Field (read
+                from the cell's local `extracellular` snapshot); a species
+                missing from both is treated as 0.0. A
                 dying cell with `lysis_targets` set (see `Cell`) also has its
                 lysis payload delivered to the environment; see
                 `_deliver_lysis_payloads`.
@@ -209,21 +212,10 @@ class Colony:
         """
         self.environment.diffuse(dt)
         self.environment.react(dt, method, ode_method)
-        self.apply_chemical_fields()
         self._update_growth_rates()
-        for cell in self.cells:
-            cell.step(dt, method, ode_method)
+        self._step_cells(dt, method, ode_method)
         self.export_chemical_fields()
-        # Re-apply: a chemical field's value is an externally-imposed boundary
-        # condition, not a quantity the cell's own growth should dilute, but
-        # cell.step's growth phase dilutes every entry in `concentrations`
-        # indiscriminately. Re-sampling here corrects field-backed species
-        # back to the true environment value for this step's recorded state,
-        # while leaving the (correct, freshly-sampled) value reactions saw
-        # during this same step untouched. Running after export_chemical_fields
-        # means a cell sensing the same field it just exported into sees this
-        # step's freshly-deposited mass.
-        self.apply_chemical_fields()
+        self.sample_chemical_fields()
         self.enforce_bounds()
         self.enforce_survival_conditions()
         alive = self.living_cells
@@ -237,25 +229,80 @@ class Colony:
         """Vectorized nearest-grid-point (row, col) indices for an (n, 2) array of positions in μm."""
         return self.environment.grid_indices(positions)
 
-    def apply_chemical_fields(self):
+    def _step_cells(self, dt, method, ode_method):
         """
-        Copy each chemical field's local value into every living cell as the
-        concentration of the chemical species sharing the field's name.
+        Step every cell, exchanging mass with the chemical Fields its
+        reaction network references.
+
+        Any network species sharing a chemical (`is_chemical=True`) Field's
+        name is that Field's extracellular species: the cell's reactions
+        read it at the voxel containing the cell's center and consume or
+        produce it there, via `Cell.step`'s `external` (with the voxel's
+        `grid_cell_volume` as its compartment volume), and the result is
+        written straight back into the Field. Molecules are conserved
+        between the cell and the Field.
+
+        Coupled cells are stepped one at a time, in an order shuffled by
+        `environment.rng` each step, each reading its voxel after the
+        previous cells' writes. Cells sharing a voxel therefore share (and
+        can jointly deplete) one pool, without any cell getting systematic
+        first access to it. Uncoupled cells step in list order first.
         """
+        chemical = {
+            name: field
+            for name, field in self.environment.fields.items()
+            if field.is_chemical
+        }
+        coupled, coupled_species = [], []
+        for cell in self.cells:
+            species = (
+                [s for s in cell.network.species if s in chemical]
+                if cell.alive and cell.network and chemical
+                else []
+            )
+            if species:
+                coupled.append(cell)
+                coupled_species.append(species)
+            else:
+                cell.step(dt, method, ode_method)
+        if not coupled:
+            return
+
+        positions = np.array([cell.position for cell in coupled])
+        i_idx, j_idx = self._field_indices(positions)
+        voxel_volume = self.environment.grid_cell_volume
+        for k in self.environment.rng.permutation(len(coupled)):
+            i, j = i_idx[k], j_idx[k]
+            external = {s: float(chemical[s].values[i, j]) for s in coupled_species[k]}
+            updated = coupled[k].step(dt, method, ode_method, external, voxel_volume)
+            for s, value in updated.items():
+                chemical[s].values[i, j] = value
+
+    def sample_chemical_fields(self):
+        """
+        Refresh every living cell's `extracellular` snapshot with each
+        chemical field's value at the cell's position.
+
+        Read-only: this records what the cell's surroundings look like (for
+        `Simulation` history and survival conditions) and never moves mass;
+        mass exchange happens in `_step_cells`.
+        """
+        living = [cell for cell in self.cells if cell.alive]
+        if not living:
+            return
         chemical_fields = [
             field for field in self.environment.fields.values() if field.is_chemical
         ]
+        for cell in living:
+            cell.extracellular = {}
         if not chemical_fields:
-            return
-        living = [cell for cell in self.cells if cell.alive]
-        if not living:
             return
         positions = np.array([cell.position for cell in living])
         i_idx, j_idx = self._field_indices(positions)
         for field in chemical_fields:
             values = field.values[i_idx, j_idx]
             for cell, value in zip(living, values):
-                cell.concentrations[field.name] = float(value)
+                cell.extracellular[field.name] = float(value)
 
     def export_chemical_fields(self):
         """
@@ -328,7 +375,8 @@ class Colony:
         cell, computing the per-cell drag/diffusion pipeline as batched
         numpy array ops instead of one Python pass per cell.
 
-        Uses slender-body drag for an anisotropic rod. Local viscosity and
+        Uses slender-body drag for an anisotropic rod, and isotropic Stokes
+        drag (γ_t = 6πηr, γ_r = 8πηr³) for a sphere. Local viscosity and
         diffusivity are sampled from the environment grid at each cell's
         position. Spatial units are μm; dt is in seconds. `noise` is the
         (n, 3) array of (parallel, perpendicular, rotational) standard-normal
@@ -345,6 +393,7 @@ class Colony:
         lengths = np.array([cell.length for cell in alive])
         radii = np.array([cell.radius for cell in alive])
         orientations = np.array([cell.orientation for cell in alive])
+        is_sphere = np.array([cell.shape == "sphere" for cell in alive])
         xi = np.asarray(noise)
 
         i_idx, j_idx = self._field_indices(positions)
@@ -360,10 +409,17 @@ class Colony:
         r = radii * 1e-6
         ln_ratio = np.log(L_eff / r)  # ln(total length / radius), always > 0
 
-        # Slender-body drag coefficients
+        # Slender-body drag coefficients (rods)
         gamma_par = 2.0 * np.pi * eta_local * L_eff / ln_ratio  # kg/s
         gamma_perp = 4.0 * np.pi * eta_local * L_eff / ln_ratio  # kg/s
         gamma_rot = np.pi * eta_local * L_eff**3 / (3.0 * ln_ratio)  # kg·m²/s
+
+        # Stokes drag coefficients (spheres)
+        if is_sphere.any():
+            gamma_stokes = 6.0 * np.pi * eta_local * r
+            gamma_par = np.where(is_sphere, gamma_stokes, gamma_par)
+            gamma_perp = np.where(is_sphere, gamma_stokes, gamma_perp)
+            gamma_rot = np.where(is_sphere, 8.0 * np.pi * eta_local * r**3, gamma_rot)
 
         # Diffusion coefficients via Einstein relation
         D_par = _kBT / gamma_par  # m²/s
@@ -427,6 +483,10 @@ class Colony:
         so both contact types go through one overdamped update:
           Δc = F / ζ_t * dt,  ζ_t = drag * length
           Δθ = τ / ζ_r * dt,  ζ_r = (drag / 12) * length³
+        A sphere is the length-0 case: its axis segment is a single point, so
+        the same segment-distance math covers sphere-sphere and sphere-rod
+        contacts. Its contact torque is identically zero, so it uses
+        ζ_t = 3 * drag * radius and is never rotated here.
 
         Candidate cell-cell pairs are restricted to cells sharing a grid bin
         or an adjacent one (see _build_spatial_grid), which avoids the O(n²)
@@ -515,6 +575,11 @@ class Colony:
         self._apply_wall_forces(alive, endpoints, forces_x, forces_y, torques)
 
         for i, cell in enumerate(alive):
+            if cell.shape == "sphere":
+                zeta_t = 3.0 * self.drag * cell.radius
+                cell.position[0] += forces_x[i] / zeta_t * dt
+                cell.position[1] += forces_y[i] / zeta_t * dt
+                continue
             zeta_t = self.drag * cell.length
             zeta_r = (self.drag / 12.0) * cell.length**3
             cell.position[0] += forces_x[i] / zeta_t * dt
@@ -549,6 +614,10 @@ class Colony:
         face: the near one for a thick block, and still the only one for a
         thin wall no matter how deep the penetration.
 
+        A sphere's two axis endpoints coincide at its center, so it samples
+        that single point against the faces (sampling both would double the
+        face force).
+
         Corner points (sec 3): point contact between the cell's axis
         segment and the corner, reusing `_segment_point_closest` (the
         cell-cell segment-distance routine with one segment collapsed to a
@@ -564,7 +633,10 @@ class Colony:
             a1x, a1y, b1x, b1y, cix, ciy = endpoints[i]
             R = ci.radius
 
-            for ex, ey in ((a1x, a1y), (b1x, b1y)):
+            sample_points = (
+                ((cix, ciy),) if ci.shape == "sphere" else ((a1x, a1y), (b1x, b1y))
+            )
+            for ex, ey in sample_points:
                 best_h = best_nx = best_ny = None
                 for x0, y0, x1, y1, nx, ny in faces:
                     tx, ty = x1 - x0, y1 - y0
@@ -626,7 +698,9 @@ class Colony:
             if not cell.alive:
                 continue
             for species, op, threshold in self.survival_conditions:
-                value = cell.concentrations.get(species, 0.0)
+                value = cell.concentrations.get(
+                    species, cell.extracellular.get(species, 0.0)
+                )
                 if not _COMPARISONS[op](value, threshold):
                     cell.kill()
                     lysed.append(cell)

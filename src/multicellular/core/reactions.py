@@ -147,6 +147,13 @@ class Reaction:
             delta[i] += self.products.get(species, 0) - self.reactants.get(species, 0)
         return delta
 
+    def get_net_changes(self) -> Dict[str, int]:
+        """Net stoichiometric change (products - reactants) per species touched."""
+        return {
+            s: self.products.get(s, 0) - self.reactants.get(s, 0)
+            for s in set(self.reactants) | set(self.products)
+        }
+
     def get_export_vector(self, exported_species_list: List[str]) -> np.ndarray:
         """
         Return this reaction's export stoichiometry for a given species ordering.
@@ -257,6 +264,7 @@ class ReactionNetwork:
         method: str = "ODE",
         rng: np.random.Generator = None,
         ode_method: str = "RK45",
+        compartment_volumes: Dict[str, float] = None,
     ) -> Dict[str, float]:
         """
         Advance the chemical state by one time step using the given simulation method.
@@ -273,20 +281,35 @@ class ReactionNetwork:
             ode_method: `solve_ivp` integrator used when method is "ODE" (ignored
                 by SSA/CLE): one of "RK45" (default), "RK23", "DOP853",
                 "Radau", "BDF", or "LSODA". Case-insensitive.
+            compartment_volumes: optional dict of species → volume of the
+                compartment that species lives in, for species that live
+                outside `volume` (e.g. an extracellular species living in an
+                environment voxel). Every rate law is still evaluated
+                against concentrations and scaled by `volume` — a reaction
+                fires `v * volume` molecules per unit time — but each
+                species' concentration changes by those molecules divided
+                by its *own* compartment's volume, so molecule counts are
+                conserved across compartments. Species not listed live in
+                `volume`. Default None: every species lives in `volume`.
 
         Returns:
             Updated concentration dictionary
         """
+        compartment_volumes = compartment_volumes or {}
+        weights = np.array(
+            [volume / compartment_volumes.get(s, volume) for s in self.species]
+        )
+        external = np.array([s in compartment_volumes for s in self.species])
         method = method.upper()
         if method == "ODE":
-            return self._simulate_ode_step(state, dt, volume, ode_method)
+            return self._simulate_ode_step(state, dt, volume, ode_method, weights)
         elif method == "SSA":
             return self._simulate_ssa_step(
-                state, dt, volume, rng or np.random.default_rng()
+                state, dt, volume, rng or np.random.default_rng(), weights, external
             )
         elif method == "CLE":
             return self._simulate_cle_step(
-                state, dt, volume, rng or np.random.default_rng()
+                state, dt, volume, rng or np.random.default_rng(), weights, external
             )
         else:
             raise ValueError(f"Unknown simulation method: {method}")
@@ -297,13 +320,22 @@ class ReactionNetwork:
             [self.reactions[rxn_name].rate(state) for rxn_name in self._reaction_names]
         )
 
-    def _clamp_export_extents(
-        self, state: Dict[str, float], extent: np.ndarray
+    def _clamp_extents(
+        self,
+        state: Dict[str, float],
+        extent: np.ndarray,
+        weights: np.ndarray,
+        external: np.ndarray,
     ) -> np.ndarray:
         """
         Clamp the per-reaction firing extent (concentration-equivalent
         advancement, before stoichiometry is applied) of every export-tagged
-        reaction to [0, available reactant].
+        reaction to [0, available reactant], and of every reaction touching
+        a species in another compartment (`external`) so that it alone
+        can't drive any species it touches negative.
+
+        `weights` is each species' `volume / compartment volume` ratio (see
+        `simulate_step`'s `compartment_volumes`).
 
         Export reactions are one-directional (a cell can't un-secrete), and
         can't remove more of a reactant than the cell currently has. Doing
@@ -314,16 +346,39 @@ class ReactionNetwork:
         results afterward can otherwise let mass be created or destroyed
         (e.g. CLE noise driving the aggregate exported amount negative,
         clipped to 0, while the aggregate internal state isn't clipped).
+
+        The same reasoning applies to reactions that move mass across
+        compartments (e.g. uptake of an extracellular species, whose amount
+        is owned by an environment Field): clipping either side after the
+        fact would create mass. A positive extent is capped by how much of
+        each of the reaction's net reactants is available, and a negative
+        extent (CLE noise running the reaction backward) by how much of each
+        net product is available.
         """
+        weight = dict(zip(self.species, weights))
+        is_external = dict(zip(self.species, external))
         for j, name in enumerate(self._reaction_names):
             rxn = self.reactions[name]
-            if not rxn.exports:
+            if rxn.exports:
+                cap = min(
+                    (
+                        state.get(s, 0.0) / (stoich * weight[s])
+                        for s, stoich in rxn.reactants.items()
+                    ),
+                    default=np.inf,
+                )
+                extent[j] = min(max(extent[j], 0.0), cap)
+            changes = rxn.get_net_changes()
+            if not any(is_external[s] for s in changes):
                 continue
-            cap = min(
-                (state.get(s, 0.0) / stoich for s, stoich in rxn.reactants.items()),
-                default=np.inf,
-            )
-            extent[j] = min(max(extent[j], 0.0), cap)
+            for s, stoich in changes.items():
+                if stoich == 0:
+                    continue
+                available = state.get(s, 0.0) / (abs(stoich) * weight[s])
+                if stoich < 0:
+                    extent[j] = min(extent[j], available)
+                else:
+                    extent[j] = max(extent[j], -available)
         return extent
 
     def _simulate_ode_step(
@@ -332,6 +387,7 @@ class ReactionNetwork:
         dt: float,
         volume: float,
         ode_method: str = "RK45",
+        weights: np.ndarray = None,
     ) -> Dict[str, float]:
         """
         Integrate the reaction ODEs over `dt` with `scipy.integrate.solve_ivp`.
@@ -342,6 +398,10 @@ class ReactionNetwork:
         without reactant, so their rate is clamped to >= 0 and to 0 whenever
         a reactant is depleted; the exported total is integrated alongside
         the intracellular state, so the two stay consistent.
+
+        `weights` (each species' `volume / compartment volume` ratio; see
+        `simulate_step`'s `compartment_volumes`) scales each species' rate
+        of change into its own compartment's concentration basis.
         """
         method = next(
             (m for m in ODE_METHODS if m.upper() == str(ode_method).upper()), None
@@ -356,6 +416,8 @@ class ReactionNetwork:
         S = self._stoichiometry_matrix
         S_exp = self._export_stoichiometry_matrix
         export_flags = [self.reactions[r].exports for r in self._reaction_names]
+        if weights is None:
+            weights = np.ones(n)
 
         def rhs(_t, y):
             conc = {s: max(y[i], 0.0) for i, s in enumerate(species_list)}
@@ -366,7 +428,7 @@ class ReactionNetwork:
                 rxn = self.reactions[name]
                 depleted = any(conc.get(s, 0.0) <= 0.0 for s in rxn.reactants)
                 v[j] = 0.0 if depleted else max(v[j], 0.0)
-            return np.concatenate([S @ v, S_exp @ v])
+            return np.concatenate([weights * (S @ v), S_exp @ v])
 
         x0 = np.array([state.get(s, 0.0) for s in species_list])
         y0 = np.concatenate([x0, np.zeros(len(self.exported_species))])
@@ -390,6 +452,8 @@ class ReactionNetwork:
         dt: float,
         volume: float,
         rng: np.random.Generator,
+        weights: np.ndarray = None,
+        external: np.ndarray = None,
     ) -> Dict[str, float]:
         """
         Gillespie direct-method SSA step, advancing exactly `dt`.
@@ -405,20 +469,33 @@ class ReactionNetwork:
         same firing loop, so they're exact by construction (each firing
         moves an integer number of molecules from one bucket to the other;
         no separate clamping is needed, unlike the ODE/CLE steps).
+
+        Each species is counted in its own compartment's volume
+        (`volume / weights`). Species in another compartment (`external`,
+        e.g. an extracellular Field's voxel) are *not* rounded to whole
+        molecules, so the owning pool's fractional amount isn't created or
+        destroyed by rounding; firings still move whole molecules. A firing
+        that would drive any count negative is rejected (time advances, the
+        state doesn't change), so mass is never created by clamping.
         """
         species_list = self.species
         S = self._stoichiometry_matrix
         S_exp = self._export_stoichiometry_matrix
         n_reactions = len(self._reaction_names)
+        if weights is None:
+            weights = np.ones(len(species_list))
+            external = np.zeros(len(species_list), dtype=bool)
+        volumes = volume / weights
 
         counts = np.array(
-            [max(0, round(state.get(s, 0.0) * volume)) for s in species_list]
+            [state.get(s, 0.0) * volumes[i] for i, s in enumerate(species_list)]
         )
+        counts = np.maximum(np.where(external, counts, np.round(counts)), 0.0)
         export_counts = np.zeros(len(self.exported_species))
 
         t = 0.0
         while t < dt:
-            conc = {s: counts[i] / volume for i, s in enumerate(species_list)}
+            conc = {s: counts[i] / volumes[i] for i, s in enumerate(species_list)}
             propensities = np.maximum(self._rate_vector(conc), 0.0) * volume
             a0 = propensities.sum()
 
@@ -430,14 +507,17 @@ class ReactionNetwork:
                 break
 
             j = rng.choice(n_reactions, p=propensities / a0)
-            counts = np.maximum(counts + S[:, j], 0.0)
-            export_counts += S_exp[:, j]
             t += tau
+            new_counts = counts + S[:, j]
+            if (new_counts < 0.0).any():
+                continue
+            counts = new_counts
+            export_counts += S_exp[:, j]
 
         self.last_exported = {
             s: export_counts[i] for i, s in enumerate(self.exported_species)
         }
-        return {s: counts[i] / volume for i, s in enumerate(species_list)}
+        return {s: counts[i] / volumes[i] for i, s in enumerate(species_list)}
 
     def _simulate_cle_step(
         self,
@@ -445,6 +525,8 @@ class ReactionNetwork:
         dt: float,
         volume: float,
         rng: np.random.Generator,
+        weights: np.ndarray = None,
+        external: np.ndarray = None,
     ) -> Dict[str, float]:
         """
         Chemical Langevin equation step (Euler-Maruyama), in concentration
@@ -453,20 +535,29 @@ class ReactionNetwork:
         a(N) = volume * v(C) used by SSA, then dividing through by volume:
 
             dC = S @ v(C) dt + (1 / sqrt(volume)) * S @ (sqrt(v(C)) * xi) * sqrt(dt)
+
+        with each species' row then scaled by `weights` into its own
+        compartment's concentration basis.
         """
         species_list = self.species
         S = self._stoichiometry_matrix
         n_reactions = len(self._reaction_names)
+        if weights is None:
+            weights = np.ones(len(species_list))
+            external = np.zeros(len(species_list), dtype=bool)
 
         x = np.array([state.get(s, 0.0) for s in species_list])
         v = np.maximum(self._rate_vector(state), 0.0)
 
         xi = rng.normal(size=n_reactions)
-        extent = self._clamp_export_extents(
-            state, dt * v + np.sqrt(dt / volume) * (np.sqrt(v) * xi)
+        extent = self._clamp_extents(
+            state,
+            dt * v + np.sqrt(dt / volume) * (np.sqrt(v) * xi),
+            weights,
+            external,
         )
 
-        x_new = x + S @ extent
+        x_new = x + weights * (S @ extent)
 
         exported_delta = self._export_stoichiometry_matrix @ extent
         self.last_exported = {

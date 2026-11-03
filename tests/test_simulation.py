@@ -216,3 +216,30 @@ def test_field_history_tracks_field_values_per_timestep():
     assert first_snapshot[2, 2] == pytest.approx(10.0)
     assert last_snapshot[2, 2] < first_snapshot[2, 2]
     assert not np.allclose(first_snapshot, last_snapshot)
+
+
+def test_simulation_records_extracellular_field_species_as_columns():
+    uptake = Reaction(
+        {"A": 1}, {"A_int": 1}, rate_law_type="mass_action", rate_params={"k": 1.0}
+    )
+    cell = Cell(
+        id=0,
+        position=[25.0, 25.0],
+        orientation=[1.0, 0.0],
+        network=ReactionNetwork("uptake", {"R": uptake}),
+        growth_rate=0.0,
+        rng=np.random.default_rng(0),
+    )
+    field = Field("A", np.full((10, 10), 2.0), is_chemical=True)
+    env = Environment(
+        "env", wall_map=np.zeros((10, 10)), size=(50.0, 50.0), fields=[field]
+    )
+
+    colony = Colony([cell], env, brownian_motion=False)
+    df = Simulation(colony, dt=0.1, t_max=0.5).run(show_progress=False)
+
+    assert "A" in df.columns and "A_int" in df.columns
+    assert df["A"].iloc[0] == pytest.approx(2.0)  # sampled before the first record
+    # Recorded value is the local (depleting) field value.
+    assert df["A"].iloc[-1] == pytest.approx(field.values[5, 5])
+    assert df["A"].iloc[-1] < 2.0

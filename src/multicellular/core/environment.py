@@ -19,13 +19,21 @@ class Field:
     a diffusible chemical's concentration, temperature, or surface
     roughness. The field's extent may be larger than the simulation
     bounds (e.g. to provide a margin for future diffusion dynamics).
+
+    A field marked `is_chemical=True` holds an extracellular chemical
+    species' concentration: any cell reaction-network species sharing the
+    field's name *is* that extracellular species, and reactions that consume
+    or produce it exchange mass with the field at the cell's voxel (see
+    `Colony._step_cells`).
     """
 
     def __init__(
         self, name, values, is_chemical=False, diffuses=False, diffusivity=None
     ):
         self.name = name
-        self.values = np.asarray(values, dtype=float)
+        # Copied: cells and reactions write into `values` in place, which
+        # must never reach back into the caller's array.
+        self.values = np.array(values, dtype=float)
         self.is_chemical = is_chemical
         self.diffuses = diffuses
         if diffuses:
@@ -145,8 +153,9 @@ class Environment:
         No meter conversion here (unlike `diffuse`, which works in meters
         because `diffusivity` is in m²/s) — this stays in μm³ to match
         `Cell.compute_volume()` directly, since Field concentrations are on
-        the same volumetric basis as Cell concentrations (see
-        `Colony.apply_chemical_fields`'s direct-copy convention).
+        the same volumetric basis as Cell concentrations. This is the
+        compartment volume a cell's extracellular species live in (see
+        `Colony._step_cells`).
         """
         dx = self.size[0] / self.shape[1]
         dy = self.size[1] / self.shape[0]

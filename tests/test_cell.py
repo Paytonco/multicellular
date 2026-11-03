@@ -411,3 +411,165 @@ def test_adder_homeostasis():
 
 if __name__ == "__main__":
     test_basic_cell_behavior()
+
+
+def _uptake_cell(growth_rate=0.0):
+    uptake = Reaction(
+        {"A": 1}, {"A_int": 1}, rate_law_type="mass_action", rate_params={"k": 1.0}
+    )
+    return Cell(
+        id=1,
+        position=[0.0, 0.0],
+        orientation=[1.0, 0.0],
+        network=ReactionNetwork("uptake", {"R": uptake}),
+        growth_rate=growth_rate,
+        rng=np.random.default_rng(0),
+    )
+
+
+def test_step_with_external_returns_updated_external_and_conserves_mass():
+    cell = _uptake_cell()
+    v_ext = 20.0
+    volume = cell.compute_volume()
+
+    updated = cell.step(0.1, external={"A": 2.0}, external_volume=v_ext)
+
+    assert set(updated) == {"A"}
+    assert updated["A"] < 2.0
+    assert "A" not in cell.concentrations
+    taken = (2.0 - updated["A"]) * v_ext
+    assert cell.copy_number("A_int") == pytest.approx(taken, rel=1e-6)
+    assert cell.concentrations["A_int"] * volume == pytest.approx(taken, rel=1e-6)
+
+
+def test_step_external_species_not_diluted_by_growth():
+    cell = _uptake_cell(growth_rate=np.log(2))
+    cell.network.reactions["R"].rate_params["k"] = 0.0
+
+    updated = cell.step(0.5, external={"A": 2.0}, external_volume=20.0)
+
+    assert updated["A"] == pytest.approx(2.0)
+
+
+def test_step_external_requires_external_volume():
+    cell = _uptake_cell()
+    with pytest.raises(ValueError):
+        cell.step(0.1, external={"A": 2.0})
+
+
+def test_step_without_external_returns_empty_dict():
+    cell = _uptake_cell()
+    assert cell.step(0.1) == {}
+
+
+def test_daughters_inherit_extracellular_snapshot():
+    cell = _make_cell()
+    cell.extracellular = {"AHL": 0.4}
+    d1, d2 = cell.divide()
+    assert d1.extracellular == {"AHL": 0.4} and d2.extracellular == {"AHL": 0.4}
+    d1.extracellular["AHL"] = 1.0
+    assert d2.extracellular["AHL"] == 0.4  # independent copies
+
+
+# --- Spherical cells ---------------------------------------------------------
+
+
+def _make_sphere(radius=0.5, rng=None, **kwargs):
+    return Cell(
+        id=1,
+        position=[0.0, 0.0],
+        orientation=[1.0, 0.0],
+        radius=radius,
+        shape="sphere",
+        rng=rng if rng is not None else np.random.default_rng(0),
+        **kwargs,
+    )
+
+
+def test_cell_defaults_to_rod_shape():
+    cell = Cell(id=1, position=[0.0, 0.0], orientation=[1.0, 0.0])
+    assert cell.shape == "rod"
+    assert cell.length == 2.0
+    assert cell.delta_bar == 1.0
+
+
+def test_invalid_shape_raises():
+    with pytest.raises(ValueError, match="shape"):
+        Cell(id=1, position=[0.0, 0.0], orientation=[1.0, 0.0], shape="cube")
+
+
+def test_sphere_with_nonzero_length_raises():
+    with pytest.raises(ValueError, match="length"):
+        _make_sphere(length=1.0)
+
+
+def test_sphere_volume_is_four_thirds_pi_r_cubed():
+    cell = _make_sphere(radius=0.7)
+    assert cell.length == 0.0
+    assert cell.compute_volume() == pytest.approx(4.0 / 3.0 * np.pi * 0.7**3)
+
+
+def test_sphere_default_delta_bar_is_initial_volume():
+    cell = _make_sphere(radius=0.6)
+    assert cell.delta_bar == pytest.approx(4.0 / 3.0 * np.pi * 0.6**3)
+    assert cell.size_at_birth == pytest.approx(cell.compute_volume())
+
+
+def test_sphere_growth_scales_radius_and_conserves_copy_number():
+    cell = _make_sphere(radius=0.5, growth_rate=0.3)
+    cell.set_concentration("A", 2.0)
+    v0, n0 = cell.compute_volume(), cell.copy_number("A")
+    cell.grow(0.5)
+    assert cell.length == 0.0
+    assert cell.radius == pytest.approx(0.5 * np.exp(0.3 * 0.5 / 3.0))
+    assert cell.compute_volume() == pytest.approx(v0 * np.exp(0.3 * 0.5))
+    assert cell.copy_number("A") == pytest.approx(n0)
+
+
+def test_sphere_division_target_is_in_volume_units():
+    cell = _make_sphere(radius=0.5, cv_delta=0.0, a=1.0)
+    v0 = cell.compute_volume()
+    assert cell._division_target == pytest.approx(2.0 * v0)
+    assert not cell.ready_to_divide()
+    cell.radius = 0.5 * 2.0 ** (1.0 / 3.0) * 1.0001
+    assert cell.ready_to_divide()
+
+
+def test_sphere_division_conserves_volume_and_daughters_touch():
+    cell = _make_sphere(radius=0.5, cv_f=0.05, rng=np.random.default_rng(3))
+    cell.set_concentration("A", 1.0)
+    cell.set_concentration("B", 2.0, low_copy=True)
+    target = cell._division_target
+    cell.radius = (3.0 * target / (4.0 * np.pi)) ** (1.0 / 3.0) * (1 + 1e-9)
+    n_b = int(round(cell.copy_number("B")))
+
+    d1, d2 = cell.divide()
+
+    for d in (d1, d2):
+        assert d.shape == "sphere"
+        assert d.length == 0.0
+    assert d1.compute_volume() + d2.compute_volume() == pytest.approx(target)
+    gap = np.linalg.norm(d2.position - d1.position)
+    assert gap == pytest.approx(d1.radius + d2.radius)
+    # Daughters lie along the parent's orientation.
+    assert d1.position[1] == pytest.approx(0.0)
+    assert d2.position[1] == pytest.approx(0.0)
+    assert d1.concentrations["A"] == pytest.approx(1.0)
+    assert round(d1.copy_number("B")) + round(d2.copy_number("B")) == n_b
+
+
+def test_sphere_adder_mean_birth_volume_converges_to_delta_bar():
+    rng = np.random.default_rng(11)
+    cell = _make_sphere(radius=0.5, rng=rng, growth_rate=1.0)
+    delta_bar = cell.delta_bar
+    birth_sizes = []
+    for _ in range(2000):
+        while not cell.ready_to_divide():
+            cell.grow(0.01)
+        cell = cell.divide()[rng.integers(2)]
+        birth_sizes.append(cell.size_at_birth)
+    assert np.mean(birth_sizes[200:]) == pytest.approx(delta_bar, rel=0.05)
+
+
+def test_to_dict_includes_shape():
+    assert _make_sphere().to_dict()["shape"] == "sphere"

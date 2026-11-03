@@ -1,7 +1,8 @@
 # multicellular
 
 An agent-based simulation framework for bacterial cell colonies. Each cell is
-modeled as a rod-shaped body (cylinder with hemispherical caps) carrying an
+modeled as a rod-shaped body (cylinder with hemispherical caps), or as a
+sphere for coccoid cells (see [Spherical cells](#spherical-cells)), carrying an
 internal chemical reaction network (e.g. a gene-regulatory circuit), and grows,
 divides, diffuses, and pushes against its neighbors within a shared environment.
 
@@ -12,10 +13,12 @@ tested:
 
 - Individual cells with geometry, growth (with continuous dilution of
   concentrations as volume increases), division, and internal reaction
-  networks
+  networks, as rods (bacilli) or spheres (cocci), which can be mixed in one
+  colony
 - Chemical reaction networks (mass-action, Michaelis-Menten, Hill-Langmuir,
-  custom rate laws), simulated via ODE (`solve_ivp`), the chemical Langevin
-  equation (CLE), or Gillespie SSA
+  custom rate laws), simulated via ODE (`scipy.integrate.solve_ivp`, with
+  explicit or stiff solvers), the chemical Langevin equation (CLE), or
+  Gillespie SSA
 - Environment with spatially-varying diffusivity and viscosity fields, plus
   per-field diffusion (a mass-conserving finite-difference solver) for any
   `Field` marked `diffuses=True`
@@ -23,7 +26,9 @@ tested:
   other by a `ReactionNetwork`, stepped forward independently at every
   non-wall grid cell (ODE, CLE, or SSA, same as inside a `Cell`)
 - Colony with overdamped-Langevin Brownian motion, Hookean cell-cell and
-  cell-wall contact forces and torques, chemical field sensing and export
+  cell-wall contact forces and torques, mass-conserving exchange between
+  cells and chemical `Field`s (sensing, uptake, and membrane-bound
+  extracellular chemistry all draw on the real local pool), export
   (secretion), optional chemical survival conditions, and lysis-based
   delivery (a bulk one-time intracellular-to-`Field` deposit when a cell
   dies from a violated survival condition)
@@ -73,15 +78,50 @@ cell = Cell(
     radius=0.5,
 )
 
-print(cell.compute_volume())
+print(cell.compute_volume())  # μm³
 
-# Grow over time and check for division
+# Grow over time until the cell reaches its division target
 dt = 0.1
-while not cell.ready_to_divide(threshold_length=4.0):
-    cell.grow(dt, growth_rate=1.0)
+while not cell.ready_to_divide():
+    cell.grow(dt)
 
 daughter1, daughter2 = cell.divide()
 ```
+
+#### Growth and division (adder model)
+
+A cell grows exponentially: a rod's length evolves as
+`L(t) = L_b * exp(growth_rate * t)`. It divides according to a stochastic
+**adder** model. At birth, each cell samples a division target
+
+```
+S_d = a * S_b + Δ,    Δ ~ Normal(delta_bar, cv_delta * delta_bar)   (resampled until Δ > 0)
+```
+
+where `S_b` is its size at birth (`cell.size_at_birth`). The size is length
+for rods and volume for spheres; see [Spherical cells](#spherical-cells).
+`cell.ready_to_divide()` returns `True` once the size reaches `S_d`. At that
+point `cell.divide()` returns two daughters with sizes `f * S_d` and
+`(1 - f) * S_d`, placed so that their surfaces just touch. If the cell isn't
+ready yet, `divide()` returns `None`. Each daughter samples its own target,
+so the lineage keeps adding about `delta_bar` per generation.
+
+The growth and division constructor arguments are:
+
+| Argument | Default | Meaning |
+|---|---|---|
+| `growth_rate` | `ln 2` | Exponential growth rate λ (a mean doubling time of 1 time unit). |
+| `growth_rate_law` | `None` | Optional `f(concentrations, extracellular) -> growth_rate`, called by `Colony` every step with the cell's concentrations and the local value of every `Field` (e.g. temperature- or nutrient-dependent growth; see `examples/ratkowsky_temperature_demo.ipynb`). |
+| `delta_bar` | `1.0` μm (rods); initial volume (spheres) | Mean added size per generation. At steady state, mean birth size is `delta_bar` and mean division size is `2 * delta_bar`. |
+| `cv_delta` | `0.10` | Coefficient of variation of the added increment Δ, which is the main source of division noise. |
+| `a` | `1.0` | Size-control strategy: `1` is a pure adder, `0` a sizer, and `2` roughly a timer. |
+| `cv_f` | `0.0` | CV of the division fraction `f ~ Normal(0.5, cv_f * 0.5)`. The default `0.0` gives a symmetric split; about `0.03` adds partition noise. |
+| `rng` | fresh `default_rng()` | `np.random.Generator` behind all of this cell's randomness: division, Brownian motion, and SSA/CLE chemistry. Daughters share it. |
+| `shape` | `"rod"` | `"rod"` or `"sphere"`; see [Spherical cells](#spherical-cells). |
+| `lysis_targets` | `None` | See [Lysis-based delivery](#lysis-based-delivery). |
+
+`cell.step(dt)` runs the cell's reaction network (if it has one) and then
+calls `grow(dt)`. `cell.to_dict()` returns a snapshot of the cell's state.
 
 `Cell` also exposes two methods for directly applying external motion:
 
@@ -93,6 +133,34 @@ daughter1, daughter2 = cell.divide()
 
 Both are also called internally by `Colony` when applying Brownian motion and
 contact forces.
+
+#### Spherical cells
+
+Pass `shape="sphere"` for a coccoid cell (a circle in the 2D plane):
+
+```python
+coccus = Cell(id=2, position=[5.0, 0.0], orientation=[1.0, 0.0],
+              radius=0.5, shape="sphere")
+```
+
+A sphere is the zero-length case of the rod geometry (`length` is fixed at
+0), so volume, contact detection, and rendering all use the same code as rods,
+and rods and spheres can be mixed in one colony. What differs:
+
+- **Growth**: the radius grows as `r *= exp(growth_rate * dt / 3)`, so volume
+  grows at `growth_rate`, the same as for rods.
+- **Division (adder)**: the size variable is volume (μm³), not length.
+  `delta_bar` defaults to the initial volume `(4/3)πr³`. A cell splits into
+  two spheres with volumes `f·V_d` and `(1−f)·V_d`, placed along its
+  orientation so that they touch.
+- **Mechanics**: the contact drag is `ζ_t = 3 * drag * radius`, and contacts
+  never rotate a sphere, because every contact force passes through its
+  center. Brownian motion uses Stokes drag (`6πηr`, and `8πηr³` for
+  rotation). That rotational diffusion is what randomizes the axis the
+  sphere divides along.
+
+See section 14 of `examples/feature_tour.ipynb` for a worked example: a
+single coccus growing and dividing, and a mixed rod/coccus colony.
 
 ### `Reaction` and `ReactionNetwork`
 
@@ -106,6 +174,18 @@ The method is chosen per call to `simulate_step` (or, when running a full
 see [`Simulation`](#simulation) below) rather than being fixed on the
 `ReactionNetwork` itself, so the same network can be advanced with different
 methods.
+
+Each rate law reads its parameters from `rate_params`:
+
+| `rate_law_type` | Rate | Parameters |
+|---|---|---|
+| `"mass_action"` (default) | `k * Π [reactant]^stoich` | `k` (default `1.0`) |
+| `"michaelis_menten"` | `Vmax * [E] * [S] / (Km + [S])`, where `S` is the first reactant and `E` the first catalyst (`[E] = 1` if there are no catalysts) | `Vmax`, `Km` (default `1.0` each) |
+| `"hill_langmuir"` | `beta * [E] * (1 + alpha * C [z]^n) / (1 + C [z]^n)`, where `E` is `catalysts[0]` (e.g. RNAP) and `z` is `catalysts[1]` (the activator or inducer) | `alpha`, `beta`, `C`, `n` (all required) |
+| `"custom"` | `custom_rate_law(reactant_conc, product_conc, catalyst_conc, rate_params)` | anything your function reads |
+
+Catalysts appear in the rate but are neither consumed nor produced. For
+repression, use a `custom` rate law (e.g. `beta / (1 + ([R]/K)^n)`).
 
 ```python
 from multicellular import ReactionNetwork
@@ -129,7 +209,13 @@ new_state = network.simulate_step(state, dt=0.1, volume=1.0)  # method="ODE" by 
 dict in, a concentration dict out (`{species: value}`, keyed by
 `network.species`). `volume` is the cell's current volume (held fixed across
 the call). `method` (`"ODE"`, `"CLE"`, or `"SSA"`, case-insensitive) selects
-the simulation algorithm for that call. `rng` (an optional
+the simulation algorithm for that call. `ode_method` picks the
+`solve_ivp` integrator when `method="ODE"`. It is one of `"RK45"` (default),
+`"RK23"`, `"DOP853"`, or a stiff solver: `"Radau"`, `"BDF"`, or `"LSODA"`.
+Use a stiff solver for networks with widely separated time scales, e.g.
+fast binding next to slow expression, where explicit solvers crawl. The
+integration uses `rtol=1e-6` and `atol=1e-9`, and the result is clipped at
+zero. `rng` (an optional
 `np.random.Generator`, used by `"CLE"` and `"SSA"`) defaults to a fresh
 `np.random.default_rng()` if omitted; `Cell.step` passes the cell's own `rng`
 so that one seed per `Cell` controls its entire stochastic trajectory —
@@ -170,7 +256,53 @@ Michaelis-Menten and Hill-Langmuir.
   concentrations before returning. This conversion is invisible to callers:
   `Cell.step` and `Cell.grow`'s dilution logic (see
   [Dilution by growth](#dilution-by-growth) above) work identically
-  regardless of `simulation_method`.
+  regardless of `simulation_method`. A firing that would drive any count
+  negative (possible only with custom rate laws, or with a fractional
+  extracellular pool; see below) is rejected rather than clipped, so SSA
+  never creates mass.
+
+#### Species in another compartment (`compartment_volumes`)
+
+`simulate_step` takes an optional `compartment_volumes` dict mapping a
+species to the volume of the compartment it lives in, for species that
+don't live in `volume`, such as an extracellular species living in an
+environment voxel. Rate laws are unchanged: they're still evaluated
+against concentrations and scaled by `volume`, so reaction `j` moves
+`v_j * volume` molecules per unit time. Each species' concentration,
+though, changes by those molecules divided by *its own* compartment's
+volume:
+
+```
+d[intracellular]/dt = S @ v
+d[extracellular]/dt = (volume / V_compartment) * (S @ v)
+```
+
+Molecule counts are therefore conserved across compartments. Rates also
+respond to depletion within the step (e.g. a transporter slows as it
+drains its voxel). Per method:
+
+- **`"ODE"`** integrates the weighted system directly.
+- **`"SSA"`** counts each species in its own compartment's volume. It
+  doesn't round other-compartment counts to whole molecules, so the
+  owning pool's fractional amount is never created or destroyed by
+  rounding; each firing still moves whole molecules.
+- **`"CLE"`** clamps each cross-compartment reaction's extent so that it
+  can't drive any species it touches negative. Clipping afterwards would
+  create mass in the other pool.
+
+```python
+uptake = Reaction({"A_ext": 1}, {"A_int": 1}, rate_law_type="mass_action", rate_params={"k": 1.0})
+network = ReactionNetwork("uptake", {"R": uptake})
+new_state = network.simulate_step(
+    {"A_ext": 2.0, "A_int": 0.0}, dt=0.1, volume=2.0,
+    compartment_volumes={"A_ext": 20.0},   # A_ext lives in a 20 um^3 voxel
+)
+```
+
+You rarely call this directly. `Colony` passes it automatically for every
+network species backed by a chemical `Field`; see
+[Extracellular species](#extracellular-species-uptake-and-membrane-bound-enzymes)
+below.
 
 #### Exporting species (secretion)
 
@@ -200,22 +332,34 @@ deposit into a `Field` — see
 [Secretion (chemical export)](#secretion-chemical-export) below.
 
 All three simulation methods keep the exported amount exactly consistent
-with what's actually removed from the cell: for `"ODE"`/`"CLE"`, each export
-reaction's per-step "firing extent" is clamped to `[0, available reactant]`
-once, and *both* the intracellular delta and the exported delta are derived
-from that same clamped value — clipping the two results independently
-afterward instead could let CLE noise (or a forward-Euler overshoot at large
-`dt`) silently create or destroy mass. For `"SSA"`, exported counts are
-tracked exactly during the same firing loop that updates intracellular
-counts, so they're exact by construction.
+with what's actually removed from the cell:
+
+- **`"ODE"`** integrates the cumulative exported amount alongside the
+  intracellular state. Each export reaction's rate is clamped to be `≥ 0`,
+  and to `0` once any of its reactants is depleted.
+- **`"CLE"`** clamps each export reaction's per-step firing extent to
+  `[0, available reactant]` once. Both the intracellular change and the
+  exported amount are then derived from that single clamped value.
+  Clipping the two results independently could let noise create or
+  destroy mass.
+- **`"SSA"`** tracks exported counts in the same firing loop that updates
+  intracellular counts, so they're exact by construction.
+
+If the destination is a chemical (`is_chemical=True`) `Field`, an ordinary
+reaction producing the field-backed species (e.g. `X -> X_ext`, with a
+`Field` named `X_ext`) is equivalent to an export; see
+[Extracellular species](#extracellular-species-uptake-and-membrane-bound-enzymes)
+below. Exports remain the way to deposit into a `Field` that isn't
+chemical.
 
 ### Cell with an internal reaction network
 
 A `Cell` can be given a `ReactionNetwork`; calling `cell.step(dt)` advances
-both its internal chemistry and its growth. `cell.step` takes an optional
-`method` argument (`"ODE"` by default, or `"CLE"`/`"SSA"`), forwarded to the
-network's `simulate_step` — this is what `Colony.step` and `Simulation` use
-to apply the simulation method chosen when the `Simulation` was created (see
+both its internal chemistry and its growth. `cell.step` takes optional
+`method` (`"ODE"` by default, or `"CLE"`/`"SSA"`) and `ode_method`
+(default `"RK45"`) arguments, which it forwards to the network's
+`simulate_step`. `Colony.step` and `Simulation` use these to apply the
+simulation method chosen when the `Simulation` was created (see
 [`Simulation`](#simulation) below):
 
 ```python
@@ -237,9 +381,10 @@ print(cell.concentrations)
 Growth changes a cell's volume but not its molecule counts, so `cell.grow(dt)`
 holds each species' copy number (`concentration * volume`) fixed across the
 volume change: it computes every species' copy number at the pre-growth
-volume, grows `length` (and so volume), then divides those copy numbers by
-the new volume to get diluted concentrations. Since `cell.step(dt)` runs the
-reaction network's ODE step before calling `grow`, copy number changes from
+volume, grows the cell (and so its volume), then divides those copy numbers by
+the new volume to get diluted concentrations. A rod grows its `length` and a
+sphere grows its `radius`. Since `cell.step(dt)` runs the
+reaction network's step before calling `grow`, copy number changes from
 reactions and from growth-driven dilution are applied in two clearly
 separated stages each timestep — reactions are the only thing that changes
 copy number, growth only dilutes it:
@@ -265,9 +410,9 @@ below) but still hands back concentrations at the end of that step, so
 
 When a cell divides, each daughter receives its own cloned copy of the
 reaction network (`network.clone()`). For most species, concentration is
-conserved across division (each daughter inherits the parent's
-concentration, which conserves total copy number since each daughter has
-half the parent's volume).
+conserved across division. Each daughter inherits the parent's
+concentration, which conserves total copy number because the daughters'
+volumes split the parent's.
 
 ### Low-copy species
 
@@ -321,21 +466,98 @@ env.get_field("glucose")
 Every `Field` added to an `Environment` must have a `values` matrix matching
 the environment's `shape`; adding a mismatched field raises `ValueError`.
 
-A `Field` also carries an `is_chemical` flag (default `False`). Fields marked
-`is_chemical=True` are treated as diffusible chemical species: at each
-timestep, `Colony` samples the field's local value at every living cell's
-position and writes it into that cell's `concentrations` under the field's
-`name`, overwriting any existing value for that species (see
-[`Colony`](#colony) below). This sampling happens both before and after each
-cell's internal step, so a chemical field's value is treated as an
-externally-imposed boundary condition: the cell's own growth (see
-[Dilution by growth](#dilution-by-growth) below) never dilutes it. Every living
-cell's position is looked up in the field grid in one batched (vectorized)
-operation per field, rather than one Python-level lookup per cell.
+A `Field` also carries an `is_chemical` flag (default `False`). A field
+marked `is_chemical=True` holds an extracellular chemical species: any
+species in a cell's `ReactionNetwork` that shares the field's `name` *is*
+that extracellular species, and it exchanges real mass with the field (see
+[Extracellular species](#extracellular-species-uptake-and-membrane-bound-enzymes)
+below). After every step, each living cell's local value of every chemical
+field is also recorded in `cell.extracellular` (a read-only snapshot,
+keyed by field name). `Simulation` records it into the history DataFrame
+under the field's name, and survival conditions can test it.
 
 ```python
 glucose = Field("glucose", np.ones((10, 10)), is_chemical=True)
 ```
+
+#### Extracellular species: uptake and membrane-bound enzymes
+
+Intracellular and extracellular forms of a molecule are distinct species
+with distinct names: `glucose` (backed by a chemical `Field`) versus
+`glucose_int` (an ordinary intracellular species). Moving between them, or
+reacting outside the cell, is just ordinary reactions. There's no special
+"import" mechanism. Each step, for every living cell, `Colony`:
+
+1. reads each field-backed species' concentration at the voxel containing
+   the cell's center;
+2. steps the cell's network with those species living in the voxel
+   (`compartment_volumes={species: environment.grid_cell_volume}`; see
+   [Species in another compartment](#species-in-another-compartment-compartment_volumes)
+   above);
+3. writes the voxel's updated concentrations straight back into the fields.
+
+So any reaction that consumes or produces a field-backed species draws
+from or adds to the local pool, and molecules are conserved between cells
+and medium. A reaction moving `n` molecules changes the cell's own species
+by `n / V_cell`, and the voxel's by `n / V_voxel`.
+
+```python
+import numpy as np
+from multicellular import Cell, Colony, Environment, Field, ReactionNetwork
+from multicellular.core.reactions import Reaction
+
+# Transporter: extracellular glucose -> intracellular glucose_int.
+transport = Reaction({"glucose": 1}, {"glucose_int": 1}, catalysts=["PtsG"],
+                     rate_law_type="michaelis_menten", rate_params={"Vmax": 4.0, "Km": 0.5})
+# Membrane-bound enzyme acting outside the cell: glucose -> gluconate, both
+# extracellular, catalysed by the cell's own (intracellular) Gdh.
+oxidation = Reaction({"glucose": 1}, {"gluconate": 1}, catalysts=["Gdh"],
+                     rate_law_type="michaelis_menten", rate_params={"Vmax": 2.0, "Km": 0.5})
+
+cell = Cell(id=0, position=[12.0, 12.0], orientation=[1.0, 0.0],
+            network=ReactionNetwork("glucose", {"transport": transport, "oxidation": oxidation}))
+cell.set_concentration("PtsG", 1.0)
+cell.set_concentration("Gdh", 1.0)
+
+env = Environment("closed chamber", wall_map=np.zeros((12, 12)), size=(24.0, 24.0), fields=[
+    Field("glucose", np.ones((12, 12)), is_chemical=True, diffuses=True, diffusivity=1e-12),
+    Field("gluconate", np.zeros((12, 12)), is_chemical=True, diffuses=True, diffusivity=1e-12),
+])
+colony = Colony([cell], env)
+for _ in range(100):
+    colony.step(dt=0.1)
+# glucose field + gluconate field + glucose_int in the cell is conserved exactly.
+```
+
+Details:
+
+- **Catalyst-only sensing is free.** A species that only ever appears as a
+  catalyst (an inducer like IPTG, or a constant `RNAP` field) is read but
+  never consumed, so sensing it doesn't change the field.
+- **Not part of the cell.** Field-backed species are kept out of
+  `cell.concentrations` (the zero entries a new cell seeds for every
+  network species are dropped on its first step), so growth never dilutes
+  them and division never partitions them. A species is field-backed only
+  while the current environment has a chemical `Field` of that name. After
+  `switch_environment` to an environment without it, the name is an
+  ordinary intracellular species again.
+- **Shared voxels.** Coupled cells are stepped one at a time, in an order
+  shuffled by `environment.rng` each step, and each reads its voxel after
+  the previous cells' writes. Cells sharing a voxel therefore share one
+  pool and can't jointly overdraw it, and no cell gets systematic first
+  access.
+- **Voxel volume matters.** `environment.grid_cell_volume` (`dx * dy *
+  depth`) is the extracellular compartment volume. A voxel smaller than
+  the cell drains (and refills) faster than the cell's own species
+  change; one much larger barely notices a single cell.
+  `examples/danino_oscillator_demo.ipynb` uses this deliberately, sizing
+  each voxel to one cell's share of free medium so that
+  `V_cell / V_voxel = d/(1-d)`, the density factor in the Danino et al.
+  model.
+- **Don't export into a field-backed reactant's own field.** An export
+  reaction whose reactant `X` is itself field-backed (because a chemical
+  `Field` named `X` exists) consumes extracellular `X` and deposits it right
+  back. Use a distinct intracellular name (`X_int`) for the cell's pool.
 
 #### Field diffusion
 
@@ -418,6 +640,10 @@ extent. `env.in_bounds(position)` checks whether a 2D position (e.g. a
 cell's center of mass) falls within `[0, size[0]] × [0, size[1]]` *and* does
 not land on a `wall_map` out-of-bounds (`-1`) cell (see next section).
 
+`Environment` also takes an `rng` (`np.random.Generator`, default a fresh
+`default_rng()`). It drives `react()`'s SSA/CLE noise and the order in which
+`Colony` steps cells that share chemical fields.
+
 `Environment` also takes a `depth` (μm, default `1.0` — twice the default
 `Cell` radius of 0.5 μm, i.e. sized for a single-cell-thick microfluidics
 monolayer). Together with the grid spacing implied by `wall_map`'s shape and
@@ -471,7 +697,7 @@ volume) rather than a cell's. No separate conversion logic is needed.
 `react()` excludes wall (`wall_map == 1`) cells from the update, the same as
 `diffuse()`: there's no medium there to react in.
 
-`Colony.step(dt, method)` calls `environment.react(dt, method)` right after
+`Colony.step(dt, method, ode_method)` calls `environment.react(dt, method, ode_method)` right after
 `environment.diffuse(dt)` (see [`Colony`](#colony) below), so reaction-diffusion
 runs every step even with an empty `Colony` (no cells at all) — see
 `examples/feature_tour.ipynb`'s Gray-Scott Turing pattern demo.
@@ -557,10 +783,11 @@ print(cell.concentrations["X"], field.values[5, 5])  # X left the cell, appeared
 If a cell exports a species with no matching `Field` in the environment,
 `export_chemical_fields` raises `ValueError` — validated for every exporting
 cell before any field is mutated, so a missing field never causes a partial
-deposit. The target field doesn't need `is_chemical=True` (that flag only
-controls whether `Colony` *senses* the field back into cells — an orthogonal
-concern from whether it can receive secretion) or `diffuses=True`, though
-combining both lets secreted material spread spatially on subsequent steps.
+deposit. The target field doesn't need `is_chemical=True` (that flag makes
+the field's name an extracellular species of any network that references
+it, an orthogonal concern from whether it can receive secretion) or
+`diffuses=True`, though combining both lets secreted material spread
+spatially and be sensed or taken up by other cells.
 
 #### Lysis-based delivery
 
@@ -610,18 +837,13 @@ as `export_chemical_fields` above.
 
 A source species must map to a **different** target species name —
 `Cell.__init__` raises `ValueError` if any source equals its own target.
-This isn't just a naming nicety: `Colony.apply_chemical_fields` mirrors a
-chemical `Field`'s value into every living cell's same-named concentration
-every step, but that's a non-conservative copy, not a depleting transfer —
-the field's mass is never actually removed from the field when a cell reads
-it. If a cell then lysed that mirrored value straight back into the
-same-named field, it would inject mass that was never taken out in the
-first place, compounding with every cell that dies. Deliver into a
-distinct species instead — the same discipline already used on the import
-side, where a `Field`-mirrored species is converted into a separate,
-truly-intracellular pool via a reaction (see
-[`Reaction` and `ReactionNetwork`](#reaction-and-reactionnetwork) above)
-before it's consumed.
+This isn't just a naming nicety. A species named after a chemical `Field`
+*is* that field's extracellular pool (see
+[Extracellular species](#extracellular-species-uptake-and-membrane-bound-enzymes)
+above): the cell reads it and exchanges mass with it, but holds no copies
+of it itself, so there's nothing intracellular to release. Deliver an
+intracellular species into a distinct, field-backed one instead, the same
+intracellular/extracellular naming discipline used for uptake.
 
 `lysis_targets` is inherited by both daughters at division, the same way
 `species` and `growth_rate_law` are.
@@ -645,18 +867,20 @@ colony.step(dt=0.1)
 
 - **`k`** (default `10.0`): Hookean contact stiffness (force / length). Controls
   how hard cells push against one another when they overlap. Must be tuned
-  alongside `dt`; the explicit integrator is stable when
-  `dt < 2 * drag * length / k`.
+  alongside `dt`; the explicit integrator is stable when `dt < 2 * ζ_t / k`.
+  That is `dt < 2 * drag * length / k` for rods and
+  `dt < 6 * drag * radius / k` for spheres.
 - **`k_wall`** (default: `10 * k`): Hookean stiffness for cell-wall contacts
   (see [Wall forces](#wall-forces) below). Walls default to much stiffer than
   cells, so they behave close to a rigid boundary rather than yielding like
   another cell would; pass an explicit value to override. Like `k`, it must
   be tuned alongside `dt` — the explicit integrator is stable when
-  `dt < 2 * drag * length / k_wall`, so a much stiffer `k_wall` needs a
+  `dt < 2 * ζ_t / k_wall`, so a much stiffer `k_wall` needs a
   correspondingly smaller `dt`.
 - **`drag`** (default `1.0`): isotropic drag constant for contact dynamics
   (force · time / length²). Sets the translational drag `ζ_t = drag * length`
-  and rotational drag `ζ_r = (drag / 12) * length³`.
+  and rotational drag `ζ_r = (drag / 12) * length³` for rods, and
+  `ζ_t = 3 * drag * radius` for spheres (which contact forces never rotate).
 
 It also accepts **`brownian_motion`** (default `True`): whether `step`
 applies an overdamped-Langevin Brownian kick to living cells each step (see
@@ -669,8 +893,10 @@ It also accepts an optional **`survival_conditions`** parameter: a list of
 `(species, operator, threshold)` tuples, e.g. `[("A", ">", 0)]`. Every step,
 each living cell's concentration of `species` is compared against
 `threshold` using `operator` — one of `">"`, `">="`, `"<"`, `"<="`, `"=="`,
-`"!="` — and the cell dies as soon as any condition is violated. A species
-missing from a cell's concentrations is treated as `0.0`. With multiple
+`"!="` — and the cell dies as soon as any condition is violated. `species`
+may be intracellular or the name of a chemical `Field` (read from the
+cell's local `extracellular` snapshot, e.g. a toxin in the medium); a
+species missing from both is treated as `0.0`. With multiple
 conditions, a cell dies if *any* of them is violated. A cell killed this way
 that also has `lysis_targets` set delivers its lysis payload to the
 environment — see [Lysis-based delivery](#lysis-based-delivery) above:
@@ -680,36 +906,35 @@ environment — see [Lysis-based delivery](#lysis-based-delivery) above:
 colony = Colony(cells, env, survival_conditions=[("A", ">", 0), ("B", "<=", 10)])
 ```
 
-`colony.step(dt)` performs the following operations in order (an optional
-second argument, `method`, is forwarded to every cell's `Cell.step` — see
+`colony.step(dt)` performs the following operations in order. Its optional
+`method` (default `"ODE"`) and `ode_method` (default `"RK45"`) arguments
+are forwarded to every cell's `Cell.step` (see
 [Cell with an internal reaction network](#cell-with-an-internal-reaction-network)
-above — and defaults to `"ODE"`, same as `Cell.step`):
+above) and to `environment.react`:
 
 1. **Diffusion** — calls `environment.diffuse(dt)`, advancing every field
    with `diffuses=True` (no-op if there are none; see
    [Field diffusion](#field-diffusion) above).
-2. **Field reactions** — calls `environment.react(dt, method)`, advancing the
+2. **Field reactions** — calls `environment.react(dt, method, ode_method)`, advancing the
    environment's `reactions` network (if any) independently at every
    non-wall grid cell (no-op if `reactions` is `None`; see
    [Field reactions (reaction-diffusion)](#field-reactions-reaction-diffusion)
    above).
-3. **Chemical fields** — for every `Field` on the environment with
-   `is_chemical=True`, samples its local value at each living cell's
-   position and sets that cell's concentration of the same-named species
-   (no-op if there are no chemical fields).
-4. **Internal step** — calls `cell.step(dt)` for every cell (chemistry +
-   growth). Growth dilutes every species in `concentrations`, including
-   ones just set from a chemical field in step 3.
+3. **Growth rates** — calls each living cell's `growth_rate_law` (if any)
+   with its concentrations and the local value of every field.
+4. **Internal step** — calls `cell.step` for every cell (chemistry +
+   growth). Cells whose network references a chemical `Field` exchange
+   mass with their voxel as part of this step, one cell at a time in a
+   shuffled order (see
+   [Extracellular species](#extracellular-species-uptake-and-membrane-bound-enzymes)
+   above). Growth dilutes only intracellular species.
 5. **Chemical export** — calls `export_chemical_fields()`, depositing
    whatever each cell exported this step into the matching `Field` (no-op if
    no cell exported anything; see
    [Secretion (chemical export)](#secretion-chemical-export) above).
-6. **Chemical fields (re-applied)** — repeats step 3, so each chemical
-   field's value overwrites whatever growth diluted it to in step 4. This
-   keeps the field's value pinned to the environment between steps; reactions
-   in step 4 already saw the correct, freshly-sampled value from step 3.
-   Running after step 5 means a cell sensing the same field it just exported
-   into sees this step's freshly-deposited mass.
+6. **Sampling** — calls `sample_chemical_fields()`, refreshing every living
+   cell's read-only `extracellular` snapshot of its local chemical-field
+   values (for recording and survival conditions; moves no mass).
 7. **Bounds enforcement** — kills any living cell whose center of mass lies
    outside `environment.size`'s physical extent or on a `wall_map`
    out-of-bounds (`-1`) cell (see
@@ -781,8 +1006,14 @@ lookup). The effective local viscosity is then:
 This Stokes-Einstein scaling means that a region with lower diffusivity is
 treated as more viscous, and vice versa.
 
-Translational and rotational drag coefficients are computed from `η_local` and
-the cell's geometry using slender-body theory for a thin rod of total length
+For a spherical cell (`shape="sphere"`), slender-body theory doesn't apply.
+Its drag is isotropic Stokes drag, so `γ_∥ = γ_⊥ = 6π η_local r` and
+`γ_rot = 8π η_local r³`, and the same displacement formulas below apply. A
+sphere's rotational diffusion matters only because its orientation sets the
+axis it next divides along.
+
+For a rod, translational and rotational drag coefficients are computed from
+`η_local` and the cell's geometry using slender-body theory for a thin rod of total length
 `L_eff = length + 2 × radius`:
 
 ```
@@ -846,6 +1077,13 @@ overdamped dynamics using the `drag` parameter:
 Δθ_i = (Σ τ_i)  / ζ_r · dt,   ζ_r = (drag / 12) · length³
 ```
 
+A spherical cell is the `length = 0` case: its axis segment collapses to a
+point (its center), so the same segment-distance math handles sphere–sphere
+and sphere–rod contacts unchanged. Because a contact force on a sphere always
+passes through its center, its torque is identically zero. Spheres use
+`ζ_t = 3 · drag · radius` and are never rotated by contacts. A rod touching
+a sphere still gets the usual torque.
+
 When cell axes are nearly parallel the closest-point solution is non-unique;
 `Colony` handles this explicitly by using the midpoint of the overlapping axial
 projection rather than a degenerate endpoint, which gives the physically
@@ -888,6 +1126,8 @@ step. There are two contact primitives:
   cases: a rod lying parallel to the face gets an equal push from both ends
   (straight, zero net torque); a tilted rod gets an off-center push from
   whichever end penetrates more, pivoting it to lie flat against the wall.
+  A sphere's two "endpoints" coincide at its center, so it samples that one
+  point only (counting it twice would double the wall force).
 - **Corner points.** Near the end of a finite face, or an inside corner, a
   cell rounds the tip rather than being blocked by an unbounded plane. This
   is point contact between the cell's axis segment and the corner point —
@@ -908,11 +1148,13 @@ letting the endpoint tunnel through once some fixed depth is exceeded.
 ### `Simulation`
 
 `Simulation` steps a `Colony` from `t=0` to `t=t_max` in increments of `dt`,
-recording every cell's position, orientation, length, alive status, and
+recording every cell's position, orientation, size, shape, alive status, and
 chemical concentrations at every timestep. It also owns the simulation
-method used to advance every cell's `ReactionNetwork` each step — pass
+method used to advance every cell's `ReactionNetwork` each step. Pass
 `simulation_method="ODE"` (the default), `"SSA"`, or `"CLE"` when
-constructing it:
+constructing it, plus `ode_method` (default `"RK45"`) to choose the
+`solve_ivp` integrator for `"ODE"`, e.g. `"LSODA"` or `"BDF"` for a stiff
+network:
 
 ```python
 import numpy as np
@@ -922,18 +1164,22 @@ env = Environment("LB medium", wall_map=np.zeros((10, 10)))
 cell = Cell(id=0, position=[50.0, 50.0], orientation=[1.0, 0.0])
 colony = Colony([cell], env)
 
-sim = Simulation(colony, dt=0.1, t_max=10.0, simulation_method="ODE")  # or "SSA"/"CLE"
+sim = Simulation(colony, dt=0.1, t_max=10.0, simulation_method="ODE",  # or "SSA"/"CLE"
+                 ode_method="RK45")  # or "LSODA", "BDF", "Radau", ...
 df = sim.run()  # pandas DataFrame, one row per cell per recorded timestep
 ```
 
 `sim.run()` records the initial state, then repeatedly calls
-`colony.step(dt, sim.simulation_method)` and records the new state of every
+`colony.step(dt, sim.simulation_method, sim.ode_method)` and records the new state of every
 cell remaining in the colony — including any new daughter cells produced by
 division — until `t_max` is reached. The
 returned DataFrame has columns `time`, `cell_id`, `alive`, `position_x`,
-`position_y`, `orientation_x`, `orientation_y`, `length`, `radius`, plus one
-column per chemical species seen in any cell's `concentrations` (missing
-values are `NaN` for cells/species that don't have that entry). The same data
+`position_y`, `orientation_x`, `orientation_y`, `length`, `radius`, `shape`
+(`"rod"` or `"sphere"`), plus one
+column per chemical species seen in any cell's `concentrations` or
+`extracellular` snapshot. A chemical `Field`'s column holds the field's
+value at that cell's location. Missing values are `NaN` for cells/species
+that don't have that entry. The same data
 is also available via `sim.history` (a list of per-cell-per-timestep dicts)
 and `sim.to_dataframe()`.
 
@@ -959,7 +1205,8 @@ Calling `sim.run()` again continues the simulation instead of restarting it:
 it picks up from the current `sim.time` and appends new records to the
 existing `sim.history` (`sim.env_history` and `sim.field_history` too)
 rather than clearing them. Pass a new, larger `t_max` to extend how far it
-runs (`sim.run(t_max=...)`), e.g. to simulate further after calling
+runs (`sim.run(t_max=...)`). Pass `ode_method=` to switch integrators for
+the rest of the run. Both are useful e.g. to simulate further after calling
 `colony.switch_environment(...)` — see
 [Switching environments](#switching-environments) above. Calling `run()` a
 second time with the same `t_max` it already reached is a no-op.
@@ -993,8 +1240,9 @@ df = run_replicates(build_colony, n_replicates=50, dt=0.01, t_max=10.0, n_jobs=-
   worker process) and must return a fresh `Colony`. Give each cell's `rng`
   a distinct seed (e.g. derived from `replicate_id`) so replicates don't
   share — or accidentally duplicate — a random stream.
-- `simulation_method` (`"ODE"` by default, or `"SSA"`/`"CLE"`) is forwarded
-  to every replicate's `Simulation`.
+- `simulation_method` (`"ODE"` by default, or `"SSA"`/`"CLE"`) and
+  `ode_method` (default `"RK45"`) are forwarded to every replicate's
+  `Simulation`.
 - `n_jobs` is forwarded to `joblib.Parallel`; `-1` (the default) uses every
   available core, and a smaller positive number caps how many to use.
 - The returned DataFrame is the concatenation of every replicate's
@@ -1018,7 +1266,7 @@ sim.visualize_colony(
     field=None, field_cmap="YlOrRd", field_vmin=0.0, field_vmax=None,
     interval=200,
     save_path=None, filename="simulation.gif",
-    show_progress=True, show=True,
+    show_progress=True, stride=1, show=True,
 )
 ```
 
@@ -1030,11 +1278,15 @@ sim.visualize_colony(red="A", green="B", interval=200)
 ```
 
 - Each cell is drawn as its rod shape (cylinder + hemispherical caps) using
-  its recorded `position`, `orientation`, `length`, and `radius`.
+  its recorded `position`, `orientation`, `length`, and `radius`. A
+  spherical cell (`length` 0) is drawn as a circle.
 - `red`/`green`/`blue` optionally name chemical species; a cell's color in
   that channel is its concentration of that species, normalized by the
   species' maximum value over the whole simulation. Channels left as `None`
-  default to a constant mid-gray value.
+  are `0`, so a cell colored only by `red` is pure red (black when the
+  species is absent), and `red` + `green` mix to yellow. With no channel
+  set at all, every cell is drawn a uniform mid-gray (`0.3` in each
+  channel).
 - Dead cells stop appearing in the frame after they die.
 - `environment.wall_map` is drawn as the background within `environment.size`:
   media (`0`) is white, walls (`1`) are solid gray, and out-of-bounds (`-1`)
@@ -1045,6 +1297,9 @@ sim.visualize_colony(red="A", green="B", interval=200)
   is called mid-simulation, the name updates automatically at the frame where
   the switch occurred.
 - `interval` is the delay between frames in milliseconds.
+- `stride` renders only every `stride`-th recorded timestep (default `1`,
+  every step), giving a shorter animation without re-running the
+  simulation.
 
 `field` optionally names a `Field` (e.g. `"temperature"`) to draw as a light,
 semi-transparent heatmap behind the cells, with a colorbar labeled with the
@@ -1134,7 +1389,7 @@ sim.visualize_field(
     vmin=0.0, vmax=None,
     interval=200,
     save_path=None, filename="simulation.gif",
-    show_progress=True, show=True,
+    show_progress=True, stride=1, show=True,
 )
 ```
 
@@ -1208,13 +1463,33 @@ sim.plot_field(["eta", "diffusivity"])  # several fields, side by side
 - Returns the `matplotlib.figure.Figure`, so callers can add further
   annotations (e.g. `fig.axes[0].axvline(...)`) before displaying it.
 
+## Examples
+
+The `examples/` directory has runnable notebooks. Their rendered animations
+are saved in `examples/outputs/`.
+
+| Notebook | Shows |
+|---|---|
+| `feature_tour.ipynb` | A short, self-contained demo of every major feature, including spherical cells (section 14) |
+| `repressilator_demo.ipynb` | Elowitz–Leibler three-gene oscillator |
+| `toggle_switch_demo.ipynb` | Gardner–Cantor–Collins bistable toggle: switching and memory |
+| `dupOri_cutter.ipynb` | Two incompatible plasmids with mutual nucleases: bistability via low-copy partitioning |
+| `quorum_sensing_demo.ipynb` | AHL secretion, diffusion, and density-dependent activation |
+| `danino_oscillator_demo.ipynb` | Danino et al. synchronized quorum-sensing clock; voxel volume sized to cell density |
+| `synchronized_lysis_demo.ipynb` | Din et al. synchronized lysis in a microfluidic trap, with lysis-based payload delivery |
+| `mother_machine_demo.ipynb` | Trap walls, single-file growth, and flush-out in a mother machine |
+| `ratkowsky_temperature_demo.ipynb` | Temperature-dependent growth through `growth_rate_law` |
+
+`examples/bench_visualization.py` times each stage of the simulation and
+rendering pipeline: `python examples/bench_visualization.py --t-max 9`.
+
 ## Unimplemented / stubs
 
 These pieces exist as placeholders (empty classes/functions or
 `NotImplementedError`) and are not yet usable:
 
-- **`ReactionNetwork.from_sbml`** and **`multicellular.parse_sbml`**
-  (`utils/sbml_parser.py`) — raise `NotImplementedError` / are empty. Intended
+- **`ReactionNetwork.from_sbml`** (raises `NotImplementedError`) and
+  **`multicellular.utils.sbml_parser.parse_sbml`** (an empty stub). Intended
   to construct a `ReactionNetwork` from an SBML model file.
 
 ## Running tests
@@ -1228,11 +1503,11 @@ pytest
 Run a specific test file:
 
 ```bash
-pytest tests/test_cell.py        # Cell geometry, growth, division, and pending chemical export
-pytest tests/test_reactions.py   # Reaction rate laws, stoichiometry, ODE/SSA/CLE stepping, export-reaction mass conservation
+pytest tests/test_cell.py        # Cell geometry (rods and spheres), growth, adder division, low-copy partitioning, lysis targets
+pytest tests/test_reactions.py   # Reaction rate laws, stoichiometry, ODE (all solve_ivp methods)/SSA/CLE stepping, compartments, export mass conservation
 pytest tests/test_environment.py # Environment/Field construction, wall_map validation and geometry, diffusion, and grid cell volume
 pytest tests/test_reaction_diffusion.py # Environment.react: validation, ODE/SSA/CLE correctness, wall exclusion, Colony.step coupling, Turing pattern smoke test
-pytest tests/test_colony.py      # Colony bounds enforcement, wall/cell-cell contact forces, division, dead-cell behavior, field sensing/diffusion/export
+pytest tests/test_colony.py      # Colony bounds, wall/cell-cell contact forces (rods, spheres, mixed), Brownian motion, division, dead cells, field uptake/sensing/export, survival and lysis
 pytest tests/test_simulation.py  # Simulation loop and DataFrame export
 pytest tests/test_visualization.py # visualize_colony/visualize_field/plot_field: animation output, GIF/MP4 export, stride, static plots
 pytest tests/test_parallel.py    # run_replicates: parallel execution, independence, correctness
