@@ -55,6 +55,7 @@ class Simulation:
                 "time": self.time,
                 "cell_id": cell.id,
                 "alive": cell.alive,
+                "anchored": cell.anchored,
                 "position_x": cell.position[0],
                 "position_y": cell.position[1],
                 "orientation_x": cell.orientation[0],

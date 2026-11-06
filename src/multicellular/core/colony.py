@@ -94,9 +94,49 @@ def _segment_point_closest(a1x, a1y, b1x, b1y, px, py):
     return qx, qy, math.hypot(qx - px, qy - py)
 
 
+def _pair_contact(ci, cj, ep_i, ep_j, k):
+    """
+    Hookean contact between cells ci and cj, given their `_axis_endpoints`
+    tuples. Returns None if they don't overlap, else (Fx, Fy, pcx, pcy):
+    the force on ci (cj feels its negative) and the contact point.
+    """
+    a1x, a1y, b1x, b1y, cix, ciy = ep_i
+    a2x, a2y, b2x, b2y, cjx, cjy = ep_j
+    p1x, p1y, p2x, p2y, d = _segment_segment_closest(
+        a1x, a1y, b1x, b1y, a2x, a2y, b2x, b2y
+    )
+    delta = ci.radius + cj.radius - d
+    if delta <= 0.0:
+        return None
+
+    # Contact normal: unit vector from j toward i. When axes coincide
+    # (d≈0), fall back to center-to-center direction, then to ci's
+    # perpendicular if centers also coincide.
+    if d > 1e-12:
+        Nx, Ny = (p1x - p2x) / d, (p1y - p2y) / d
+    else:
+        sepx, sepy = cix - cjx, ciy - cjy
+        sep_norm = math.hypot(sepx, sepy)
+        if sep_norm > 1e-12:
+            Nx, Ny = sepx / sep_norm, sepy / sep_norm
+        else:
+            Nx, Ny = -float(ci.orientation[1]), float(ci.orientation[0])
+
+    return k * delta * Nx, k * delta * Ny, (p1x + p2x) / 2.0, (p1y + p2y) / 2.0
+
+
 class Colony:
     """
     A collection of Cells living within an Environment.
+
+    Anchored cells (`Cell(anchored=True)`) are fixed obstacles: they take
+    part in chemistry (reactions, Field exchange, survival conditions,
+    lysis) like any other cell, but are never moved by Brownian motion,
+    contact forces, or walls. A mobile cell overlapping an anchored one
+    receives the full Hookean contact force; overlapping anchored cells
+    ignore each other, so tissue cells may be packed freely. Like every
+    cell, an anchored cell exchanges mass only with the Field voxel
+    containing its center, even if its body spans several voxels.
     """
 
     def __init__(
@@ -185,7 +225,7 @@ class Colony:
         living = [
             cell
             for cell in self.cells
-            if cell.alive and cell.growth_rate_law is not None
+            if cell.alive and not cell.anchored and cell.growth_rate_law is not None
         ]
         if not living:
             return
@@ -220,8 +260,9 @@ class Colony:
         self.enforce_survival_conditions()
         alive = self.living_cells
         if self.brownian_motion:
-            noise = self._draw_brownian_noise(alive)
-            self._apply_brownian_motion(dt, alive, noise)
+            mobile = [cell for cell in alive if not cell.anchored]
+            noise = self._draw_brownian_noise(mobile)
+            self._apply_brownian_motion(dt, mobile, noise)
         self._apply_contact_forces(dt, alive)
         self.handle_divisions()
 
@@ -445,7 +486,7 @@ class Colony:
             cell.position[1] += dr_y[idx]
             cell.apply_torque(omega[idx], dt)
 
-    def _build_spatial_grid(self, alive):
+    def _build_spatial_grid(self, alive, return_bin_size=False):
         """
         Bin cells by center position into a uniform grid for neighbor search.
 
@@ -467,7 +508,7 @@ class Colony:
             gx = int(cell.position[0] // cell_size)
             gy = int(cell.position[1] // cell_size)
             grid.setdefault((gx, gy), []).append(idx)
-        return grid
+        return (grid, cell_size) if return_bin_size else grid
 
     def _apply_contact_forces(self, dt, alive=None):
         """
@@ -488,35 +529,38 @@ class Colony:
         contacts. Its contact torque is identically zero, so it uses
         ζ_t = 3 * drag * radius and is never rotated here.
 
-        Candidate cell-cell pairs are restricted to cells sharing a grid bin
-        or an adjacent one (see _build_spatial_grid), which avoids the O(n²)
-        blowup of testing every pair directly while still finding every
-        contact.
+        Anchored cells never move: only the mobile cell of a mobile-anchored
+        pair is pushed (by the full force), anchored-anchored pairs are
+        skipped, and anchored cells feel no wall forces.
+
+        Candidate mobile-mobile pairs are restricted to cells sharing a grid
+        bin or an adjacent one (see _build_spatial_grid), which avoids the
+        O(n²) blowup of testing every pair directly while still finding every
+        contact. Anchored cells are kept out of that grid, since a single
+        large one (e.g. a eukaryotic host cell) would otherwise inflate every
+        bin; each instead scans the mobile-cell bins overlapping its own
+        reach.
 
         Per-pair math uses plain floats rather than small numpy arrays/dot
         products, since this loop runs for every candidate pair, every step.
         """
         if alive is None:
             alive = self.living_cells
-        n = len(alive)
+        mobile = [cell for cell in alive if not cell.anchored]
+        n = len(mobile)
         if n == 0:
             return
+        anchored = [cell for cell in alive if cell.anchored] if n < len(alive) else []
 
         forces_x = [0.0] * n
         forces_y = [0.0] * n
         torques = [0.0] * n
 
-        endpoints = []
-        for ci in alive:
-            px, py = float(ci.position[0]), float(ci.position[1])
-            ox, oy = float(ci.orientation[0]), float(ci.orientation[1])
-            hl = ci.length / 2.0
-            endpoints.append(
-                (px - hl * ox, py - hl * oy, px + hl * ox, py + hl * oy, px, py)
-            )
+        endpoints = [self._axis_endpoints(ci) for ci in mobile]
 
-        if n >= 2:
-            grid = self._build_spatial_grid(alive)
+        if n >= 2 or anchored:
+            grid, bin_size = self._build_spatial_grid(mobile, return_bin_size=True)
+            k = self.k
 
             for (gx, gy), home_indices in grid.items():
                 neighbor_indices = []
@@ -525,16 +569,18 @@ class Colony:
                         neighbor_indices.extend(grid.get((gx + dx, gy + dy), ()))
 
                 for i in home_indices:
-                    ci = alive[i]
+                    ci = mobile[i]
                     a1x, a1y, b1x, b1y, cix, ciy = endpoints[i]
 
                     for j in neighbor_indices:
                         if j <= i:
                             continue
 
-                        cj = alive[j]
+                        cj = mobile[j]
                         a2x, a2y, b2x, b2y, cjx, cjy = endpoints[j]
 
+                        # Inlined rather than calling `_pair_contact`: this
+                        # is the hot loop, and the extra call costs ~20%.
                         p1x, p1y, p2x, p2y, d = _segment_segment_closest(
                             a1x, a1y, b1x, b1y, a2x, a2y, b2x, b2y
                         )
@@ -558,7 +604,7 @@ class Colony:
                                     ci.orientation[0]
                                 )
 
-                        Fx, Fy = self.k * delta * Nx, self.k * delta * Ny
+                        Fx, Fy = k * delta * Nx, k * delta * Ny
                         pcx, pcy = (p1x + p2x) / 2.0, (p1y + p2y) / 2.0
 
                         # 2D torque: τ = r_x * F_y - r_y * F_x
@@ -572,9 +618,34 @@ class Colony:
                         torques[i] += rix * Fy - riy * Fx
                         torques[j] -= rjx * Fy - rjy * Fx  # F_ji = -F
 
-        self._apply_wall_forces(alive, endpoints, forces_x, forces_y, torques)
+            # Each anchored cell against the mobile cells within its reach.
+            max_mobile_half_extent = max(c.length / 2.0 + c.radius for c in mobile)
+            for ca in anchored:
+                ep_a = self._axis_endpoints(ca)
+                reach = ca.length / 2.0 + ca.radius + max_mobile_half_extent
+                px, py = ep_a[4], ep_a[5]
+                gx0 = int((px - reach) // bin_size)
+                gx1 = int((px + reach) // bin_size)
+                gy0 = int((py - reach) // bin_size)
+                gy1 = int((py + reach) // bin_size)
+                for gx in range(gx0, gx1 + 1):
+                    for gy in range(gy0, gy1 + 1):
+                        for j in grid.get((gx, gy), ()):
+                            contact = _pair_contact(
+                                ca, mobile[j], ep_a, endpoints[j], k
+                            )
+                            if contact is None:
+                                continue
+                            Fx, Fy, pcx, pcy = contact
+                            forces_x[j] -= Fx
+                            forces_y[j] -= Fy
+                            torques[j] -= (pcx - endpoints[j][4]) * Fy - (
+                                pcy - endpoints[j][5]
+                            ) * Fx
 
-        for i, cell in enumerate(alive):
+        self._apply_wall_forces(mobile, endpoints, forces_x, forces_y, torques)
+
+        for i, cell in enumerate(mobile):
             if cell.shape == "sphere":
                 zeta_t = 3.0 * self.drag * cell.radius
                 cell.position[0] += forces_x[i] / zeta_t * dt
@@ -585,6 +656,14 @@ class Colony:
             cell.position[0] += forces_x[i] / zeta_t * dt
             cell.position[1] += forces_y[i] / zeta_t * dt
             cell.apply_torque(torques[i] / zeta_r, dt)
+
+    @staticmethod
+    def _axis_endpoints(cell):
+        """(a_x, a_y, b_x, b_y, c_x, c_y): a cell's axis segment endpoints and center, as floats."""
+        px, py = float(cell.position[0]), float(cell.position[1])
+        ox, oy = float(cell.orientation[0]), float(cell.orientation[1])
+        hl = cell.length / 2.0
+        return (px - hl * ox, py - hl * oy, px + hl * ox, py + hl * oy, px, py)
 
     def _apply_wall_forces(self, alive, endpoints, forces_x, forces_y, torques):
         """

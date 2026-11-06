@@ -2,6 +2,8 @@
 
 import numpy as np
 
+from .reactions import RateLawNotVectorizedError
+
 # Diffusivity of water at 37°C in m²/s (physiological temperature).
 WATER_DIFFUSIVITY_37C = 3.0e-9  # m²/s
 WATER_VISCOSITY_37C = 6.9e-4  # Pa·s
@@ -275,9 +277,19 @@ class Environment:
         advanced via `ReactionNetwork.simulate_step`, using this
         environment's `grid_cell_volume` as the per-voxel volume so SSA's
         internal concentration<->copy-number conversion is on the same
-        physical basis as a Cell's. `simulate_step` only accepts scalar
-        (not array-valued) concentration state, so voxels are stepped in a
-        plain Python loop rather than batched.
+        physical basis as a Cell's.
+
+        With `method="ODE"`, every voxel is integrated in one batched
+        `ReactionNetwork.simulate_ode_batch` call, which is much faster
+        than a `solve_ivp` call per voxel. If a rate law can't take arrays
+        (a scalar-only `custom` rate law), voxels are instead stepped one at
+        a time, as SSA and CLE always are.
+
+        This is operator splitting: `Colony.step` diffuses every field over
+        `dt`, then reacts over `dt`. Splitting error grows with `dt` relative
+        to the reaction and diffusion time scales, so pattern-forming
+        systems need a `dt` well below their fastest reaction time scale
+        (see the Turing example in examples/feature_tour.ipynb).
 
         Wall (wall_map == 1) cells are excluded, like `diffuse`: there's no
         medium there for a reaction to occur in. Out-of-bounds (-1) cells
@@ -306,6 +318,22 @@ class Environment:
 
         volume = self.grid_cell_volume
         is_wall = self.wall_map == 1
+
+        if str(method).upper() == "ODE":
+            medium = ~is_wall
+            try:
+                new_values = network.simulate_ode_batch(
+                    {s: self.fields[s].values[medium] for s in species_list},
+                    dt,
+                    ode_method,
+                )
+            except RateLawNotVectorizedError:
+                pass
+            else:
+                for s, arr in new_values.items():
+                    self.fields[s].values[medium] = arr
+                return
+
         n_rows, n_cols = self.shape
         values = {s: self.fields[s].values for s in species_list}
 

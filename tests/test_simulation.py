@@ -243,3 +243,24 @@ def test_simulation_records_extracellular_field_species_as_columns():
     # Recorded value is the local (depleting) field value.
     assert df["A"].iloc[-1] == pytest.approx(field.values[5, 5])
     assert df["A"].iloc[-1] < 2.0
+
+
+def test_simulation_records_anchored_column():
+    env = Environment("open", wall_map=np.zeros((5, 5)), size=(20.0, 20.0))
+    host = Cell(
+        id=0,
+        position=[10.0, 10.0],
+        orientation=[1.0, 0.0],
+        shape="sphere",
+        radius=3.0,
+        anchored=True,
+    )
+    bug = Cell(id=1, position=[2.0, 2.0], orientation=[1.0, 0.0])
+    sim = Simulation(Colony([host, bug], env), dt=0.1, t_max=0.2)
+    df = sim.run(show_progress=False)
+    by_id = df.groupby("cell_id")["anchored"].unique()
+    assert list(by_id[0]) == [True]
+    assert list(by_id[1]) == [False]
+    host_rows = df[df["cell_id"] == 0]
+    assert (host_rows["position_x"] == 10.0).all()
+    assert (host_rows["radius"] == 3.0).all()

@@ -1136,3 +1136,228 @@ def test_mixed_colony_steps_and_divides():
         assert np.all(np.isfinite(c.position))
         if c.shape == "sphere":
             assert c.length == 0.0
+
+
+# --- Anchored cells ---
+
+
+def _make_anchored(position, radius=5.0, **kwargs):
+    return Cell(
+        id=None,
+        position=position,
+        orientation=[1.0, 0.0],
+        radius=radius,
+        shape="sphere",
+        anchored=True,
+        **kwargs,
+    )
+
+
+def test_anchored_cell_does_not_move_under_brownian_motion():
+    host = _make_anchored([50.0, 50.0], radius=0.5)
+    colony = Colony([host], _open_env())
+    for _ in range(20):
+        colony.step(0.1)
+    assert host.position == pytest.approx([50.0, 50.0])
+    assert host.orientation == pytest.approx([1.0, 0.0])
+
+
+def test_mobile_cell_is_pushed_out_of_anchored_cell_with_full_force():
+    host = _make_anchored([50.0, 50.0], radius=5.0)
+    bug = _make_sphere([55.3, 50.0])  # overlap δ = 5.5 - 5.3 = 0.2
+    colony = Colony([host, bug], _open_env(), k=10.0, drag=1.0)
+
+    dt = 0.01
+    colony._apply_contact_forces(dt)
+
+    # Full force F = k δ = 2 on the bug; ζ_t = 3 * drag * r = 1.5.
+    assert bug.position == pytest.approx([55.3 + 2.0 / 1.5 * dt, 50.0])
+    assert host.position == pytest.approx([50.0, 50.0])
+
+    for _ in range(2000):
+        colony._apply_contact_forces(dt)
+    assert bug.position[0] == pytest.approx(55.5, abs=1e-3)
+    assert host.position == pytest.approx([50.0, 50.0])
+
+
+def test_rod_is_pushed_and_rotated_by_anchored_cell():
+    host = _make_anchored([50.0, 50.0], radius=5.0)
+    # Rod lying tangent-ish across the host's edge, off-center: should be
+    # pushed out and torqued.
+    rod = Cell(
+        id=None,
+        position=[50.5, 55.3],
+        orientation=[1.0, 0.0],
+        length=2.0,
+        radius=0.5,
+        growth_rate=0.0,
+    )
+    colony = Colony([host, rod], _open_env(), k=10.0)
+    for _ in range(500):
+        colony._apply_contact_forces(0.01)
+    assert host.position == pytest.approx([50.0, 50.0])
+    from multicellular.core.colony import _segment_point_closest
+
+    a1x, a1y, b1x, b1y, _, _ = Colony._axis_endpoints(rod)
+    _, _, d = _segment_point_closest(a1x, a1y, b1x, b1y, 50.0, 50.0)
+    assert rod.orientation != pytest.approx([1.0, 0.0])  # it was torqued
+    assert d == pytest.approx(5.5, abs=1e-2)
+
+
+def test_overlapping_anchored_cells_ignore_each_other():
+    a = _make_anchored([50.0, 50.0])
+    b = _make_anchored([52.0, 50.0])
+    colony = Colony([a, b], _open_env())
+    colony._apply_contact_forces(0.01)
+    assert a.position == pytest.approx([50.0, 50.0])
+    assert b.position == pytest.approx([52.0, 50.0])
+
+
+def test_anchored_cell_feels_no_wall_force():
+    env = _wall_block_env()
+    host = _make_anchored([40.0, 50.0], radius=2.0)  # straddles the wall face
+    colony = Colony([host], env)
+    colony._apply_contact_forces(0.01)
+    assert host.position == pytest.approx([40.0, 50.0])
+
+
+def test_anchored_cell_does_not_grow_or_divide_in_colony_step():
+    host = _make_anchored([50.0, 50.0], radius=1.0, growth_rate=5.0)
+    host._division_target = 0.0
+    colony = Colony([host], _open_env(), brownian_motion=False)
+    for _ in range(10):
+        colony.step(0.1)
+    assert colony.cells == [host]
+    assert host.radius == 1.0
+
+
+def test_growth_rate_law_is_not_applied_to_anchored_cells():
+    host = _make_anchored(
+        [50.0, 50.0], growth_rate=0.0, growth_rate_law=lambda c, e: 99.0
+    )
+    colony = Colony([host], _open_env(), brownian_motion=False)
+    colony.step(0.1)
+    assert host.growth_rate == 0.0
+
+
+@pytest.mark.parametrize("method", ["ODE", "SSA"])
+def test_anchored_cell_exchanges_mass_with_field(method):
+    field = Field("A", np.full((10, 10), 2.0), is_chemical=True)
+    env = Environment(
+        "env",
+        wall_map=np.zeros((10, 10)),
+        size=(50.0, 50.0),
+        depth=2.0,
+        fields=[field],
+        rng=np.random.default_rng(0),
+    )
+    host = _make_uptake_cell(
+        [25.0, 25.0], k=5.0, rng=np.random.default_rng(1), anchored=True
+    )
+    initial = _total_copies(env, [host], "A", "A_int")
+    colony = Colony([host], env)
+    for _ in range(10):
+        colony.step(dt=0.1, method=method)
+    assert host.concentrations["A_int"] > 0.0
+    assert host.position == pytest.approx([25.0, 25.0])
+    assert _total_copies(env, [host], "A", "A_int") == pytest.approx(initial, rel=1e-9)
+
+
+def test_anchored_cell_dies_by_survival_condition_and_lyses():
+    field = Field("X_field", np.zeros((10, 10)))
+    env = Environment(
+        "env",
+        wall_map=np.zeros((10, 10)),
+        size=(50.0, 50.0),
+        depth=2.0,
+        fields=[field],
+    )
+    host = _make_anchored([25.0, 25.0], radius=1.0, lysis_targets={"X": "X_field"})
+    host.set_concentration("X", 2.0)
+    expected = host.copy_number("X")
+    colony = Colony([host], env, survival_conditions=[("A", ">", 0)])
+    colony.enforce_survival_conditions()
+    assert not host.alive
+    assert field.values[5, 5] == pytest.approx(expected / 50.0)
+
+
+def _brute_force_contact_step(cells, k, drag, dt):
+    """Reference: every pair tested directly, anchored cells immovable."""
+    from multicellular.core.colony import _pair_contact
+
+    eps = [Colony._axis_endpoints(c) for c in cells]
+    n = len(cells)
+    F = np.zeros((n, 2))
+    T = np.zeros(n)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if cells[i].anchored and cells[j].anchored:
+                continue
+            contact = _pair_contact(cells[i], cells[j], eps[i], eps[j], k)
+            if contact is None:
+                continue
+            Fx, Fy, pcx, pcy = contact
+            F[i] += (Fx, Fy)
+            F[j] -= (Fx, Fy)
+            T[i] += (pcx - eps[i][4]) * Fy - (pcy - eps[i][5]) * Fx
+            T[j] -= (pcx - eps[j][4]) * Fy - (pcy - eps[j][5]) * Fx
+    expected = []
+    for c, f, t in zip(cells, F, T):
+        if c.anchored:
+            expected.append((c.position.copy(), c.orientation.copy()))
+            continue
+        if c.shape == "sphere":
+            pos = c.position + f / (3.0 * drag * c.radius) * dt
+            expected.append((pos, c.orientation.copy()))
+            continue
+        pos = c.position + f / (drag * c.length) * dt
+        probe = copy.deepcopy(c)
+        probe.apply_torque(t / ((drag / 12.0) * c.length**3), dt)
+        expected.append((pos, probe.orientation.copy()))
+    return expected
+
+
+def test_large_anchored_cells_do_not_hide_small_cell_contacts():
+    rng = np.random.default_rng(3)
+    hosts = [_make_anchored([x, 50.0], radius=6.0) for x in (30.0, 45.0, 60.0)]
+    bugs = [
+        Cell(
+            id=None,
+            position=rng.uniform([20.0, 38.0], [70.0, 62.0]),
+            orientation=rng.normal(size=2),
+            length=2.0,
+            radius=0.5,
+            growth_rate=0.0,
+        )
+        for _ in range(150)
+    ]
+    cells = hosts + bugs
+    starts = [c.position.copy() for c in bugs]
+    expected = _brute_force_contact_step(cells, k=10.0, drag=1.0, dt=0.01)
+    Colony(cells, _open_env(), k=10.0, drag=1.0)._apply_contact_forces(0.01)
+    for c, (pos, ori) in zip(cells, expected):
+        assert c.position == pytest.approx(pos, abs=1e-12)
+        assert c.orientation == pytest.approx(ori, abs=1e-12)
+    # Sanity: the setup really does put bugs in contact with hosts.
+    assert any(np.linalg.norm(c.position - start) > 0 for c, start in zip(bugs, starts))
+
+
+def test_adding_anchored_cell_leaves_mobile_brownian_stream_unchanged():
+    def run(with_host):
+        bug = Cell(id=0, position=[20.0, 20.0], orientation=[1.0, 0.0], growth_rate=0.0)
+        cells = [bug]
+        if with_host:
+            cells.insert(0, _make_anchored([80.0, 80.0]))
+        # Shared after construction (which itself draws a division target),
+        # so only draws made while stepping can differ between the runs.
+        rng = np.random.default_rng(7)
+        for c in cells:
+            c.rng = rng
+        colony = Colony(cells, _open_env())
+        for _ in range(5):
+            colony.step(0.1)
+        return bug.position.copy(), bug.orientation.copy()
+
+    (p0, o0), (p1, o1) = run(False), run(True)
+    assert p1 == pytest.approx(p0, abs=0)
+    assert o1 == pytest.approx(o0, abs=0)

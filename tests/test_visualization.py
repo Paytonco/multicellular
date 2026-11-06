@@ -297,3 +297,39 @@ def test_uncolored_cell_renders_mid_gray():
     rgb = _render_first_frame(_single_cell_sim())
     assert _count(rgb, (77, 77, 77)) > 100  # 0.3 * 255 ≈ 77
     assert _count(rgb, (255, 0, 0)) == 0
+
+
+def _host_and_bug_sim():
+    env = Environment("open", wall_map=np.zeros((5, 5)), size=(20.0, 20.0))
+    host = Cell(
+        id=0,
+        position=[10.0, 10.0],
+        orientation=[1.0, 0.0],
+        shape="sphere",
+        radius=4.0,
+        anchored=True,
+    )
+    bug = Cell(id=1, position=[3.0, 3.0], orientation=[1.0, 0.0], growth_rate=0.0)
+    sim = Simulation(Colony([host, bug], env, brownian_motion=False), dt=0.1, t_max=0.1)
+    sim.run(show_progress=False)
+    return sim
+
+
+def test_anchored_cells_render_with_heavier_blue_outline():
+    sim = _host_and_bug_sim()
+    rgb = _render_first_frame(sim)
+    df = sim.to_dataframe()
+    legacy = sim.to_dataframe().drop(columns="anchored")
+    sim.to_dataframe = lambda: legacy
+    rgb_legacy = _render_first_frame(sim)
+    sim.to_dataframe = lambda: df
+    # Same fills either way; only the anchored host's outline differs, and
+    # it is drawn in slate blue.
+    assert not np.array_equal(rgb, rgb_legacy)
+    assert _count(rgb, (51, 89, 191), tol=12) > 50
+    assert _count(rgb_legacy, (51, 89, 191), tol=12) == 0
+
+
+def test_visualize_colony_with_anchored_cells_returns_animation():
+    anim = _host_and_bug_sim().visualize_colony(show_progress=False)
+    assert isinstance(anim, FuncAnimation)

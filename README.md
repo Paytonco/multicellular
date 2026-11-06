@@ -15,6 +15,8 @@ tested:
   concentrations as volume increases), division, and internal reaction
   networks, as rods (bacilli) or spheres (cocci), which can be mixed in one
   colony
+- Anchored (fixed) cells that keep their chemistry but never grow, divide, or
+  move, e.g. eukaryotic host cells in a tissue colonized by bacteria
 - Chemical reaction networks (mass-action, Michaelis-Menten, Hill-Langmuir,
   custom rate laws), simulated via ODE (`scipy.integrate.solve_ivp`, with
   explicit or stiff solvers), the chemical Langevin equation (CLE), or
@@ -119,6 +121,7 @@ The growth and division constructor arguments are:
 | `rng` | fresh `default_rng()` | `np.random.Generator` behind all of this cell's randomness: division, Brownian motion, and SSA/CLE chemistry. Daughters share it. |
 | `shape` | `"rod"` | `"rod"` or `"sphere"`; see [Spherical cells](#spherical-cells). |
 | `lysis_targets` | `None` | See [Lysis-based delivery](#lysis-based-delivery). |
+| `anchored` | `False` | Fix the cell in place; see [Anchored cells](#anchored-cells). |
 
 `cell.step(dt)` runs the cell's reaction network (if it has one) and then
 calls `grow(dt)`. `cell.to_dict()` returns a snapshot of the cell's state.
@@ -127,9 +130,10 @@ calls `grow(dt)`. `cell.to_dict()` returns a snapshot of the cell's state.
 
 - `cell.apply_force(velocity, dt)` — translates the cell by `velocity * dt`.
   Treats the argument as a velocity (effective force / drag), consistent with
-  the overdamped regime. No-op if the cell is dead.
+  the overdamped regime. No-op if the cell is dead or anchored.
 - `cell.apply_torque(omega, dt)` — rotates the orientation unit vector by
-  `omega * dt` radians via a 2D rotation matrix. No-op if the cell is dead.
+  `omega * dt` radians via a 2D rotation matrix. No-op if the cell is dead or
+  anchored.
 
 Both are also called internally by `Colony` when applying Brownian motion and
 contact forces.
@@ -161,6 +165,45 @@ and rods and spheres can be mixed in one colony. What differs:
 
 See section 14 of `examples/feature_tour.ipynb` for a worked example: a
 single coccus growing and dividing, and a mixed rod/coccus colony.
+
+#### Anchored cells
+
+Pass `anchored=True` for a cell that is fixed in place, such as a eukaryotic
+cell in a tissue being colonized by bacteria:
+
+```python
+host = Cell(id=0, position=[10.0, 6.0], orientation=[1.0, 0.0],
+            radius=6.0, shape="sphere", anchored=True, network=host_network)
+```
+
+An anchored cell's body is frozen, but its biology is not:
+
+- **Frozen**: it never grows (`step` only advances `age`, so its size and
+  concentrations are not diluted), never divides, and never moves. `Colony`
+  gives it no Brownian motion, no contact or wall forces, and does not call its
+  `growth_rate_law`.
+- **Still active**: its reaction network runs every step, it exchanges mass
+  with chemical `Field`s (sensing, uptake, secretion) like any other cell, and
+  it can die from a survival condition and deliver its `lysis_targets`.
+- **Contacts**: a mobile cell overlapping an anchored cell receives the full
+  Hookean contact force `k·δ` (and the matching torque), so an anchored cell
+  behaves like a stiff cell that cannot move. Overlapping anchored cells
+  ignore each other, so tissue cells can be packed or overlap freely.
+  Anchored cells are kept out of the neighbor-search grid, so a few large
+  host cells don't slow contact detection for a colony of small bacteria.
+- **Chemistry is coupled at one voxel**: like every cell, an anchored cell
+  exchanges mass only with the `Field` voxel containing its center, even if
+  its body covers several voxels.
+
+`anchored` is a plain attribute, so a cell can be pinned or released partway
+through a simulation (`cell.anchored = False` resumes growth from its current
+size). Daughters of a released cell are mobile. `Simulation` records an
+`anchored` column, and `visualize_colony` draws anchored cells with a heavier
+slate-blue outline.
+
+See section 18 of `examples/feature_tour.ipynb` for a worked example: bacteria
+colonizing a row of anchored host cells, killing the nearest hosts through a
+secreted AHL signal.
 
 ### `Reaction` and `ReactionNetwork`
 
@@ -666,7 +709,10 @@ its `Field`s to each other, giving `∂C/∂t = D∇²C + R(C)` at every grid ce
 machinery `Cell.step` uses internally (`"ODE"`, `"SSA"`, or `"CLE"`) — the
 only new code is stepping it independently at every non-wall voxel, with
 each species' value read from and written back to the matching-named
-`Field`:
+`Field`. With `"ODE"`, every voxel is integrated in one batched `solve_ivp`
+call (`ReactionNetwork.simulate_ode_batch`), which is much faster than one
+call per voxel. A `custom` rate law that only accepts scalars makes `react()`
+fall back to stepping voxels one at a time, as `"SSA"` and `"CLE"` always do.
 
 ```python
 import numpy as np
@@ -700,7 +746,14 @@ volume) rather than a cell's. No separate conversion logic is needed.
 `Colony.step(dt, method, ode_method)` calls `environment.react(dt, method, ode_method)` right after
 `environment.diffuse(dt)` (see [`Colony`](#colony) below), so reaction-diffusion
 runs every step even with an empty `Colony` (no cells at all) — see
-`examples/feature_tour.ipynb`'s Gray-Scott Turing pattern demo.
+`examples/feature_tour.ipynb`'s Turing pattern demo (section 9).
+
+Each step diffuses every field over `dt` and then reacts over `dt`
+(operator splitting), and the splitting error grows with `dt`. Pattern-forming
+systems need `dt` well below their fastest reaction time scale. For example,
+the Schnakenberg demo, whose kinetics run on a time scale of about 1, matches
+a fully coupled solution at `dt = 0.02`, but at `dt = 0.5` it forms a
+different, lower-amplitude pattern.
 
 #### Walls and out-of-bounds (`wall_map`)
 
@@ -1173,7 +1226,7 @@ df = sim.run()  # pandas DataFrame, one row per cell per recorded timestep
 `colony.step(dt, sim.simulation_method, sim.ode_method)` and records the new state of every
 cell remaining in the colony — including any new daughter cells produced by
 division — until `t_max` is reached. The
-returned DataFrame has columns `time`, `cell_id`, `alive`, `position_x`,
+returned DataFrame has columns `time`, `cell_id`, `alive`, `anchored`, `position_x`,
 `position_y`, `orientation_x`, `orientation_y`, `length`, `radius`, `shape`
 (`"rod"` or `"sphere"`), plus one
 column per chemical species seen in any cell's `concentrations` or
@@ -1470,7 +1523,7 @@ are saved in `examples/outputs/`.
 
 | Notebook | Shows |
 |---|---|
-| `feature_tour.ipynb` | A short, self-contained demo of every major feature, including spherical cells (section 14) |
+| `feature_tour.ipynb` | A short, self-contained demo of every major feature, including spherical cells (section 14) and anchored host cells (section 18) |
 | `repressilator_demo.ipynb` | Elowitz–Leibler three-gene oscillator |
 | `toggle_switch_demo.ipynb` | Gardner–Cantor–Collins bistable toggle: switching and memory |
 | `dupOri_cutter.ipynb` | Two incompatible plasmids with mutual nucleases: bistability via low-copy partitioning |

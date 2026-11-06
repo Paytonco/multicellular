@@ -40,6 +40,7 @@ class Cell:
         cv_f=0.0,
         lysis_targets=None,
         shape="rod",
+        anchored=False,
     ):
         """
         Args:
@@ -77,6 +78,15 @@ class Cell:
                 after a chemical Field is that Field's extracellular species
                 (see `step`'s `external`), so the cell holds no intracellular
                 copies of it to deliver.
+            anchored: if True, the cell is fixed in place: it does not grow,
+                divide, or move (no Brownian motion, and contact/wall forces
+                never displace or rotate it), e.g. a eukaryotic host cell in
+                a tissue. Its reaction network still runs, it still
+                exchanges mass with chemical Fields, and it can still die by
+                a survival condition (and lyse). Mobile cells that overlap it
+                are pushed away by the full contact force. A plain
+                attribute: set `cell.anchored` to pin or release a cell
+                partway through a simulation.
         """
         if shape not in SHAPES:
             raise ValueError(f"shape must be one of {SHAPES}, got {shape!r}.")
@@ -98,6 +108,7 @@ class Cell:
             )
         self.id = id
         self.shape = shape
+        self.anchored = bool(anchored)
         self.position = np.array(position, dtype=float)
         self.orientation = self._normalize(np.array(orientation, dtype=float))
         self.length = length
@@ -192,7 +203,13 @@ class Cell:
         then divided by the post-growth volume to get diluted
         concentrations. Reactions (run separately, in `step`) are the only
         thing that changes copy number.
+
+        An anchored cell only ages: its size, and therefore its
+        concentrations, stay fixed.
         """
+        if self.anchored:
+            self.age += dt
+            return
         copy_numbers = {s: self.copy_number(s) for s in self.concentrations}
         if self.shape == "sphere":
             # Volume ∝ r³, so r grows at λ/3 for volume to grow at λ.
@@ -261,7 +278,9 @@ class Cell:
         return updated_external
 
     def ready_to_divide(self):
-        """Return True if the cell has reached its sampled division target."""
+        """Return True if the cell has reached its sampled division target. Anchored cells never divide."""
+        if self.anchored:
+            return False
         return self._size() >= self._division_target
 
     def _partition_copies(self, n):
@@ -375,14 +394,14 @@ class Cell:
         return daughter1, daughter2
 
     def apply_force(self, force_vector, dt):
-        """Move the cell based on external forces. No-op if dead."""
-        if not self.alive:
+        """Move the cell based on external forces. No-op if dead or anchored."""
+        if not self.alive or self.anchored:
             return
         self.position += force_vector * dt
 
     def apply_torque(self, omega, dt):
-        """Rotate the cell by omega * dt radians. No-op if dead."""
-        if not self.alive:
+        """Rotate the cell by omega * dt radians. No-op if dead or anchored."""
+        if not self.alive or self.anchored:
             return
         angle = omega * dt
         cos_a, sin_a = math.cos(angle), math.sin(angle)
@@ -420,6 +439,7 @@ class Cell:
             "species": self.species,
             "age": self.age,
             "alive": self.alive,
+            "anchored": self.anchored,
             "concentrations": self.concentrations.copy(),
             "extracellular": self.extracellular.copy(),
         }

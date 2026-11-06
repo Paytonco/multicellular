@@ -5,7 +5,11 @@ import pytest
 
 from multicellular.core.colony import Colony
 from multicellular.core.environment import Environment, Field
-from multicellular.core.reactions import Reaction, ReactionNetwork
+from multicellular.core.reactions import (
+    RateLawNotVectorizedError,
+    Reaction,
+    ReactionNetwork,
+)
 
 
 def _decay_network(k=0.2):
@@ -40,27 +44,23 @@ def _isomerization_network(k_fwd=0.5, k_rev=0.3):
     )
 
 
-def _gray_scott_network(F=0.035, k=0.065):
+def _schnakenberg_network(a=0.1, b=0.9):
     """
-    Classic Gray-Scott reaction-diffusion system, decomposed into
-    elementary mass-action reactions:
-        U + 2V -> 3V        (autocatalysis: du/dt -= u*v^2, dv/dt += u*v^2)
-        (feed)  -> U         (du/dt += F)
-        U ->  (removal)      (du/dt -= F*u), combining with feed to F*(1-u)
-        V ->  (kill)         (dv/dt -= (F+k)*v)
+    Schnakenberg activator-substrate system as elementary mass-action steps:
+        (feed) -> u, u -> (decay)   du/dt += a - u
+        (feed) -> v                 dv/dt += b
+        2u + v -> 3u                du/dt += u^2 v, dv/dt -= u^2 v
     """
     return ReactionNetwork(
-        "gray_scott",
+        "schnakenberg",
         {
-            "autocatalysis": Reaction(
-                reactants={"U": 1, "V": 2},
-                products={"V": 3},
-                rate_params={"k": 1.0},
+            "feed_u": Reaction(reactants={}, products={"u": 1}, rate_params={"k": a}),
+            "decay_u": Reaction(
+                reactants={"u": 1}, products={}, rate_params={"k": 1.0}
             ),
-            "feed_U": Reaction(reactants={}, products={"U": 1}, rate_params={"k": F}),
-            "remove_U": Reaction(reactants={"U": 1}, products={}, rate_params={"k": F}),
-            "kill_V": Reaction(
-                reactants={"V": 1}, products={}, rate_params={"k": F + k}
+            "feed_v": Reaction(reactants={}, products={"v": 1}, rate_params={"k": b}),
+            "autocatalysis": Reaction(
+                reactants={"u": 2, "v": 1}, products={"u": 3}, rate_params={"k": 1.0}
             ),
         },
     )
@@ -213,42 +213,159 @@ def test_colony_step_runs_field_reactions_with_zero_cells():
     assert np.allclose(field.values, 10.0 * np.exp(-0.5), rtol=1e-4)
 
 
-def test_gray_scott_turing_pattern_grows_spatial_variance():
-    # Smoke test for the notebook's Turing-pattern demo: starting from a
-    # small perturbed patch, the classic Gray-Scott instability should
-    # amplify spatial non-uniformity rather than settle back to a flat
-    # field. Deterministic (ODE) and kept small so it runs in ~1 second.
-    n = 16
-    network = _gray_scott_network()
+def _schnakenberg_coupled_reference(u, v, T, a=0.1, b=0.9, Du=1.0, Dv=40.0):
+    """Fully coupled forward-Euler solve (small dt), independent of the library."""
 
-    U = np.ones((n, n))
-    V = np.zeros((n, n))
-    mid = n // 2
-    U[mid - 2 : mid + 2, mid - 2 : mid + 2] = 0.50
-    V[mid - 2 : mid + 2, mid - 2 : mid + 2] = 0.25
+    def lap(C):
+        P = np.pad(C, 1, mode="edge")
+        return P[2:, 1:-1] + P[:-2, 1:-1] + P[1:-1, 2:] + P[1:-1, :-2] - 4 * C
+
+    h = 0.005
+    for _ in range(int(round(T / h))):
+        uuv = u * u * v
+        u, v = u + h * (Du * lap(u) + a - u + uuv), v + h * (Dv * lap(v) + b - uuv)
+    return u
+
+
+def test_schnakenberg_turing_pattern_matches_coupled_reference():
+    # The notebook's Turing demo: from 1% noise around the uniform steady
+    # state, a diffusion-driven instability grows a spot pattern. With a
+    # small enough dt the operator-split library run must match a fully
+    # coupled solve, not just "become non-uniform" (a coarse dt also does
+    # that, but forms a different, lower-amplitude pattern).
+    n, a, b = 16, 0.1, 0.9
     rng = np.random.default_rng(0)
-    U += rng.normal(0, 0.02, size=(n, n))
-    V += rng.normal(0, 0.02, size=(n, n))
+    u0 = (a + b) + rng.normal(0, 0.01, size=(n, n))
+    v0 = b / (a + b) ** 2 + rng.normal(0, 0.01, size=(n, n))
 
-    dt = 2.0
-    dx_m = (float(n) / n) * 1e-6
-    field_u = Field("U", U, diffuses=True, diffusivity=0.16 * dx_m**2)
-    field_v = Field("V", V, diffuses=True, diffusivity=0.08 * dx_m**2)
+    dx_m = 1e-6
+    field_u = Field("u", u0, diffuses=True, diffusivity=1.0 * dx_m**2)
+    field_v = Field("v", v0, diffuses=True, diffusivity=40.0 * dx_m**2)
     env = Environment(
         "env",
         wall_map=np.zeros((n, n)),
         size=(float(n), float(n)),
         fields=[field_u, field_v],
-        reactions=network,
+        reactions=_schnakenberg_network(a, b),
     )
-
-    std_before = env.fields["V"].values.std()
-    for _ in range(300):
+    T, dt = 40.0, 0.02
+    for _ in range(int(round(T / dt))):
         env.diffuse(dt)
         env.react(dt, method="ODE")
 
-    assert np.all(np.isfinite(env.fields["U"].values))
-    assert np.all(np.isfinite(env.fields["V"].values))
-    assert np.all(env.fields["U"].values >= 0.0)
-    assert np.all(env.fields["V"].values >= 0.0)
-    assert env.fields["V"].values.std() > std_before
+    u = env.fields["u"].values
+    reference = _schnakenberg_coupled_reference(u0, v0, T)
+    assert u.max() - u.min() > 3.0  # a strongly patterned field
+    assert np.corrcoef(u.ravel(), reference.ravel())[0, 1] > 0.99
+    assert u.max() == pytest.approx(reference.max(), rel=0.05)
+
+
+def _random_grid_env(network, species, shape=(6, 7), wall_map=None, seed=0):
+    rng = np.random.default_rng(seed)
+    fields = [Field(s, rng.uniform(0.1, 2.0, size=shape)) for s in species]
+    return Environment(
+        "env",
+        wall_map=np.zeros(shape) if wall_map is None else wall_map,
+        size=(float(shape[1]), float(shape[0])),
+        fields=fields,
+        reactions=network,
+    )
+
+
+def _react_voxel_by_voxel(env, dt, ode_method="RK45"):
+    """Reference: the per-voxel simulate_step loop react() used before batching."""
+    network = env.reactions
+    expected = {s: env.fields[s].values.copy() for s in network.species}
+    for i in range(env.shape[0]):
+        for j in range(env.shape[1]):
+            if env.wall_map[i, j] == 1:
+                continue
+            state = {s: float(expected[s][i, j]) for s in network.species}
+            new = network.simulate_step(
+                state, dt, env.grid_cell_volume, "ODE", ode_method=ode_method
+            )
+            for s, value in new.items():
+                expected[s][i, j] = value
+    return expected
+
+
+@pytest.mark.parametrize("ode_method", ["RK45", "BDF", "Radau", "LSODA"])
+def test_batched_ode_react_matches_per_voxel_steps(ode_method):
+    wall_map = np.zeros((6, 7))
+    wall_map[2, 3] = 1
+    env = _random_grid_env(
+        _schnakenberg_network(), ["u", "v"], wall_map=wall_map, seed=1
+    )
+    wall_before = {s: env.fields[s].values[2, 3] for s in ("u", "v")}
+    expected = _react_voxel_by_voxel(env, 0.5, ode_method)
+
+    env.react(0.5, method="ODE", ode_method=ode_method)
+
+    for s in ("u", "v"):
+        np.testing.assert_allclose(env.fields[s].values, expected[s], rtol=1e-4)
+        assert env.fields[s].values[2, 3] == wall_before[s]  # walls untouched
+
+
+def test_batched_ode_react_handles_michaelis_menten_and_hill_rate_laws():
+    network = ReactionNetwork(
+        "mixed",
+        {
+            "mm": Reaction(
+                reactants={"S": 1},
+                products={"P": 1},
+                catalysts=["E"],
+                rate_law_type="michaelis_menten",
+                rate_params={"Vmax": 1.0, "Km": 0.5},
+            ),
+            "hill": Reaction(
+                reactants={},
+                products={"P": 1},
+                catalysts=["E", "S"],
+                rate_law_type="hill_langmuir",
+                rate_params={"alpha": 50.0, "beta": 0.1, "C": 1.0, "n": 2},
+            ),
+        },
+    )
+    env = _random_grid_env(network, ["E", "P", "S"])
+    expected = _react_voxel_by_voxel(env, 1.0)
+    env.react(1.0, method="ODE")
+    for s in ("E", "P", "S"):
+        np.testing.assert_allclose(env.fields[s].values, expected[s], rtol=1e-4)
+
+
+def test_scalar_only_custom_rate_law_falls_back_to_per_voxel_steps():
+    import math
+
+    def scalar_only(reactants, products, catalysts, params):
+        # math.exp and max reject arrays, so this can't be batched.
+        return params["k"] * max(reactants["A"], 0.0) * math.exp(0.0)
+
+    network = ReactionNetwork(
+        "custom",
+        {
+            "decay": Reaction(
+                reactants={"A": 1},
+                products={},
+                rate_law_type="custom",
+                custom_rate_law=scalar_only,
+                rate_params={"k": 0.5},
+            )
+        },
+    )
+    env = _random_grid_env(network, ["A"])
+    with pytest.raises(RateLawNotVectorizedError):
+        network.simulate_ode_batch({"A": env.fields["A"].values.ravel()}, 1.0)
+
+    before = env.fields["A"].values.copy()
+    env.react(1.0, method="ODE")
+    np.testing.assert_allclose(env.fields["A"].values, before * np.exp(-0.5), rtol=1e-4)
+
+
+def test_batched_ode_react_is_a_no_op_on_an_all_wall_grid():
+    env = _random_grid_env(
+        _schnakenberg_network(), ["u", "v"], wall_map=np.ones((6, 7))
+    )
+    before = {s: env.fields[s].values.copy() for s in ("u", "v")}
+    env.react(1.0, method="ODE")
+    for s in ("u", "v"):
+        assert np.array_equal(env.fields[s].values, before[s])

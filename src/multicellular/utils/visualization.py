@@ -29,6 +29,13 @@ _DEFAULT_CHANNEL_VALUE = 0.3
 _FIELD_OVERLAY_ALPHA = 0.45
 _FIELD_OVERLAY_ZORDER = 1.5
 
+# Cell outlines in `_render_frames`: mobile cells get a thin black edge,
+# anchored (fixed) cells a heavier slate-blue one, which stays distinct from
+# any fill color (gray default or species-driven RGB).
+_MOBILE_EDGE_COLOR = (0.0, 0.0, 0.0, 1.0)
+_ANCHORED_EDGE_COLOR = (0.2, 0.35, 0.75, 1.0)
+_ANCHORED_LINEWIDTH = 2.5
+
 # wall_map entry -> RGB, used to paint the environment background: media (0)
 # is left white/uncolored so it doesn't compete with the field overlay, wall
 # (1) is a solid neutral gray, out-of-bounds (-1) is the same red tint as the
@@ -358,6 +365,23 @@ def _render_frames(
         n_points=n_points,
     )
     colors = _cell_colors(alive, red, green, blue, scales)
+    # Anchored cells get a heavier, slate-blue outline so fixed host cells
+    # stand out from the mobile population. Histories recorded before the
+    # `anchored` column existed have none: every cell is mobile.
+    if "anchored" in alive.columns:
+        anchored = alive["anchored"].fillna(False).to_numpy(dtype=bool)
+    else:
+        anchored = np.zeros(len(alive), dtype=bool)
+    any_anchored = bool(anchored.any())
+    if any_anchored:
+        edgecolors = np.where(
+            anchored[:, None],
+            np.array(_ANCHORED_EDGE_COLOR),
+            np.array(_MOBILE_EDGE_COLOR),
+        )
+        linewidths = np.where(
+            anchored, _ANCHORED_LINEWIDTH, plt.rcParams["patch.linewidth"]
+        )
     alive_times = alive["time"].to_numpy(dtype=float)
     frame_starts = np.searchsorted(alive_times, times, side="left")
     frame_stops = np.searchsorted(alive_times, times, side="right")
@@ -405,6 +429,9 @@ def _render_frames(
             start, stop = frame_starts[index], frame_stops[index]
             cells.set_verts(outlines[start:stop])
             cells.set_facecolor(colors[start:stop])
+            if any_anchored:
+                cells.set_edgecolor(edgecolors[start:stop])
+                cells.set_linewidth(linewidths[start:stop])
 
             env = env_by_time.get(t, first_env)
             left_title.set_text(env.name)

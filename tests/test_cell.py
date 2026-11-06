@@ -573,3 +573,94 @@ def test_sphere_adder_mean_birth_volume_converges_to_delta_bar():
 
 def test_to_dict_includes_shape():
     assert _make_sphere().to_dict()["shape"] == "sphere"
+
+
+# --- Anchored cells ---
+
+
+def _decay_network(k=1.0):
+    decay = Reaction({"A": 1}, {}, rate_law_type="mass_action", rate_params={"k": k})
+    return ReactionNetwork("decay", {"decay": decay})
+
+
+def test_anchored_defaults_to_false():
+    cell = Cell(id=1, position=[0.0, 0.0], orientation=[1.0, 0.0])
+    assert cell.anchored is False
+
+
+def test_anchored_cell_does_not_grow_or_dilute_but_ages():
+    cell = Cell(
+        id=1,
+        position=[0.0, 0.0],
+        orientation=[1.0, 0.0],
+        anchored=True,
+        growth_rate=1.0,
+    )
+    cell.set_concentration("B", 3.0)
+    length, radius = cell.length, cell.radius
+    for _ in range(10):
+        cell.step(0.1)
+    assert cell.length == length
+    assert cell.radius == radius
+    assert cell.concentrations["B"] == 3.0
+    assert cell.age == pytest.approx(1.0)
+
+
+def test_anchored_sphere_does_not_grow():
+    cell = Cell(
+        id=1,
+        position=[0.0, 0.0],
+        orientation=[1.0, 0.0],
+        shape="sphere",
+        radius=5.0,
+        anchored=True,
+    )
+    cell.step(1.0)
+    assert cell.radius == 5.0
+
+
+def test_anchored_cell_still_runs_reactions():
+    cell = Cell(
+        id=1,
+        position=[0.0, 0.0],
+        orientation=[1.0, 0.0],
+        network=_decay_network(),
+        anchored=True,
+    )
+    cell.set_concentration("A", 1.0)
+    cell.step(1.0)
+    assert cell.concentrations["A"] == pytest.approx(np.exp(-1.0), rel=1e-3)
+
+
+def test_anchored_cell_never_divides():
+    cell = _make_cell()
+    cell.length = 10.0 * cell._division_target
+    cell.anchored = True
+    assert not cell.ready_to_divide()
+    assert cell.divide() is None
+
+
+def test_released_anchored_cell_resumes_growth():
+    cell = Cell(
+        id=1,
+        position=[0.0, 0.0],
+        orientation=[1.0, 0.0],
+        anchored=True,
+        growth_rate=1.0,
+    )
+    cell.anchored = False
+    cell.grow(1.0)
+    assert cell.length == pytest.approx(2.0 * np.e)
+
+
+def test_anchored_cell_ignores_force_and_torque():
+    cell = Cell(id=1, position=[1.0, 2.0], orientation=[1.0, 0.0], anchored=True)
+    cell.apply_force(np.array([5.0, 5.0]), 1.0)
+    cell.apply_torque(1.0, 1.0)
+    assert cell.position == pytest.approx([1.0, 2.0])
+    assert cell.orientation == pytest.approx([1.0, 0.0])
+
+
+def test_to_dict_includes_anchored():
+    cell = Cell(id=1, position=[0.0, 0.0], orientation=[1.0, 0.0], anchored=True)
+    assert cell.to_dict()["anchored"] is True

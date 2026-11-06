@@ -3,10 +3,32 @@
 from typing import Callable, Dict, List, Union
 
 import numpy as np
+from scipy import sparse
 from scipy.integrate import solve_ivp
 
 # Every numerical method accepted by scipy.integrate.solve_ivp ("ODE" mode).
 ODE_METHODS = ("RK45", "RK23", "DOP853", "Radau", "BDF", "LSODA")
+
+
+class RateLawNotVectorizedError(Exception):
+    """
+    Raised by `ReactionNetwork.simulate_ode_batch` when a rate law can't be
+    evaluated on arrays of concentrations (typically a `custom` rate law
+    written for scalars, e.g. one using `math.exp` or `max`). Callers fall
+    back to stepping each compartment separately.
+    """
+
+
+def _resolve_ode_method(ode_method):
+    """Case-insensitively match `ode_method` against ODE_METHODS."""
+    method = next(
+        (m for m in ODE_METHODS if m.upper() == str(ode_method).upper()), None
+    )
+    if method is None:
+        raise ValueError(
+            f"Unknown ODE method: {ode_method!r}; expected one of {ODE_METHODS}"
+        )
+    return method
 
 
 class Reaction:
@@ -314,6 +336,113 @@ class ReactionNetwork:
         else:
             raise ValueError(f"Unknown simulation method: {method}")
 
+    def simulate_ode_batch(
+        self,
+        state: Dict[str, np.ndarray],
+        dt: float,
+        ode_method: str = "RK45",
+    ) -> Dict[str, np.ndarray]:
+        """
+        Integrate the reaction ODEs over `dt` for many independent
+        compartments at once, e.g. every voxel of an `Environment`.
+
+        Equivalent to calling `simulate_step(..., method="ODE")` on each
+        compartment separately, but as a single `solve_ivp` call over the
+        stacked state, with every rate law evaluated on whole arrays. That
+        removes the per-compartment Python and `solve_ivp` overhead, which
+        otherwise dominates reaction-diffusion runs.
+
+        The compartments don't interact, so the Jacobian is block-diagonal
+        (one species-by-species block per compartment). The stiff solvers
+        are told so, `jac_sparsity` for BDF/Radau and band widths for LSODA,
+        so their finite-difference Jacobians stay cheap.
+
+        Error control is shared: `solve_ivp` takes one step size for the
+        whole batch and judges each step by the RMS of the scaled error over
+        every component, so one compartment's local error can exceed the
+        per-component tolerance a separate solve would enforce. In practice
+        the difference is far below the scheme's other errors (see
+        tests/test_reaction_diffusion.py, which compares the two).
+
+        Export-tagged reactions are clamped as in `simulate_step`, but the
+        exported amounts are not tracked (`last_exported` is left alone),
+        since a batch has no single owner to deliver them to.
+
+        Args:
+            state: species → 1D array of concentrations, one entry per
+                compartment (all the same length). Must include every
+                species in the network.
+            dt: time step.
+            ode_method: `solve_ivp` method, as in `simulate_step`.
+
+        Returns:
+            species → 1D array of updated concentrations (clamped to >= 0).
+
+        Raises:
+            RateLawNotVectorizedError: if a rate law can't be evaluated on
+                arrays. Checked before integrating, so callers can fall back
+                to per-compartment `simulate_step` calls.
+        """
+        method = _resolve_ode_method(ode_method)
+        species_list = self.species
+        n = len(species_list)
+        x0 = np.stack(
+            [np.asarray(state[s], dtype=float) for s in species_list], axis=1
+        )  # (m compartments, n species); flattened compartment-major below
+        m = x0.shape[0]
+        if m == 0:
+            return {s: np.zeros(0) for s in species_list}
+
+        S = self._stoichiometry_matrix
+        names = self._reaction_names
+        reactions = [self.reactions[name] for name in names]
+        export_flags = [bool(rxn.exports) for rxn in reactions]
+
+        def rates(X):
+            conc = {s: X[:, i] for i, s in enumerate(species_list)}
+            v = np.empty((len(reactions), m))
+            for j, rxn in enumerate(reactions):
+                v[j] = rxn.rate(conc)  # a scalar (e.g. zero-order) broadcasts
+                if export_flags[j]:
+                    depleted = np.zeros(m, dtype=bool)
+                    for s in rxn.reactants:
+                        depleted |= conc[s] <= 0.0
+                    v[j] = np.where(depleted, 0.0, np.maximum(v[j], 0.0))
+            return v
+
+        X0 = np.maximum(x0, 0.0)
+        try:
+            with np.errstate(all="ignore"):
+                probe = rates(X0)
+        except (TypeError, ValueError) as err:
+            raise RateLawNotVectorizedError(str(err)) from err
+        if probe.shape != (len(reactions), m):
+            raise RateLawNotVectorizedError("rate law returned the wrong shape")
+
+        def rhs(_t, y):
+            X = np.maximum(y.reshape(m, n), 0.0)
+            return (S @ rates(X)).T.ravel()
+
+        options = {}
+        if method in ("BDF", "Radau"):
+            options["jac_sparsity"] = sparse.block_diag([np.ones((n, n))] * m)
+        elif method == "LSODA":
+            options["lband"] = options["uband"] = n - 1
+
+        sol = solve_ivp(
+            rhs,
+            (0.0, dt),
+            x0.ravel(),
+            method=method,
+            rtol=1e-6,
+            atol=1e-9,
+            **options,
+        )
+        if not sol.success:
+            raise RuntimeError(f"ODE integration failed: {sol.message}")
+        X_new = np.maximum(sol.y[:, -1].reshape(m, n), 0.0)
+        return {s: X_new[:, i] for i, s in enumerate(species_list)}
+
     def _rate_vector(self, state: Dict[str, float]) -> np.ndarray:
         """Evaluate every reaction's rate law against `state` (a concentration dict)."""
         return np.array(
@@ -403,13 +532,7 @@ class ReactionNetwork:
         `simulate_step`'s `compartment_volumes`) scales each species' rate
         of change into its own compartment's concentration basis.
         """
-        method = next(
-            (m for m in ODE_METHODS if m.upper() == str(ode_method).upper()), None
-        )
-        if method is None:
-            raise ValueError(
-                f"Unknown ODE method: {ode_method!r}; expected one of {ODE_METHODS}"
-            )
+        method = _resolve_ode_method(ode_method)
 
         species_list = self.species
         n = len(species_list)
