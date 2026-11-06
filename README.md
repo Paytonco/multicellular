@@ -20,7 +20,8 @@ tested:
 - Chemical reaction networks (mass-action, Michaelis-Menten, Hill-Langmuir,
   custom rate laws), simulated via ODE (`scipy.integrate.solve_ivp`, with
   explicit or stiff solvers), the chemical Langevin equation (CLE), or
-  Gillespie SSA
+  Gillespie SSA, either inside cells or on their own via
+  `ReactionNetwork.simulate()`
 - Environment with spatially-varying diffusivity and viscosity fields, plus
   per-field diffusion (a mass-conserving finite-difference solver) for any
   `Field` marked `diffuses=True`
@@ -212,7 +213,7 @@ secreted AHL signal.
 stoichiometry matrix, and advances concentrations with one of three
 simulation methods: `"ODE"` (numerical integration via `scipy.integrate.solve_ivp`; the default, with `RK45` as the default solver), `"CLE"` (chemical
 Langevin equation), or `"SSA"` (Gillespie stochastic simulation algorithm).
-The method is chosen per call to `simulate_step` (or, when running a full
+The method is chosen per call to `simulate_step` or `simulate` (or, when running a full
 `Colony`/`Simulation`, once via `Simulation`'s `simulation_method` argument —
 see [`Simulation`](#simulation) below) rather than being fixed on the
 `ReactionNetwork` itself, so the same network can be advanced with different
@@ -303,6 +304,35 @@ Michaelis-Menten and Hill-Langmuir.
   negative (possible only with custom rate laws, or with a fractional
   extracellular pool; see below) is rejected rather than clipped, so SSA
   never creates mass.
+
+#### Simulating a network on its own (`simulate`)
+
+To run a network over time without building a `Cell`, `Colony`, or
+`Simulation`, use `simulate`. It calls `simulate_step` repeatedly from `t=0`
+to `t_max` and returns a pandas DataFrame with a `time` column and one
+column per species (in `network.species` order), including the initial
+state:
+
+```python
+df = network.simulate({"A": 1.0}, t_max=10.0, dt=0.1)  # method="ODE" by default
+df.plot(x="time")
+
+df = network.simulate({"A": 1.0}, t_max=10.0, dt=0.1, volume=100.0, method="SSA", seed=0)
+```
+
+- Species missing from the initial state start at 0. A name that isn't a
+  network species raises `ValueError`.
+- The run takes `round(t_max / dt)` steps, and row `k` is at `time = k * dt`.
+- `method`, `ode_method`, `volume`, and `compartment_volumes` mean the same
+  as in `simulate_step`. `volume` only matters for `"SSA"`/`"CLE"`, where it
+  sets the molecule count per unit concentration (and so the noise level).
+- One random generator is used for the whole run: pass `seed` for a
+  reproducible `"SSA"`/`"CLE"` trajectory, or your own `rng`.
+- If the network exports species (see
+  [Exporting species](#exporting-species-secretion) below), each gets a
+  cumulative `exported_<species>` column, in molecule counts, so
+  `[X] * volume + exported_X` is conserved for a pure efflux reaction.
+- `show_progress=True` shows a tqdm progress bar.
 
 #### Species in another compartment (`compartment_volumes`)
 

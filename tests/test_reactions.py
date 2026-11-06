@@ -637,3 +637,81 @@ def test_external_only_reaction_changes_only_external_species():
     assert new["E"] == pytest.approx(1.0)
     assert new["S"] + new["P"] == pytest.approx(2.0)
     assert new["S"] == pytest.approx(2.0 * np.exp(-0.1 * 0.1), rel=1e-5)
+
+
+# --- ReactionNetwork.simulate ---
+
+
+def _decay(k=0.5):
+    return ReactionNetwork(
+        "decay",
+        {"decay": Reaction(reactants={"A": 1}, products={}, rate_params={"k": k})},
+    )
+
+
+def _conversion(k=0.5):
+    return ReactionNetwork(
+        "conversion",
+        {"conv": Reaction(reactants={"A": 1}, products={"B": 1}, rate_params={"k": k})},
+    )
+
+
+def test_simulate_ode_matches_analytic_decay():
+    k, A0 = 0.5, 10.0
+    df = _decay(k).simulate({"A": A0}, t_max=4.0, dt=0.1)
+    assert list(df.columns) == ["time", "A"]
+    assert len(df) == 41
+    np.testing.assert_allclose(df["time"], np.arange(41) * 0.1)
+    np.testing.assert_allclose(df["A"], A0 * np.exp(-k * df["time"]), rtol=1e-4)
+
+
+def test_simulate_missing_species_start_at_zero_and_mass_conserved():
+    df = _conversion().simulate({"A": 5.0}, t_max=2.0, dt=0.1)
+    assert df["B"].iloc[0] == 0.0
+    np.testing.assert_allclose(df["A"] + df["B"], 5.0, rtol=1e-6)
+
+
+def test_simulate_unknown_species_raises():
+    with pytest.raises(ValueError, match="Unknown species"):
+        _decay().simulate({"A": 1.0, "Z": 1.0}, t_max=1.0, dt=0.1)
+
+
+def test_simulate_rejects_bad_dt_and_t_max():
+    with pytest.raises(ValueError):
+        _decay().simulate({"A": 1.0}, t_max=1.0, dt=0.0)
+    with pytest.raises(ValueError):
+        _decay().simulate({"A": 1.0}, t_max=-1.0, dt=0.1)
+
+
+def test_simulate_ssa_reproducible_with_seed():
+    net = _conversion()
+    kwargs = dict(t_max=5.0, dt=0.5, volume=100.0, method="ssa")
+    df1 = net.simulate({"A": 1.0}, seed=1, **kwargs)
+    df2 = net.simulate({"A": 1.0}, seed=1, **kwargs)
+    df3 = net.simulate({"A": 1.0}, seed=2, **kwargs)
+    assert df1.equals(df2)
+    assert not df1.equals(df3)
+
+
+def test_simulate_tracks_cumulative_exports():
+    net = ReactionNetwork(
+        "secretion",
+        {
+            "secrete": Reaction(
+                reactants={"S": 1},
+                products={},
+                exports={"S": 1},
+                rate_params={"k": 0.3},
+            )
+        },
+    )
+    volume = 2.0
+    df = net.simulate({"S": 4.0}, t_max=5.0, dt=0.25, volume=volume)
+    assert "exported_S" in df.columns
+    assert df["exported_S"].iloc[0] == 0.0
+    np.testing.assert_allclose(df["S"] * volume + df["exported_S"], 8.0, rtol=1e-5)
+
+
+def test_simulate_invalid_method_raises():
+    with pytest.raises(ValueError, match="Unknown simulation method"):
+        _decay().simulate({"A": 1.0}, t_max=1.0, dt=0.1, method="euler")

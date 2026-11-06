@@ -3,8 +3,10 @@
 from typing import Callable, Dict, List, Union
 
 import numpy as np
+import pandas as pd
 from scipy import sparse
 from scipy.integrate import solve_ivp
+from tqdm import tqdm
 
 # Every numerical method accepted by scipy.integrate.solve_ivp ("ODE" mode).
 ODE_METHODS = ("RK45", "RK23", "DOP853", "Radau", "BDF", "LSODA")
@@ -335,6 +337,84 @@ class ReactionNetwork:
             )
         else:
             raise ValueError(f"Unknown simulation method: {method}")
+
+    def simulate(
+        self,
+        initial_state: Dict[str, float],
+        t_max: float,
+        dt: float,
+        volume: float = 1.0,
+        method: str = "ODE",
+        ode_method: str = "RK45",
+        rng: np.random.Generator = None,
+        seed: int = None,
+        compartment_volumes: Dict[str, float] = None,
+        show_progress: bool = False,
+    ) -> pd.DataFrame:
+        """
+        Simulate this network on its own (no Cell/Colony) from t=0 to `t_max`.
+
+        Repeatedly calls `simulate_step`, recording the state at t=0 and
+        after every step.
+
+        Args:
+            initial_state: dict of species → initial concentration. Species
+                not listed start at 0; unknown species raise ValueError.
+            t_max: end time; the run takes `round(t_max / dt)` steps.
+            dt: timestep size.
+            volume: compartment volume, as in `simulate_step`. Only matters
+                for SSA/CLE, where it converts concentrations to molecule
+                counts.
+            method: "ODE", "SSA", or "CLE", as in `simulate_step`.
+            ode_method: `solve_ivp` method for "ODE", as in `simulate_step`.
+            rng: random generator for SSA/CLE. If not given, one is created
+                from `seed`, so stochastic runs are reproducible.
+            seed: seed for the generator created when `rng` is None.
+            compartment_volumes: as in `simulate_step`.
+            show_progress: show a tqdm progress bar.
+
+        Returns:
+            DataFrame with a `time` column, one column per species (in
+            `self.species` order), and, if the network exports species, a
+            cumulative `exported_<species>` column (molecule counts) for each.
+        """
+        if dt <= 0:
+            raise ValueError(f"dt must be positive, got {dt}")
+        if t_max < 0:
+            raise ValueError(f"t_max must be non-negative, got {t_max}")
+        unknown = set(initial_state) - set(self.species)
+        if unknown:
+            raise ValueError(
+                f"Unknown species in initial_state: {sorted(unknown)}; "
+                f"network species are {self.species}"
+            )
+
+        state = {s: float(initial_state.get(s, 0.0)) for s in self.species}
+        rng = rng or np.random.default_rng(seed)
+        exported = {s: 0.0 for s in self.exported_species}
+
+        def record(time):
+            row = {"time": time, **state}
+            row.update({f"exported_{s}": v for s, v in exported.items()})
+            return row
+
+        records = [record(0.0)]
+        n_steps = round(t_max / dt)
+        for k in tqdm(range(1, n_steps + 1), disable=not show_progress):
+            state = self.simulate_step(
+                state,
+                dt,
+                volume,
+                method=method,
+                rng=rng,
+                ode_method=ode_method,
+                compartment_volumes=compartment_volumes,
+            )
+            for s in self.exported_species:
+                exported[s] += self.last_exported[s]
+            records.append(record(k * dt))
+
+        return pd.DataFrame(records)
 
     def simulate_ode_batch(
         self,
