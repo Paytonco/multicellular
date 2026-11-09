@@ -54,6 +54,9 @@ class Simulation:
             record = {
                 "time": self.time,
                 "cell_id": cell.id,
+                "parent_id": cell.parent_id,
+                "generation": cell.generation,
+                "root_id": cell.root_id,
                 "alive": cell.alive,
                 "anchored": cell.anchored,
                 "position_x": cell.position[0],
@@ -99,6 +102,9 @@ class Simulation:
         for step_index in tqdm(
             range(start_step + 1, n_steps + 1), disable=not show_progress
         ):
+            # Keep the colony's clock (which stamps lineage events) exactly
+            # on the recorded times, rather than accumulating `+= dt` drift.
+            self.colony.time = self.time
             self.colony.step(self.dt, self.simulation_method, self.ode_method)
             self.time = step_index * self.dt
             self.record()
@@ -108,6 +114,48 @@ class Simulation:
     def to_dataframe(self):
         """Return the recorded history as a pandas DataFrame."""
         return pd.DataFrame(self.history)
+
+    @property
+    def lineage(self):
+        """The colony's `Lineage`: every cell ever created, as a forest of trees."""
+        return self.colony.lineage
+
+    def lineage_dataframe(self):
+        """
+        One row per cell ever created: id, parent_id, root_id, generation,
+        birth_time, end_time, fate, daughter_ids, size_at_birth,
+        size_at_division, shape, species. See `Lineage.to_dataframe`.
+        """
+        return self.colony.lineage.to_dataframe()
+
+    def plot_lineage(
+        self,
+        color_by=None,
+        root_id=None,
+        ax=None,
+        cmap="viridis",
+        vmin=None,
+        vmax=None,
+        show_deaths=True,
+    ):
+        """
+        Plot the colony's lineage tree against time (see
+        `utils.visualization.plot_lineage_tree`). With `color_by` (a
+        recorded species/column name), each branch is colored over time by
+        that cell's recorded value. Returns `(fig, ax)`; does not call
+        `plt.show()`.
+        """
+        history = self.to_dataframe() if color_by is not None else None
+        return self.colony.lineage.plot(
+            ax=ax,
+            history=history,
+            color_by=color_by,
+            root_id=root_id,
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+            show_deaths=show_deaths,
+        )
 
     def visualize_colony(
         self,

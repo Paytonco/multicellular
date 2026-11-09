@@ -6,7 +6,7 @@ import imageio.v2 as imageio
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FuncAnimation
-from matplotlib.collections import PolyCollection
+from matplotlib.collections import LineCollection, PolyCollection
 from matplotlib.image import AxesImage
 from matplotlib.patches import Rectangle
 from PIL import Image
@@ -641,3 +641,193 @@ def _display_and_save(frames, interval, save_path, filename, show=True):
     )
     plt.show()
     return anim
+
+
+# Lineage-tree plot: marker per death cause (divided/alive cells get none).
+_LINEAGE_DEATH_MARKERS = {
+    "survival_condition": "x",
+    "killed": "x",
+    "out_of_bounds": ">",
+}
+_LINEAGE_BRANCH_COLOR = "0.2"
+# Vertical gap (in leaf rows) between separate founders' trees.
+_LINEAGE_ROOT_GAP = 1.0
+
+
+def _lineage_layout(lineage, roots):
+    """
+    Assign each cell a y position: leaves get consecutive rows in DFS order
+    (one tree after another, separated by `_LINEAGE_ROOT_GAP`), and every
+    cell that divided sits at the mean y of its daughters. Iterative, so
+    deep lineages don't hit the recursion limit.
+    """
+    y = {}
+    next_row = 0.0
+    for root in roots:
+        stack = [(root, False)]
+        while stack:
+            cid, expanded = stack.pop()
+            kids = lineage.children(cid)
+            if not kids:
+                y[cid] = next_row
+                next_row += 1.0
+            elif not expanded:
+                stack.append((cid, True))
+                stack.extend((k, False) for k in reversed(kids))
+            else:
+                y[cid] = float(np.mean([y[k] for k in kids]))
+        next_row += _LINEAGE_ROOT_GAP
+    return y
+
+
+def _branch_segments(record, t_stop, y, times, values):
+    """
+    Split one cell's branch [birth, t_stop] at its recorded times, each
+    piece colored by the value recorded at its start. Recorded rows outside
+    the branch (e.g. a dead cell still listed afterwards) are ignored.
+    """
+    t0 = record.birth_time
+    keep = (times >= t0) & (times < t_stop)
+    times, values = times[keep], values[keep]
+    if len(times) == 0 or times[0] > t0:
+        # No sample at birth: extend the earliest known value back to it.
+        first = values[0] if len(values) else np.nan
+        times = np.concatenate([[t0], times])
+        values = np.concatenate([[first], values])
+    edges = np.append(times, t_stop)
+    segments = [[(a, y), (b, y)] for a, b in zip(edges[:-1], edges[1:])]
+    return segments, values
+
+
+def plot_lineage_tree(
+    lineage,
+    history=None,
+    color_by=None,
+    root_id=None,
+    ax=None,
+    cmap="viridis",
+    vmin=None,
+    vmax=None,
+    show_deaths=True,
+):
+    """
+    Draw a lineage as a tree against time.
+
+    Each cell is a horizontal branch from its birth to its division/death
+    (or to `lineage.time` if still alive); a vertical connector joins the two
+    daughters at each division. Leaves are stacked in depth-first order and
+    each parent is centered on its daughters; separate founders are stacked
+    with a gap. Deaths are marked at the branch tip ("x" for a survival
+    condition or manual kill, ">" for leaving the environment).
+
+    Args:
+        lineage: a `Lineage` (e.g. `colony.lineage`).
+        history: the Simulation history DataFrame (`sim.to_dataframe()`),
+            required when `color_by` is given.
+        color_by: a column of `history` (e.g. a species). Each branch is
+            colored over time by that cell's recorded value.
+        root_id: draw only this cell's subtree.
+        ax: an existing Axes to draw on; a new figure is created otherwise.
+        cmap, vmin, vmax: colormap and limits for `color_by` (limits default
+            to the range of the plotted values).
+        show_deaths: whether to mark deaths at branch tips.
+
+    Returns:
+        (fig, ax). Does not call `plt.show()`.
+    """
+    if color_by is not None:
+        if history is None:
+            raise ValueError("color_by requires the simulation history DataFrame.")
+        if color_by not in history.columns:
+            raise ValueError(f"'{color_by}' is not a column of the history.")
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 5))
+    else:
+        fig = ax.figure
+
+    roots = [root_id] if root_id is not None else sorted(lineage.roots())
+    ids = []
+    for root in roots:
+        ids.extend([root, *lineage.descendants(root)])
+    if not ids:
+        ax.set_xlabel("time")
+        ax.set_yticks([])
+        return fig, ax
+
+    y = _lineage_layout(lineage, roots)
+
+    grouped = {}
+    if color_by is not None:
+        sub = history.loc[history["cell_id"].isin(ids), ["cell_id", "time", color_by]]
+        for cid, rows in sub.sort_values("time").groupby("cell_id"):
+            grouped[cid] = (
+                rows["time"].to_numpy(float),
+                rows[color_by].to_numpy(float),
+            )
+
+    branch_segments, branch_values = [], []
+    connectors = []
+    deaths = {}
+    for cid in ids:
+        rec = lineage[cid]
+        t_stop = rec.end_time if rec.end_time is not None else lineage.time
+        if color_by is not None:
+            times, values = grouped.get(cid, (np.empty(0), np.empty(0)))
+            segs, vals = _branch_segments(rec, t_stop, y[cid], times, values)
+            branch_segments.extend(segs)
+            branch_values.extend(vals)
+        else:
+            branch_segments.append([(rec.birth_time, y[cid]), (t_stop, y[cid])])
+        kids = lineage.children(cid)
+        if kids:
+            ys = [y[k] for k in kids]
+            connectors.append([(rec.end_time, min(ys)), (rec.end_time, max(ys))])
+        if show_deaths and rec.fate in _LINEAGE_DEATH_MARKERS:
+            deaths.setdefault(rec.fate, []).append((t_stop, y[cid]))
+
+    # Colored branches are many short per-step pieces; projecting caps
+    # overlap them slightly so antialiasing doesn't leave hairline gaps.
+    branches = LineCollection(
+        branch_segments,
+        linewidths=2.0,
+        capstyle="projecting" if color_by is not None else "butt",
+    )
+    if color_by is not None:
+        values = np.asarray(branch_values, dtype=float)
+        finite = values[np.isfinite(values)]
+        lo = vmin if vmin is not None else (finite.min() if finite.size else 0.0)
+        hi = vmax if vmax is not None else (finite.max() if finite.size else 1.0)
+        branches.set_array(np.ma.masked_invalid(values))
+        branches.set_cmap(cmap)
+        branches.set_clim(lo, hi)
+        fig.colorbar(branches, ax=ax, label=color_by)
+    else:
+        branches.set_color(_LINEAGE_BRANCH_COLOR)
+    ax.add_collection(branches)
+    ax.add_collection(
+        LineCollection(connectors, colors=_LINEAGE_BRANCH_COLOR, linewidths=1.0)
+    )
+    for fate, points in deaths.items():
+        xs, ys = zip(*points)
+        ax.scatter(
+            xs,
+            ys,
+            marker=_LINEAGE_DEATH_MARKERS[fate],
+            color="crimson",
+            zorder=3,
+            label=fate.replace("_", " "),
+        )
+    if deaths:
+        ax.legend(loc="best", fontsize="small")
+
+    ax.autoscale_view()
+    ax.set_xlabel("time")
+    ax.set_ylabel("cell")
+    leaf_ids = [cid for cid in ids if not lineage.children(cid)]
+    if len(leaf_ids) <= 40:
+        ax.set_yticks([y[c] for c in leaf_ids], [str(c) for c in leaf_ids])
+    else:
+        ax.set_yticks([])
+    ax.invert_yaxis()
+    return fig, ax

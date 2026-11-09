@@ -2,10 +2,12 @@
 
 import math
 import operator as _operator
+from collections import Counter
 
 import numpy as np
 
 from .environment import WATER_DIFFUSIVITY_37C
+from .lineage import Lineage
 
 _kBT = 1.380649e-23 * 310.15  # J  (k_B × 37°C)
 
@@ -137,6 +139,12 @@ class Colony:
     ignore each other, so tissue cells may be packed freely. Like every
     cell, an anchored cell exchanges mass only with the Field voxel
     containing its center, even if its body spans several voxels.
+
+    Every cell the colony ever holds is recorded in `self.lineage` (a
+    `Lineage`): initial cells as founders at construction, then each
+    division and death (with its cause) stamped with the simulation time at
+    the end of the step it happened in. Cell ids must be unique; cells
+    passed with `id=None` are assigned fresh ids.
     """
 
     def __init__(
@@ -192,7 +200,49 @@ class Colony:
         )
         self.brownian_motion = brownian_motion
         existing_ids = [cell.id for cell in self.cells if cell.id is not None]
+        duplicates = sorted(i for i, n in Counter(existing_ids).items() if n > 1)
+        if duplicates:
+            raise ValueError(
+                f"Cell ids must be unique within a Colony; duplicated: {duplicates}. "
+                "Pass id=None to have the Colony assign one."
+            )
         self._next_id = max(existing_ids, default=-1) + 1
+        # Simulation time of the colony's latest state; every lineage event
+        # in a step is stamped with the time at the end of that step.
+        self.time = 0.0
+        self.lineage = Lineage()
+        self._register_new_cells(self.time)
+
+    def _register_new_cells(self, time):
+        """
+        Give any id-less cell a fresh id and add every cell not yet in the
+        lineage as a founder (its own root unless it already has one).
+        """
+        for cell in self.cells:
+            if cell.id is None:
+                cell.id = self._next_id
+                self._next_id += 1
+            elif cell.id >= self._next_id:
+                self._next_id = cell.id + 1
+            if cell.id in self.lineage:
+                continue
+            if cell.root_id is None:
+                cell.root_id = cell.id
+            self.lineage.register_founder(cell, time)
+
+    def _sync_lineage(self, time):
+        """
+        Reconcile the lineage with `self.cells` at the start of a step, at
+        the current `time`: register cells appended to `cells` directly, and
+        record deaths of cells killed outside the colony's own checks (e.g.
+        `cell.kill()` between steps).
+        """
+        self._register_new_cells(time)
+        records = self.lineage.records
+        for cell in self.cells:
+            if not cell.alive and records[cell.id].end_time is None:
+                self.lineage.register_death(cell, time, cell.death_cause or "killed")
+        self.lineage.time = time
 
     @staticmethod
     def _validate_survival_conditions(survival_conditions):
@@ -250,21 +300,27 @@ class Colony:
             ode_method: `scipy.integrate.solve_ivp` method used when
                 `method` is "ODE" (default "RK45").
         """
+        t_end = self.time + dt
+        # Catch cells added or killed by hand since the last step before
+        # this step's events are recorded.
+        self._sync_lineage(self.time)
         self.environment.diffuse(dt)
         self.environment.react(dt, method, ode_method)
         self._update_growth_rates()
         self._step_cells(dt, method, ode_method)
         self.export_chemical_fields()
         self.sample_chemical_fields()
-        self.enforce_bounds()
-        self.enforce_survival_conditions()
+        self.enforce_bounds(t_end)
+        self.enforce_survival_conditions(t_end)
         alive = self.living_cells
         if self.brownian_motion:
             mobile = [cell for cell in alive if not cell.anchored]
             noise = self._draw_brownian_noise(mobile)
             self._apply_brownian_motion(dt, mobile, noise)
         self._apply_contact_forces(dt, alive)
-        self.handle_divisions()
+        self.handle_divisions(t_end)
+        self.time = t_end
+        self.lineage.time = t_end
 
     def _field_indices(self, positions):
         """Vectorized nearest-grid-point (row, col) indices for an (n, 2) array of positions in μm."""
@@ -758,20 +814,28 @@ class Colony:
                 forces_y[i] += Fy
                 torques[i] += (qx - cix) * Fy - (qy - ciy) * Fx
 
-    def enforce_bounds(self):
-        """Kill any cell whose center of mass has left the environment's physical extent or entered a wall_map out-of-bounds (-1) cell."""
+    def enforce_bounds(self, time=None):
+        """
+        Kill any cell whose center of mass has left the environment's
+        physical extent or entered a wall_map out-of-bounds (-1) cell,
+        recording its death in the lineage at `time` (default `self.time`).
+        """
+        time = self.time if time is None else time
         for cell in self.cells:
             if cell.alive and not self.environment.in_bounds(cell.position):
-                cell.kill()
+                cell.kill("out_of_bounds")
+                self.lineage.register_death(cell, time, "out_of_bounds")
 
-    def enforce_survival_conditions(self):
+    def enforce_survival_conditions(self, time=None):
         """
         Kill any living cell whose concentrations violate a survival
         condition, then deliver lysis payloads (see
         `_deliver_lysis_payloads`) for whichever cells were just killed.
+        Deaths are recorded in the lineage at `time` (default `self.time`).
         """
         if not self.survival_conditions:
             return
+        time = self.time if time is None else time
         lysed = []
         for cell in self.cells:
             if not cell.alive:
@@ -781,7 +845,8 @@ class Colony:
                     species, cell.extracellular.get(species, 0.0)
                 )
                 if not _COMPARISONS[op](value, threshold):
-                    cell.kill()
+                    cell.kill("survival_condition")
+                    self.lineage.register_death(cell, time, "survival_condition")
                     lysed.append(cell)
                     break
         self._deliver_lysis_payloads(lysed)
@@ -829,11 +894,20 @@ class Colony:
             field = self.environment.get_field(target_field)
             field.values = field.values + delta
 
-    def handle_divisions(self):
-        """Replace any cell ready to divide with its two daughter cells."""
+    def handle_divisions(self, time=None):
+        """
+        Replace any cell ready to divide with its two daughter cells,
+        recording the division in the lineage at `time` (default
+        `self.time`).
+        """
+        time = self.time if time is None else time
         new_cells = []
         for cell in self.cells:
-            daughters = cell.divide() if cell.alive else None
+            if cell.alive:
+                size_at_division = cell._division_target
+                daughters = cell.divide()
+            else:
+                daughters = None
             if daughters is None:
                 new_cells.append(cell)
                 continue
@@ -841,4 +915,7 @@ class Colony:
                 daughter.id = self._next_id
                 self._next_id += 1
                 new_cells.append(daughter)
+            self.lineage.register_division(
+                cell, daughters, time, size_at_division=size_at_division
+            )
         self.cells = new_cells

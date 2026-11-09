@@ -60,8 +60,9 @@ def _make_cell(position, growth_rate=0.0):
     # growth_rate=0.0 by default so mechanics/survival/field tests aren't
     # entangled with growth-driven concentration dilution (see test_cell.py
     # for dedicated dilution tests).
+    # id=None: Colony assigns unique ids (it rejects duplicates).
     return Cell(
-        id=1,
+        id=None,
         position=position,
         orientation=[1.0, 0.0],
         length=2.0,
@@ -366,7 +367,7 @@ def _make_uptake_cell(position, k=1.0, growth_rate=0.0, rng=None, **kwargs):
         {"A": 1}, {"A_int": 1}, rate_law_type="mass_action", rate_params={"k": k}
     )
     return Cell(
-        id=1,
+        id=None,
         position=position,
         orientation=[1.0, 0.0],
         length=2.0,

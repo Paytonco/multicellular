@@ -41,6 +41,9 @@ class Cell:
         lysis_targets=None,
         shape="rod",
         anchored=False,
+        parent_id=None,
+        generation=0,
+        root_id=None,
     ):
         """
         Args:
@@ -87,6 +90,13 @@ class Cell:
                 are pushed away by the full contact force. A plain
                 attribute: set `cell.anchored` to pin or release a cell
                 partway through a simulation.
+            parent_id: id of the cell this one was born from by division,
+                or None for a founder. Set by `divide`.
+            generation: number of divisions separating this cell from its
+                founder (0 for a founder). Set by `divide`.
+            root_id: id of this cell's founder. Set by `divide` for
+                daughters; Colony sets it to the cell's own id for founders.
+                See `Colony.lineage` for the full lineage tree.
         """
         if shape not in SHAPES:
             raise ValueError(f"shape must be one of {SHAPES}, got {shape!r}.")
@@ -107,6 +117,9 @@ class Cell:
                 f"{same} mapped to themselves."
             )
         self.id = id
+        self.parent_id = parent_id
+        self.generation = int(generation)
+        self.root_id = root_id
         self.shape = shape
         self.anchored = bool(anchored)
         self.position = np.array(position, dtype=float)
@@ -117,6 +130,7 @@ class Cell:
         self.network = network
         self.age = 0.0
         self.alive = True
+        self.death_cause = None
         self.rng = rng or np.random.default_rng()
 
         self.growth_rate = growth_rate
@@ -351,6 +365,9 @@ class Cell:
             a=self.a,
             cv_f=self.cv_f,
             lysis_targets=self.lysis_targets,
+            parent_id=self.id,
+            generation=self.generation + 1,
+            root_id=self.root_id,
         )
         daughter1 = Cell(
             position=pos1,
@@ -419,7 +436,15 @@ class Cell:
         self.orientation[0] = nx
         self.orientation[1] = ny
 
-    def kill(self):
+    def kill(self, cause="killed"):
+        """
+        Mark the cell dead. `cause` is recorded as its lineage fate (see
+        `Colony.lineage`): "killed" (default, e.g. a manual kill),
+        "out_of_bounds", or "survival_condition". Killing an already-dead
+        cell keeps its original cause.
+        """
+        if self.alive:
+            self.death_cause = cause
         self.alive = False
 
     def _normalize(self, v):
@@ -430,6 +455,9 @@ class Cell:
     def to_dict(self):
         return {
             "id": self.id,
+            "parent_id": self.parent_id,
+            "generation": self.generation,
+            "root_id": self.root_id,
             "shape": self.shape,
             "position": self.position.tolist(),
             "orientation": self.orientation.tolist(),

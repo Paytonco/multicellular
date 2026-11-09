@@ -1256,7 +1256,8 @@ df = sim.run()  # pandas DataFrame, one row per cell per recorded timestep
 `colony.step(dt, sim.simulation_method, sim.ode_method)` and records the new state of every
 cell remaining in the colony — including any new daughter cells produced by
 division — until `t_max` is reached. The
-returned DataFrame has columns `time`, `cell_id`, `alive`, `anchored`, `position_x`,
+returned DataFrame has columns `time`, `cell_id`, `parent_id`, `generation`,
+`root_id` (see [Lineage tracking](#lineage-tracking)), `alive`, `anchored`, `position_x`,
 `position_y`, `orientation_x`, `orientation_y`, `length`, `radius`, `shape`
 (`"rod"` or `"sphere"`), plus one
 column per chemical species seen in any cell's `concentrations` or
@@ -1293,6 +1294,44 @@ the rest of the run. Both are useful e.g. to simulate further after calling
 `colony.switch_environment(...)` — see
 [Switching environments](#switching-environments) above. Calling `run()` a
 second time with the same `t_max` it already reached is a no-op.
+
+#### Lineage tracking
+
+Every cell a `Colony` ever holds is recorded in `colony.lineage` (also
+`sim.lineage`), a `Lineage`: a forest of family trees, one per founder cell.
+Initial cells are founders, born at `t=0`. Each division and death is
+stamped with the simulation time at the end of the step it happened in.
+Cell ids must be unique within a colony. Pass `id=None` and the colony
+assigns one. Each `Cell` also carries `parent_id`, `generation` (divisions
+since its founder), and `root_id` (its founder's id). These three also
+appear as columns of the history DataFrame, so
+`df.groupby("root_id")` follows a clone.
+
+```python
+sim = Simulation(Colony([Cell(id=None, position=[50.0, 50.0], orientation=[1.0, 0.0])], env),
+                 dt=0.02, t_max=6.0)
+sim.run()
+
+lin = sim.lineage_dataframe()  # one row per cell ever created
+# id, parent_id, root_id, generation, birth_time, end_time, fate,
+# daughter_ids, size_at_birth, size_at_division, shape, species
+
+L = sim.lineage
+L.children(0), L.sisters(1), L.ancestors(42), L.descendants(0)
+L.leaves(), L.roots(), L.subtree(3)   # subtree(...) is a new Lineage
+L.generation_times()                  # interdivision times of non-founders
+L.to_newick()                         # branch length = cell lifetime
+
+fig, ax = sim.plot_lineage(color_by="GFP")  # tree vs. time, colored by GFP
+```
+
+`fate` is `"alive"`, `"divided"`, `"out_of_bounds"` (killed by
+`enforce_bounds`), `"survival_condition"`, or `"killed"` (a manual
+`cell.kill()`). `end_time` is `NaN` while a cell is alive. In
+`plot_lineage`, each cell is a horizontal branch from birth to
+division/death. Deaths are marked at the branch tip, and `color_by` colors
+each branch over time by that cell's recorded value. `root_id=` plots one
+subtree. It returns `(fig, ax)` without calling `plt.show()`.
 
 ### `run_replicates`
 
@@ -1553,7 +1592,7 @@ are saved in `examples/outputs/`.
 
 | Notebook | Shows |
 |---|---|
-| `feature_tour.ipynb` | A short, self-contained demo of every major feature, including spherical cells (section 14) and anchored host cells (section 18) |
+| `feature_tour.ipynb` | A short, self-contained demo of every major feature, including spherical cells (section 14) anchored host cells (section 18), and lineage tracking (section 19) |
 | `repressilator_demo.ipynb` | Elowitz–Leibler three-gene oscillator |
 | `toggle_switch_demo.ipynb` | Gardner–Cantor–Collins bistable toggle: switching and memory |
 | `dupOri_cutter.ipynb` | Two incompatible plasmids with mutual nucleases: bistability via low-copy partitioning |
