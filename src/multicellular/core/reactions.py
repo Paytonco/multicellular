@@ -11,6 +11,28 @@ from tqdm import tqdm
 # Every numerical method accepted by scipy.integrate.solve_ivp ("ODE" mode).
 ODE_METHODS = ("RK45", "RK23", "DOP853", "Radau", "BDF", "LSODA")
 
+# Exact and approximate stochastic algorithms accepted in "SSA" mode.
+SSA_METHODS = ("direct", "next_reaction", "tau_leaping")
+
+# Tau-leaping (Cao, Gillespie & Petzold 2006) error-control parameter: the
+# largest relative change any propensity may undergo during one leap.
+DEFAULT_TAU_EPSILON = 0.03
+
+# A reaction within this many firings of exhausting a reactant is "critical"
+# and is never leaped over, only fired one at a time (CGP 2006's n_c).
+_N_CRITICAL = 10
+
+# Tau-leaping falls back to exact SSA when the leap would be shorter than
+# this many expected firings' worth of time (10 / a0), running at most
+# _SSA_FALLBACK_FIRINGS direct-method firings before trying to leap again.
+_SSA_FALLBACK_THRESHOLD = 10.0
+_SSA_FALLBACK_FIRINGS = 100
+
+# Tau-leaping's assumed relative sensitivity of a `custom` rate law to each
+# species it reads (its g_i). Unknowable in general; 3 is conservative for
+# typical rate laws. Lower `tau_epsilon` if a custom law is steeper.
+_CUSTOM_RATE_ORDER = 3.0
+
 
 class RateLawNotVectorizedError(Exception):
     """
@@ -31,6 +53,85 @@ def _resolve_ode_method(ode_method):
             f"Unknown ODE method: {ode_method!r}; expected one of {ODE_METHODS}"
         )
     return method
+
+
+def _resolve_ssa_method(ssa_method):
+    """Case-insensitively match `ssa_method` against SSA_METHODS."""
+    method = next(
+        (m for m in SSA_METHODS if m.upper() == str(ssa_method).upper()), None
+    )
+    if method is None:
+        raise ValueError(
+            f"Unknown SSA method: {ssa_method!r}; expected one of {SSA_METHODS}"
+        )
+    return method
+
+
+class _IndexedPriorityQueue:
+    """
+    Binary min-heap over items 0..n-1 keyed by a time, with a position map
+    so any item's time can be changed in O(log n). This is the "indexed
+    priority queue" of Gibson & Bruck's Next Reaction Method.
+    """
+
+    def __init__(self, times):
+        self.times = [float(t) for t in times]
+        n = len(self.times)
+        self.heap = list(range(n))
+        self.pos = list(range(n))
+        for k in range(n // 2 - 1, -1, -1):
+            self._sift_down(k)
+
+    def __len__(self):
+        return len(self.heap)
+
+    def min(self):
+        """Return (item, time) with the smallest time."""
+        j = self.heap[0]
+        return j, self.times[j]
+
+    def update(self, item, time):
+        """Set `item`'s time and restore the heap order."""
+        old = self.times[item]
+        self.times[item] = float(time)
+        if time < old:
+            self._sift_up(self.pos[item])
+        else:
+            self._sift_down(self.pos[item])
+
+    def _swap(self, a, b):
+        heap = self.heap
+        heap[a], heap[b] = heap[b], heap[a]
+        self.pos[heap[a]] = a
+        self.pos[heap[b]] = b
+
+    def _sift_up(self, k):
+        while k > 0:
+            parent = (k - 1) // 2
+            if self.times[self.heap[k]] < self.times[self.heap[parent]]:
+                self._swap(k, parent)
+                k = parent
+            else:
+                return
+
+    def _sift_down(self, k):
+        n = len(self.heap)
+        while True:
+            left, right, smallest = 2 * k + 1, 2 * k + 2, k
+            if (
+                left < n
+                and self.times[self.heap[left]] < self.times[self.heap[smallest]]
+            ):
+                smallest = left
+            if (
+                right < n
+                and self.times[self.heap[right]] < self.times[self.heap[smallest]]
+            ):
+                smallest = right
+            if smallest == k:
+                return
+            self._swap(k, smallest)
+            k = smallest
 
 
 class Reaction:
@@ -178,6 +279,49 @@ class Reaction:
             for s in set(self.reactants) | set(self.products)
         }
 
+    def rate_dependencies(self) -> set:
+        """
+        Every species this reaction's rate can depend on: those each built-in
+        rate law reads, or, for `custom`, every reactant, product and
+        catalyst (all `rate()` passes to a custom law).
+        """
+        if self.rate_law_type == "mass_action":
+            return set(self.reactants)
+        if self.rate_law_type == "michaelis_menten":
+            return set(list(self.reactants)[:1] + list(self.catalysts)[:1])
+        if self.rate_law_type == "hill_langmuir":
+            return set(self.catalysts[:2])
+        return set(self.reactants) | set(self.products) | set(self.catalysts)
+
+    def rate_sensitivity_orders(self) -> Dict[str, float]:
+        """
+        Tau-leaping's g_i for this reaction: for each species the rate reads,
+        a bound g such that changing every such species by a relative
+        amount of at most eps / g changes the rate by a relative amount of
+        at most about eps (Cao, Gillespie & Petzold 2006, generalized beyond
+        mass action).
+
+        - mass action, k * prod(c_s ** nu_s): the relative change is
+          sum(nu_s * dc_s / c_s), so g = total reaction order. (This
+          library's propensities are k c^nu rather than combinatorial, so
+          CGP's x-dependent corrections for nu > 1 aren't needed.)
+        - Michaelis-Menten, Vmax E S / (Km + S): sensitivity 1 to E and at
+          most 1 to S, so g = number of those species present.
+        - Hill-Langmuir: sensitivity 1 to E and at most n to z, so g = 1 + n.
+        - custom: unknown; a conservative _CUSTOM_RATE_ORDER for every
+          species the rate law can read.
+        """
+        if self.rate_law_type == "mass_action":
+            order = float(sum(self.reactants.values()))
+            return {s: order for s in self.reactants} if order > 0 else {}
+        if self.rate_law_type == "michaelis_menten":
+            deps = list(self.reactants)[:1] + list(self.catalysts)[:1]
+            return {s: float(len(deps)) for s in deps}
+        if self.rate_law_type == "hill_langmuir":
+            g = 1.0 + float(self.rate_params.get("n", 1.0))
+            return {s: g for s in self.catalysts[:2]}
+        return {s: _CUSTOM_RATE_ORDER for s in self.rate_dependencies()}
+
     def get_export_vector(self, exported_species_list: List[str]) -> np.ndarray:
         """
         Return this reaction's export stoichiometry for a given species ordering.
@@ -231,6 +375,34 @@ class ReactionNetwork:
         self._export_stoichiometry_matrix = self.get_export_stoichiometry_matrix(
             self.exported_species, self._reaction_names
         )
+
+        # Next Reaction Method dependency graph: after reaction j fires,
+        # only the reactions in `_dependency_graph[j]` (those whose rate
+        # reads a species j changes) need their propensity recomputed.
+        index = {s: i for i, s in enumerate(self.species)}
+        reactions = [self.reactions[name] for name in self._reaction_names]
+        self._rate_dependencies = [
+            {index[s] for s in rxn.rate_dependencies()} for rxn in reactions
+        ]
+        self._changed_species = [
+            np.flatnonzero(self._stoichiometry_matrix[:, j])
+            for j in range(len(reactions))
+        ]
+        self._dependency_graph = [
+            [
+                k
+                for k, deps in enumerate(self._rate_dependencies)
+                if deps.intersection(changed.tolist())
+            ]
+            for changed in self._changed_species
+        ]
+
+        # Tau-leaping's per-species g_i (0 = no rate law reads the species,
+        # so its changes don't constrain the leap size).
+        self._tau_orders = np.zeros(len(self.species))
+        for rxn in reactions:
+            for s, g in rxn.rate_sensitivity_orders().items():
+                self._tau_orders[index[s]] = max(self._tau_orders[index[s]], g)
 
         # Molecule counts (not concentrations) exported by the most recent
         # `simulate_step` call, keyed by exported species name. Set as a
@@ -289,6 +461,8 @@ class ReactionNetwork:
         rng: np.random.Generator = None,
         ode_method: str = "RK45",
         compartment_volumes: Dict[str, float] = None,
+        ssa_method: str = "direct",
+        tau_epsilon: float = DEFAULT_TAU_EPSILON,
     ) -> Dict[str, float]:
         """
         Advance the chemical state by one time step using the given simulation method.
@@ -315,6 +489,21 @@ class ReactionNetwork:
                 by its *own* compartment's volume, so molecule counts are
                 conserved across compartments. Species not listed live in
                 `volume`. Default None: every species lives in `volume`.
+            ssa_method: stochastic algorithm used when method is "SSA"
+                (ignored otherwise). Case-insensitive. One of:
+                "direct" (default): Gillespie's direct method; exact.
+                "next_reaction": Gibson & Bruck's Next Reaction Method;
+                exact, and faster than "direct" for networks with many
+                sparsely coupled reactions, since each firing only
+                recomputes the propensities it affects.
+                "tau_leaping": Cao, Gillespie & Petzold's adaptive
+                tau-leaping; approximate, but fires many reactions per leap,
+                so it's much faster at high copy numbers. Falls back to
+                exact firings when leaps would be tiny.
+            tau_epsilon: tau-leaping's error-control parameter (default
+                0.03): the largest relative change in any propensity
+                allowed during one leap. Smaller is more accurate and
+                slower. Ignored unless ssa_method is "tau_leaping".
 
         Returns:
             Updated concentration dictionary
@@ -328,9 +517,19 @@ class ReactionNetwork:
         if method == "ODE":
             return self._simulate_ode_step(state, dt, volume, ode_method, weights)
         elif method == "SSA":
-            return self._simulate_ssa_step(
-                state, dt, volume, rng or np.random.default_rng(), weights, external
-            )
+            rng = rng or np.random.default_rng()
+            ssa_method = _resolve_ssa_method(ssa_method)
+            if ssa_method == "next_reaction":
+                return self._simulate_next_reaction_step(
+                    state, dt, volume, rng, weights, external
+                )
+            if ssa_method == "tau_leaping":
+                if not tau_epsilon > 0:
+                    raise ValueError(f"tau_epsilon must be positive, got {tau_epsilon}")
+                return self._simulate_tau_leap_step(
+                    state, dt, volume, rng, weights, external, tau_epsilon
+                )
+            return self._simulate_ssa_step(state, dt, volume, rng, weights, external)
         elif method == "CLE":
             return self._simulate_cle_step(
                 state, dt, volume, rng or np.random.default_rng(), weights, external
@@ -350,6 +549,8 @@ class ReactionNetwork:
         seed: int = None,
         compartment_volumes: Dict[str, float] = None,
         show_progress: bool = False,
+        ssa_method: str = "direct",
+        tau_epsilon: float = DEFAULT_TAU_EPSILON,
     ) -> pd.DataFrame:
         """
         Simulate this network on its own (no Cell/Colony) from t=0 to `t_max`.
@@ -372,6 +573,9 @@ class ReactionNetwork:
             seed: seed for the generator created when `rng` is None.
             compartment_volumes: as in `simulate_step`.
             show_progress: show a tqdm progress bar.
+            ssa_method: "direct", "next_reaction", or "tau_leaping", used
+                when method is "SSA", as in `simulate_step`.
+            tau_epsilon: tau-leaping error control, as in `simulate_step`.
 
         Returns:
             DataFrame with a `time` column, one column per species (in
@@ -409,6 +613,8 @@ class ReactionNetwork:
                 rng=rng,
                 ode_method=ode_method,
                 compartment_volumes=compartment_volumes,
+                ssa_method=ssa_method,
+                tau_epsilon=tau_epsilon,
             )
             for s in self.exported_species:
                 exported[s] += self.last_exported[s]
@@ -681,46 +887,289 @@ class ReactionNetwork:
         that would drive any count negative is rejected (time advances, the
         state doesn't change), so mass is never created by clamping.
         """
-        species_list = self.species
+        counts, volumes = self._to_counts(state, volume, weights, external)
+        export_counts = np.zeros(len(self.exported_species))
+        counts, export_counts, _ = self._ssa_direct_firings(
+            counts, export_counts, volumes, volume, rng, 0.0, dt
+        )
+        return self._from_counts(counts, volumes, export_counts)
+
+    def _to_counts(self, state, volume, weights, external):
+        """
+        Convert a concentration dict to molecule counts for the SSA family.
+
+        Each species is counted in its own compartment's volume
+        (`volume / weights`, returned as `volumes`). Intracellular species
+        are rounded to whole molecules; species in another compartment
+        (`external`) keep their fractional amount, so rounding never creates
+        or destroys mass in a pool the network doesn't own.
+        """
+        n = len(self.species)
+        if weights is None:
+            weights = np.ones(n)
+            external = np.zeros(n, dtype=bool)
+        volumes = volume / weights
+        counts = np.array(
+            [state.get(s, 0.0) * volumes[i] for i, s in enumerate(self.species)]
+        )
+        counts = np.maximum(np.where(external, counts, np.round(counts)), 0.0)
+        return counts, volumes
+
+    def _from_counts(self, counts, volumes, export_counts):
+        """Set `last_exported` and convert counts back to a concentration dict."""
+        self.last_exported = {
+            s: export_counts[i] for i, s in enumerate(self.exported_species)
+        }
+        return {s: counts[i] / volumes[i] for i, s in enumerate(self.species)}
+
+    def _propensities(self, counts, volumes, volume):
+        """Every reaction's propensity (firings per unit time) at `counts`."""
+        conc = {s: counts[i] / volumes[i] for i, s in enumerate(self.species)}
+        return np.maximum(self._rate_vector(conc), 0.0) * volume
+
+    def _ssa_direct_firings(
+        self, counts, export_counts, volumes, volume, rng, t, t_end, max_firings=None
+    ):
+        """
+        Run Gillespie direct-method firings from time `t` toward `t_end`.
+
+        Stops at `t_end` or after `max_firings` firings (rejected firings,
+        which would drive a count negative, count too), whichever comes
+        first. Returns (counts, export_counts, t); `t` is `t_end` if the
+        window was exhausted (the next firing would overshoot it, or no
+        reaction can fire).
+        """
         S = self._stoichiometry_matrix
         S_exp = self._export_stoichiometry_matrix
         n_reactions = len(self._reaction_names)
-        if weights is None:
-            weights = np.ones(len(species_list))
-            external = np.zeros(len(species_list), dtype=bool)
-        volumes = volume / weights
-
-        counts = np.array(
-            [state.get(s, 0.0) * volumes[i] for i, s in enumerate(species_list)]
-        )
-        counts = np.maximum(np.where(external, counts, np.round(counts)), 0.0)
-        export_counts = np.zeros(len(self.exported_species))
-
-        t = 0.0
-        while t < dt:
-            conc = {s: counts[i] / volumes[i] for i, s in enumerate(species_list)}
-            propensities = np.maximum(self._rate_vector(conc), 0.0) * volume
+        fired = 0
+        while t < t_end and (max_firings is None or fired < max_firings):
+            propensities = self._propensities(counts, volumes, volume)
             a0 = propensities.sum()
-
             if a0 <= 0.0:
-                break
+                return counts, export_counts, t_end
 
             tau = rng.exponential(1.0 / a0)
-            if t + tau > dt:
-                break
+            if t + tau > t_end:
+                return counts, export_counts, t_end
 
             j = rng.choice(n_reactions, p=propensities / a0)
             t += tau
+            fired += 1
             new_counts = counts + S[:, j]
             if (new_counts < 0.0).any():
                 continue
             counts = new_counts
-            export_counts += S_exp[:, j]
+            export_counts = export_counts + S_exp[:, j]
+        return counts, export_counts, t
 
-        self.last_exported = {
-            s: export_counts[i] for i, s in enumerate(self.exported_species)
-        }
-        return {s: counts[i] / volumes[i] for i, s in enumerate(species_list)}
+    def _simulate_next_reaction_step(
+        self,
+        state: Dict[str, float],
+        dt: float,
+        volume: float,
+        rng: np.random.Generator,
+        weights: np.ndarray = None,
+        external: np.ndarray = None,
+    ) -> Dict[str, float]:
+        """
+        Gibson & Bruck's Next Reaction Method step, advancing exactly `dt`.
+
+        Exact, like the direct method, with the same count conversion,
+        compartment handling and rejection of firings that would drive a
+        count negative (see `_simulate_ssa_step`). Each reaction keeps an
+        absolute putative firing time in an indexed priority queue. After a
+        firing, only the reactions in `_dependency_graph` (those whose rate
+        law reads a species that changed) are re-evaluated, and their
+        unused waiting times are rescaled by a_old / a_new rather than
+        redrawn. Each firing therefore costs O(dependents * log M) rather
+        than the direct method's O(M) rate-law evaluations.
+
+        Putative times are not carried across steps. Between steps, growth,
+        division, diffusion and field exchange change the state outside the
+        network, so every propensity can change. Because waiting times are
+        memoryless, drawing fresh times at the start of each step is exact,
+        just as the direct method discards a waiting time that overshoots
+        `dt`.
+        """
+        S = self._stoichiometry_matrix
+        S_exp = self._export_stoichiometry_matrix
+        reactions = [self.reactions[name] for name in self._reaction_names]
+        counts, volumes = self._to_counts(state, volume, weights, external)
+        export_counts = np.zeros(len(self.exported_species))
+        if not reactions:
+            return self._from_counts(counts, volumes, export_counts)
+
+        conc = {s: counts[i] / volumes[i] for i, s in enumerate(self.species)}
+
+        def propensity(k):
+            return max(reactions[k].rate(conc), 0.0) * volume
+
+        a = [propensity(k) for k in range(len(reactions))]
+        draws = rng.exponential(size=len(reactions))
+        queue = _IndexedPriorityQueue(
+            [d / a_k if a_k > 0.0 else np.inf for d, a_k in zip(draws, a)]
+        )
+
+        while True:
+            mu, t = queue.min()
+            if t > dt:
+                break
+            new_counts = counts + S[:, mu]
+            if (new_counts < 0.0).any():
+                # Rejected: nothing changed, so only mu needs a new time.
+                queue.update(mu, t + rng.exponential() / a[mu])
+                continue
+            counts = new_counts
+            export_counts = export_counts + S_exp[:, mu]
+            for i in self._changed_species[mu]:
+                conc[self.species[i]] = counts[i] / volumes[i]
+
+            for k in self._dependency_graph[mu]:
+                if k == mu:
+                    continue
+                a_old, a_new = a[k], propensity(k)
+                a[k] = a_new
+                tau_k = queue.times[k]
+                if a_new <= 0.0:
+                    queue.update(k, np.inf)
+                elif a_old <= 0.0 or not np.isfinite(tau_k):
+                    queue.update(k, t + rng.exponential() / a_new)
+                else:
+                    queue.update(k, t + (a_old / a_new) * (tau_k - t))
+
+            a[mu] = propensity(mu)
+            queue.update(mu, t + rng.exponential() / a[mu] if a[mu] > 0.0 else np.inf)
+
+        return self._from_counts(counts, volumes, export_counts)
+
+    def _tau_leap_size(self, counts, a, noncritical, epsilon):
+        """
+        Cao, Gillespie & Petzold (2006) species-based leap size: the largest
+        tau for which every species' expected change and standard deviation
+        over the non-critical reactions stay within max(eps * x_i / g_i, 1),
+        so no propensity changes by more than about eps. Species no rate law
+        reads (g_i == 0) don't constrain it. Returns inf if nothing does.
+
+        One deviation from CGP: the drift term uses the gross flux
+        sum_j |S_ij| a_j rather than the net |sum_j S_ij a_j|. Near an
+        equilibrium the net drift cancels to ~0, and CGP then allows leaps
+        far longer than the relaxation time (e.g. tau ~ 9 / k for a
+        birth-death process at 2e4 copies). Explicit leaping over that is
+        unstable and inflates variance several-fold. With no opposing
+        reactions, the two are identical.
+        """
+        S_nc = self._stoichiometry_matrix[:, noncritical]
+        a_nc = a[noncritical]
+        mu = np.abs(S_nc) @ a_nc
+        sigma2 = (S_nc**2) @ a_nc
+        g = self._tau_orders
+        constrained = (g > 0.0) & ((mu != 0.0) | (sigma2 > 0.0))
+        if not constrained.any():
+            return np.inf
+        bound = np.maximum(epsilon * counts[constrained] / g[constrained], 1.0)
+        with np.errstate(divide="ignore"):
+            tau_mu = bound / np.abs(mu[constrained])
+            tau_sigma = bound**2 / sigma2[constrained]
+        return float(min(tau_mu.min(), tau_sigma.min()))
+
+    def _simulate_tau_leap_step(
+        self,
+        state: Dict[str, float],
+        dt: float,
+        volume: float,
+        rng: np.random.Generator,
+        weights: np.ndarray = None,
+        external: np.ndarray = None,
+        epsilon: float = DEFAULT_TAU_EPSILON,
+    ) -> Dict[str, float]:
+        """
+        Adaptive tau-leaping step (Cao, Gillespie & Petzold 2006), advancing
+        exactly `dt`.
+
+        Each leap:
+        1. Reactions within _N_CRITICAL firings of exhausting a reactant
+           are critical; the rest are leaped over.
+        2. The leap size tau' comes from `_tau_leap_size` (error control
+           `epsilon`). If tau' < 10 / a0, leaping wouldn't pay off, so up to
+           100 exact direct-method firings run instead.
+        3. The time to the next critical firing tau'' ~ Exp(a0_critical).
+           The leap is tau = min(tau', tau'', time left). Each non-critical
+           reaction fires Poisson(a_j * tau) times, and, if tau == tau'',
+           one critical reaction fires once.
+        4. If the non-critical firings would drive any count negative, the
+           leap is rejected and retried with tau' halved. A critical firing
+           that would drive a count negative is rejected on its own, as in
+           the direct method.
+
+        Counting, compartments and exports work as in `_simulate_ssa_step`:
+        whole molecules move, fractional external pools are never
+        overdrawn, and exports are tracked from the same firing counts, so
+        mass is conserved exactly.
+        """
+        S = self._stoichiometry_matrix
+        S_exp = self._export_stoichiometry_matrix
+        n_reactions = len(self._reaction_names)
+        counts, volumes = self._to_counts(state, volume, weights, external)
+        export_counts = np.zeros(len(self.exported_species))
+        consumed = S < 0.0
+        tau_cap = np.inf  # halved after each rejected leap; reset on success
+
+        t = 0.0
+        while t < dt:
+            a = self._propensities(counts, volumes, volume)
+            a0 = a.sum()
+            if a0 <= 0.0:
+                break
+
+            # L_j: firings of j left before a net reactant runs out.
+            with np.errstate(divide="ignore", invalid="ignore"):
+                limits = np.where(
+                    consumed, np.floor(counts[:, None] / np.abs(S)), np.inf
+                ).min(axis=0, initial=np.inf)
+            critical = (a > 0.0) & (limits < _N_CRITICAL)
+            noncritical = (a > 0.0) & ~critical
+
+            tau_p = min(self._tau_leap_size(counts, a, noncritical, epsilon), tau_cap)
+            if tau_p < _SSA_FALLBACK_THRESHOLD / a0:
+                counts, export_counts, t = self._ssa_direct_firings(
+                    counts,
+                    export_counts,
+                    volumes,
+                    volume,
+                    rng,
+                    t,
+                    dt,
+                    max_firings=_SSA_FALLBACK_FIRINGS,
+                )
+                tau_cap = np.inf
+                continue
+
+            a0_crit = a[critical].sum()
+            tau_pp = rng.exponential(1.0 / a0_crit) if a0_crit > 0.0 else np.inf
+            tau = min(tau_p, tau_pp, dt - t)
+
+            firings = np.zeros(n_reactions)
+            firings[noncritical] = rng.poisson(a[noncritical] * tau)
+            new_counts = counts + S @ firings
+            if (new_counts < 0.0).any():
+                tau_cap = tau_p / 2.0
+                continue
+
+            if tau == tau_pp:
+                crit_idx = np.flatnonzero(critical)
+                j = crit_idx[rng.choice(len(crit_idx), p=a[crit_idx] / a0_crit)]
+                after_crit = new_counts + S[:, j]
+                if not (after_crit < 0.0).any():
+                    new_counts = after_crit
+                    firings[j] += 1
+
+            counts = new_counts
+            export_counts = export_counts + S_exp @ firings
+            t = dt if tau == dt - t else t + tau  # land exactly on dt
+            tau_cap = np.inf
+
+        return self._from_counts(counts, volumes, export_counts)
 
     def _simulate_cle_step(
         self,

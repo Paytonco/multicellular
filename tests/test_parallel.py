@@ -2,10 +2,12 @@
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from multicellular.core.cell import Cell
 from multicellular.core.colony import Colony
 from multicellular.core.environment import Environment
+from multicellular.core.reactions import Reaction, ReactionNetwork
 from multicellular.utils.parallel import run_replicates
 
 
@@ -72,3 +74,27 @@ def test_run_replicates_matches_serial_simulation_for_a_fixed_seed():
     pd.testing.assert_frame_equal(
         df_parallel.drop(columns=["replicate_id"]), serial_df, check_like=True
     )
+
+
+def _build_decay_colony(replicate_id):
+    network = ReactionNetwork(
+        "decay", {"R": Reaction({"A": 1}, {}, rate_params={"k": 1.0})}
+    )
+    cell = Cell(
+        id=0,
+        position=[50.0, 50.0],
+        orientation=[1.0, 0.0],
+        network=network,
+        growth_rate=0.0,
+        rng=np.random.default_rng(replicate_id),
+    )
+    cell.set_concentration("A", 1.0)
+    return Colony([cell], Environment("env", wall_map=np.zeros((10, 10))))
+
+
+def test_run_replicates_forwards_ssa_method():
+    kwargs = dict(n_replicates=2, dt=0.1, t_max=0.3, simulation_method="SSA", n_jobs=1)
+    df = run_replicates(_build_decay_colony, ssa_method="next_reaction", **kwargs)
+    assert set(df["replicate_id"]) == {0, 1}
+    with pytest.raises(ValueError, match="Unknown SSA method"):
+        run_replicates(_build_decay_colony, ssa_method="bogus", **kwargs)

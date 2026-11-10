@@ -3,6 +3,8 @@
 import pandas as pd
 from tqdm import tqdm
 
+from .reactions import DEFAULT_TAU_EPSILON
+
 _DEFAULT_FILENAME = "simulation.gif"
 
 
@@ -13,7 +15,16 @@ class Simulation:
     every timestep.
     """
 
-    def __init__(self, colony, dt, t_max, simulation_method="ODE", ode_method="RK45"):
+    def __init__(
+        self,
+        colony,
+        dt,
+        t_max,
+        simulation_method="ODE",
+        ode_method="RK45",
+        ssa_method="direct",
+        tau_epsilon=DEFAULT_TAU_EPSILON,
+    ):
         """
         Args:
             simulation_method: how every cell's reaction network is advanced
@@ -23,12 +34,22 @@ class Simulation:
             ode_method: `scipy.integrate.solve_ivp` method used when
                 simulation_method is "ODE": "RK45" (default), "RK23",
                 "DOP853", "Radau", "BDF", or "LSODA".
+            ssa_method: stochastic algorithm used when simulation_method is
+                "SSA": "direct" (Gillespie's direct method, default),
+                "next_reaction" (Gibson & Bruck; exact, faster for large
+                sparsely coupled networks), or "tau_leaping" (adaptive
+                tau-leaping; approximate, much faster at high copy numbers).
+                Case-insensitive.
+            tau_epsilon: tau-leaping error control (default 0.03): the
+                largest relative propensity change allowed per leap.
         """
         self.colony = colony
         self.dt = dt
         self.t_max = t_max
         self.simulation_method = simulation_method.upper()
         self.ode_method = ode_method
+        self.ssa_method = ssa_method
+        self.tau_epsilon = tau_epsilon
         self.time = 0.0
         self.history = []
         self.env_history = []
@@ -74,7 +95,14 @@ class Simulation:
             record.update(cell.extracellular)
             self.history.append(record)
 
-    def run(self, show_progress=True, t_max=None, ode_method=None):
+    def run(
+        self,
+        show_progress=True,
+        t_max=None,
+        ode_method=None,
+        ssa_method=None,
+        tau_epsilon=None,
+    ):
         """
         Step the colony forward, recording state at every step.
 
@@ -83,7 +111,9 @@ class Simulation:
         `run` again continues from the current time instead of resetting
         it, appending to the existing history — pass a new, larger `t_max`
         to extend the simulated window. `ode_method`, if given, replaces the
-        `solve_ivp` method used for the rest of the simulation. This supports e.g. switching the
+        `solve_ivp` method used for the rest of the simulation, and
+        `ssa_method`/`tau_epsilon`, if given, likewise replace the
+        stochastic algorithm. This supports e.g. switching the
         colony's environment (via `colony.switch_environment`) partway
         through a simulation and continuing it.
         """
@@ -91,6 +121,10 @@ class Simulation:
             self.t_max = t_max
         if ode_method is not None:
             self.ode_method = ode_method
+        if ssa_method is not None:
+            self.ssa_method = ssa_method
+        if tau_epsilon is not None:
+            self.tau_epsilon = tau_epsilon
 
         if not self.history:
             self.time = 0.0
@@ -105,7 +139,13 @@ class Simulation:
             # Keep the colony's clock (which stamps lineage events) exactly
             # on the recorded times, rather than accumulating `+= dt` drift.
             self.colony.time = self.time
-            self.colony.step(self.dt, self.simulation_method, self.ode_method)
+            self.colony.step(
+                self.dt,
+                self.simulation_method,
+                self.ode_method,
+                ssa_method=self.ssa_method,
+                tau_epsilon=self.tau_epsilon,
+            )
             self.time = step_index * self.dt
             self.record()
 

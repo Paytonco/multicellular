@@ -384,8 +384,17 @@ def _total_copies(env, cells, field_name, species):
     return field_copies + sum(cell.copy_number(species) for cell in cells)
 
 
-@pytest.mark.parametrize("method", ["ODE", "SSA", "CLE"])
-def test_uptake_depletes_field_at_cell_voxel_and_conserves_mass(method):
+@pytest.mark.parametrize(
+    "method, ssa_method",
+    [
+        ("ODE", "direct"),
+        ("CLE", "direct"),
+        ("SSA", "direct"),
+        ("SSA", "next_reaction"),
+        ("SSA", "tau_leaping"),
+    ],
+)
+def test_uptake_depletes_field_at_cell_voxel_and_conserves_mass(method, ssa_method):
     values = np.full((10, 10), 2.0)
     field = Field("A", values, is_chemical=True)
     env = Environment(
@@ -401,7 +410,7 @@ def test_uptake_depletes_field_at_cell_voxel_and_conserves_mass(method):
 
     colony = Colony([cell], env, brownian_motion=False)
     for _ in range(20):
-        colony.step(dt=0.1, method=method)
+        colony.step(dt=0.1, method=method, ssa_method=ssa_method)
 
     assert field.values[5, 5] < 2.0
     assert cell.concentrations["A_int"] > 0.0
@@ -412,8 +421,17 @@ def test_uptake_depletes_field_at_cell_voxel_and_conserves_mass(method):
     assert _total_copies(env, [cell], "A", "A_int") == pytest.approx(initial, rel=1e-9)
 
 
-@pytest.mark.parametrize("method", ["ODE", "SSA", "CLE"])
-def test_uptake_conserves_mass_with_diffusion_and_growth(method):
+@pytest.mark.parametrize(
+    "method, ssa_method",
+    [
+        ("ODE", "direct"),
+        ("CLE", "direct"),
+        ("SSA", "direct"),
+        ("SSA", "next_reaction"),
+        ("SSA", "tau_leaping"),
+    ],
+)
+def test_uptake_conserves_mass_with_diffusion_and_growth(method, ssa_method):
     field = Field(
         "A", np.full((10, 10), 1.0), is_chemical=True, diffuses=True, diffusivity=1e-11
     )
@@ -436,7 +454,7 @@ def test_uptake_conserves_mass_with_diffusion_and_growth(method):
 
     colony = Colony([cell], env, brownian_motion=False)
     for _ in range(20):
-        colony.step(dt=0.1, method=method)
+        colony.step(dt=0.1, method=method, ssa_method=ssa_method)
 
     assert colony.cells == [cell]
     assert cell.length > 2.0
@@ -517,8 +535,19 @@ def test_catalyst_only_sensing_does_not_change_field():
     assert cell.concentrations["GFP"] > 0.0
 
 
-@pytest.mark.parametrize("method", ["ODE", "SSA", "CLE"])
-def test_cells_sharing_a_voxel_jointly_deplete_it_without_going_negative(method):
+@pytest.mark.parametrize(
+    "method, ssa_method",
+    [
+        ("ODE", "direct"),
+        ("CLE", "direct"),
+        ("SSA", "direct"),
+        ("SSA", "next_reaction"),
+        ("SSA", "tau_leaping"),
+    ],
+)
+def test_cells_sharing_a_voxel_jointly_deplete_it_without_going_negative(
+    method, ssa_method
+):
     # Tiny voxel (smaller than one cell) and fast uptake: the pool can't
     # cover every cell's demand, so cells must share it.
     field = Field("A", np.full((10, 10), 20.0), is_chemical=True)
@@ -537,7 +566,7 @@ def test_cells_sharing_a_voxel_jointly_deplete_it_without_going_negative(method)
     initial = _total_copies(env, cells, "A", "A_int")
 
     colony = Colony(cells, env, brownian_motion=False)
-    colony.step(dt=0.5, method=method)
+    colony.step(dt=0.5, method=method, ssa_method=ssa_method)
 
     assert field.values.min() >= 0.0
     assert _total_copies(env, cells, "A", "A_int") == pytest.approx(initial, rel=1e-6)

@@ -8,6 +8,7 @@ import numpy as np
 
 from .environment import WATER_DIFFUSIVITY_37C
 from .lineage import Lineage
+from .reactions import DEFAULT_TAU_EPSILON
 
 _kBT = 1.380649e-23 * 310.15  # J  (k_B × 37°C)
 
@@ -288,7 +289,14 @@ class Colony:
             }
             cell.growth_rate = cell.growth_rate_law(cell.concentrations, extracellular)
 
-    def step(self, dt, method="ODE", ode_method="RK45"):
+    def step(
+        self,
+        dt,
+        method="ODE",
+        ode_method="RK45",
+        ssa_method="direct",
+        tau_epsilon=DEFAULT_TAU_EPSILON,
+    ):
         """
         Advance all cells by one timestep, then enforce bounds and divisions.
 
@@ -299,15 +307,19 @@ class Colony:
                 "SSA", or "CLE").
             ode_method: `scipy.integrate.solve_ivp` method used when
                 `method` is "ODE" (default "RK45").
+            ssa_method: stochastic algorithm used when `method` is "SSA":
+                "direct" (default), "next_reaction", or "tau_leaping".
+            tau_epsilon: tau-leaping error control (default 0.03).
         """
         t_end = self.time + dt
         # Catch cells added or killed by hand since the last step before
         # this step's events are recorded.
         self._sync_lineage(self.time)
         self.environment.diffuse(dt)
-        self.environment.react(dt, method, ode_method)
+        stochastic = {"ssa_method": ssa_method, "tau_epsilon": tau_epsilon}
+        self.environment.react(dt, method, ode_method, **stochastic)
         self._update_growth_rates()
-        self._step_cells(dt, method, ode_method)
+        self._step_cells(dt, method, ode_method, **stochastic)
         self.export_chemical_fields()
         self.sample_chemical_fields()
         self.enforce_bounds(t_end)
@@ -326,7 +338,14 @@ class Colony:
         """Vectorized nearest-grid-point (row, col) indices for an (n, 2) array of positions in μm."""
         return self.environment.grid_indices(positions)
 
-    def _step_cells(self, dt, method, ode_method):
+    def _step_cells(
+        self,
+        dt,
+        method,
+        ode_method,
+        ssa_method="direct",
+        tau_epsilon=DEFAULT_TAU_EPSILON,
+    ):
         """
         Step every cell, exchanging mass with the chemical Fields its
         reaction network references.
@@ -361,7 +380,13 @@ class Colony:
                 coupled.append(cell)
                 coupled_species.append(species)
             else:
-                cell.step(dt, method, ode_method)
+                cell.step(
+                    dt,
+                    method,
+                    ode_method,
+                    ssa_method=ssa_method,
+                    tau_epsilon=tau_epsilon,
+                )
         if not coupled:
             return
 
@@ -371,7 +396,15 @@ class Colony:
         for k in self.environment.rng.permutation(len(coupled)):
             i, j = i_idx[k], j_idx[k]
             external = {s: float(chemical[s].values[i, j]) for s in coupled_species[k]}
-            updated = coupled[k].step(dt, method, ode_method, external, voxel_volume)
+            updated = coupled[k].step(
+                dt,
+                method,
+                ode_method,
+                external,
+                voxel_volume,
+                ssa_method=ssa_method,
+                tau_epsilon=tau_epsilon,
+            )
             for s, value in updated.items():
                 chemical[s].values[i, j] = value
 

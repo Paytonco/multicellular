@@ -20,7 +20,8 @@ tested:
 - Chemical reaction networks (mass-action, Michaelis-Menten, Hill-Langmuir,
   custom rate laws), simulated via ODE (`scipy.integrate.solve_ivp`, with
   explicit or stiff solvers), the chemical Langevin equation (CLE), or
-  Gillespie SSA, either inside cells or on their own via
+  stochastic simulation (Gillespie's direct method, Gibson-Bruck's Next
+  Reaction Method, or adaptive tau-leaping), either inside cells or on their own via
   `ReactionNetwork.simulate()`
 - Environment with spatially-varying diffusivity and viscosity fields, plus
   per-field diffusion (a mass-conserving finite-difference solver) for any
@@ -305,6 +306,46 @@ Michaelis-Menten and Hill-Langmuir.
   extracellular pool; see below) is rejected rather than clipped, so SSA
   never creates mass.
 
+#### Choosing an SSA algorithm (`ssa_method`)
+
+When `method="SSA"`, `ssa_method` picks the stochastic algorithm, the same
+way `ode_method` picks the integrator for `"ODE"`. All three share the
+count conversion, compartment handling, export tracking, and
+reject-instead-of-clip rule described above.
+
+| `ssa_method` | Exact? | Use it for |
+|---|---|---|
+| `"direct"` (default) | yes | Small networks: Gillespie's direct method, as above. |
+| `"next_reaction"` | yes | Networks with many reactions, each touching few species. Gibson & Bruck's Next Reaction Method keeps each reaction's next firing time in an indexed priority queue. It uses a dependency graph to recompute only the propensities a firing affects, and rescales their unused waiting times instead of redrawing them. |
+| `"tau_leaping"` | no | High copy numbers, where exact methods spend most of their time firing reactions one by one. This is Cao, Gillespie & Petzold's (2006) adaptive tau-leaping. Each leap fires a Poisson number of every reaction, with the leap size chosen so no propensity changes by more than about `tau_epsilon` (default `0.03`). |
+
+Tau-leaping details:
+- Reactions within 10 firings of exhausting a reactant are fired one at a
+  time rather than leaped over.
+- When a leap would be shorter than about 10 expected firings, the method
+  falls back to exact direct-method firings, so at low copy numbers it
+  behaves like `"direct"`.
+- A leap that would drive a count negative is retried with half the size.
+- Each species' leap bound uses the sensitivity of the rate laws that read
+  it: the reaction order for `mass_action`, `1 + n` for `hill_langmuir`, and
+  `1`–`2` for `michaelis_menten`. For `custom` rate laws, which can't be
+  inspected, it assumes a conservative `3`. Lower `tau_epsilon` if a custom
+  law is steeper than that.
+- The drift bound uses each species' gross flux rather than its net flux.
+  This keeps leaps short near equilibria, where explicit leaping would
+  otherwise overshoot and inflate the variance.
+- Smaller `tau_epsilon` is more accurate and slower.
+
+Putative firing times (NRM) are not carried between steps. Growth, division,
+diffusion and field exchange change the state between steps, and because
+waiting times are memoryless, redrawing them at each step is exact.
+
+```python
+new_state = network.simulate_step(
+    state, dt=0.1, volume=100.0, method="SSA", rng=rng, ssa_method="tau_leaping"
+)
+```
+
 #### Simulating a network on its own (`simulate`)
 
 To run a network over time without building a `Cell`, `Colony`, or
@@ -323,7 +364,7 @@ df = network.simulate({"A": 1.0}, t_max=10.0, dt=0.1, volume=100.0, method="SSA"
 - Species missing from the initial state start at 0. A name that isn't a
   network species raises `ValueError`.
 - The run takes `round(t_max / dt)` steps, and row `k` is at `time = k * dt`.
-- `method`, `ode_method`, `volume`, and `compartment_volumes` mean the same
+- `method`, `ode_method`, `ssa_method`, `tau_epsilon`, `volume`, and `compartment_volumes` mean the same
   as in `simulate_step`. `volume` only matters for `"SSA"`/`"CLE"`, where it
   sets the molecule count per unit concentration (and so the noise level).
 - One random generator is used for the whole run: pass `seed` for a
@@ -429,8 +470,9 @@ chemical.
 
 A `Cell` can be given a `ReactionNetwork`; calling `cell.step(dt)` advances
 both its internal chemistry and its growth. `cell.step` takes optional
-`method` (`"ODE"` by default, or `"CLE"`/`"SSA"`) and `ode_method`
-(default `"RK45"`) arguments, which it forwards to the network's
+`method` (`"ODE"` by default, or `"CLE"`/`"SSA"`), `ode_method`
+(default `"RK45"`), `ssa_method` (default `"direct"`), and `tau_epsilon`
+(default `0.03`) arguments, which it forwards to the network's
 `simulate_step`. `Colony.step` and `Simulation` use these to apply the
 simulation method chosen when the `Simulation` was created (see
 [`Simulation`](#simulation) below):
@@ -990,8 +1032,8 @@ colony = Colony(cells, env, survival_conditions=[("A", ">", 0), ("B", "<=", 10)]
 ```
 
 `colony.step(dt)` performs the following operations in order. Its optional
-`method` (default `"ODE"`) and `ode_method` (default `"RK45"`) arguments
-are forwarded to every cell's `Cell.step` (see
+`method` (default `"ODE"`), `ode_method` (default `"RK45"`), `ssa_method`
+(default `"direct"`), and `tau_epsilon` (default `0.03`) arguments are forwarded to every cell's `Cell.step` (see
 [Cell with an internal reaction network](#cell-with-an-internal-reaction-network)
 above) and to `environment.react`:
 
@@ -1237,7 +1279,9 @@ method used to advance every cell's `ReactionNetwork` each step. Pass
 `simulation_method="ODE"` (the default), `"SSA"`, or `"CLE"` when
 constructing it, plus `ode_method` (default `"RK45"`) to choose the
 `solve_ivp` integrator for `"ODE"`, e.g. `"LSODA"` or `"BDF"` for a stiff
-network:
+network, or `ssa_method` (default `"direct"`; also `"next_reaction"` or
+`"tau_leaping"`, with `tau_epsilon`) to choose the stochastic algorithm for
+`"SSA"` (see [Choosing an SSA algorithm](#choosing-an-ssa-algorithm-ssa_method)):
 
 ```python
 import numpy as np
@@ -1249,7 +1293,11 @@ colony = Colony([cell], env)
 
 sim = Simulation(colony, dt=0.1, t_max=10.0, simulation_method="ODE",  # or "SSA"/"CLE"
                  ode_method="RK45")  # or "LSODA", "BDF", "Radau", ...
-df = sim.run()  # pandas DataFrame, one row per cell per recorded timestep
+df = sim.run()
+
+# Stochastic, with adaptive tau-leaping for high-copy-number chemistry:
+sim = Simulation(colony, dt=0.1, t_max=10.0, simulation_method="SSA",
+                 ssa_method="tau_leaping", tau_epsilon=0.03)  # pandas DataFrame, one row per cell per recorded timestep
 ```
 
 `sim.run()` records the initial state, then repeatedly calls
@@ -1289,8 +1337,9 @@ Calling `sim.run()` again continues the simulation instead of restarting it:
 it picks up from the current `sim.time` and appends new records to the
 existing `sim.history` (`sim.env_history` and `sim.field_history` too)
 rather than clearing them. Pass a new, larger `t_max` to extend how far it
-runs (`sim.run(t_max=...)`). Pass `ode_method=` to switch integrators for
-the rest of the run. Both are useful e.g. to simulate further after calling
+runs (`sim.run(t_max=...)`). Pass `ode_method=` (or `ssa_method=` /
+`tau_epsilon=`) to switch integrators or stochastic algorithms for the rest
+of the run. Both are useful e.g. to simulate further after calling
 `colony.switch_environment(...)` — see
 [Switching environments](#switching-environments) above. Calling `run()` a
 second time with the same `t_max` it already reached is a no-op.
@@ -1362,8 +1411,9 @@ df = run_replicates(build_colony, n_replicates=50, dt=0.01, t_max=10.0, n_jobs=-
   worker process) and must return a fresh `Colony`. Give each cell's `rng`
   a distinct seed (e.g. derived from `replicate_id`) so replicates don't
   share — or accidentally duplicate — a random stream.
-- `simulation_method` (`"ODE"` by default, or `"SSA"`/`"CLE"`) and
-  `ode_method` (default `"RK45"`) are forwarded to every replicate's
+- `simulation_method` (`"ODE"` by default, or `"SSA"`/`"CLE"`),
+  `ode_method` (default `"RK45"`), `ssa_method` (default `"direct"`), and
+  `tau_epsilon` (default `0.03`) are forwarded to every replicate's
   `Simulation`.
 - `n_jobs` is forwarded to `joblib.Parallel`; `-1` (the default) uses every
   available core, and a smaller positive number caps how many to use.

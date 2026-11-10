@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from .reactions import RateLawNotVectorizedError
+from .reactions import DEFAULT_TAU_EPSILON, RateLawNotVectorizedError
 
 # Diffusivity of water at 37°C in m²/s (physiological temperature).
 WATER_DIFFUSIVITY_37C = 3.0e-9  # m²/s
@@ -265,7 +265,14 @@ class Environment:
                 C = np.where(is_wall, C, C + D * sub_dt * laplacian)
             field.values = C
 
-    def react(self, dt, method="ODE", ode_method="RK45"):
+    def react(
+        self,
+        dt,
+        method="ODE",
+        ode_method="RK45",
+        ssa_method="direct",
+        tau_epsilon=DEFAULT_TAU_EPSILON,
+    ):
         """
         Advance `self.reactions` by dt, independently at every non-wall grid
         cell (voxel), using the given simulation method. No-op if
@@ -296,7 +303,9 @@ class Environment:
         react normally, also like `diffuse`.
 
         `ode_method` is the `scipy.integrate.solve_ivp` method used when
-        `method` is "ODE" (default "RK45").
+        `method` is "ODE" (default "RK45"). `ssa_method` ("direct",
+        "next_reaction", or "tau_leaping") and `tau_epsilon` pick the
+        stochastic algorithm used when `method` is "SSA".
 
         Raises:
             ValueError: if `self.reactions` references a species with no
@@ -343,7 +352,14 @@ class Environment:
                     continue
                 state = {s: float(values[s][i, j]) for s in species_list}
                 new_state = network.simulate_step(
-                    state, dt, volume, method, rng=self.rng, ode_method=ode_method
+                    state,
+                    dt,
+                    volume,
+                    method,
+                    rng=self.rng,
+                    ode_method=ode_method,
+                    ssa_method=ssa_method,
+                    tau_epsilon=tau_epsilon,
                 )
                 for s, value in new_state.items():
                     values[s][i, j] = value

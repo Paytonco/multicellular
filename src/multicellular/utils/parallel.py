@@ -6,15 +6,30 @@ import pandas as pd
 from joblib import Parallel, delayed
 
 from multicellular.core.colony import Colony
+from multicellular.core.reactions import DEFAULT_TAU_EPSILON
 from multicellular.core.simulation import Simulation
 
 
 def _run_one(
-    build_colony, replicate_id, dt, t_max, simulation_method, ode_method, show_progress
+    build_colony,
+    replicate_id,
+    dt,
+    t_max,
+    simulation_method,
+    ode_method,
+    show_progress,
+    ssa_method="direct",
+    tau_epsilon=DEFAULT_TAU_EPSILON,
 ):
     colony = build_colony(replicate_id)
     sim = Simulation(
-        colony, dt, t_max, simulation_method=simulation_method, ode_method=ode_method
+        colony,
+        dt,
+        t_max,
+        simulation_method=simulation_method,
+        ode_method=ode_method,
+        ssa_method=ssa_method,
+        tau_epsilon=tau_epsilon,
     )
     df = sim.run(show_progress=show_progress)
     df = df.copy()
@@ -31,6 +46,8 @@ def run_replicates(
     ode_method: str = "RK45",
     n_jobs: int = -1,
     show_progress: bool = False,
+    ssa_method: str = "direct",
+    tau_epsilon: float = DEFAULT_TAU_EPSILON,
 ) -> pd.DataFrame:
     """
     Run independent Simulations in parallel worker processes.
@@ -57,6 +74,11 @@ def run_replicates(
             own tqdm bar. Off by default since N bars interleaving across
             processes is unreadable; the replicates themselves are not
             individually progress-tracked here.
+        ssa_method: Forwarded to each replicate's `Simulation`; the
+            stochastic algorithm used when `simulation_method` is "SSA"
+            ("direct", "next_reaction", or "tau_leaping").
+        tau_epsilon: Forwarded to each replicate's `Simulation`;
+            tau-leaping error control (default 0.03).
 
     Returns:
         A single DataFrame, the concatenation of every replicate's
@@ -65,7 +87,15 @@ def run_replicates(
     """
     results = Parallel(n_jobs=n_jobs)(
         delayed(_run_one)(
-            build_colony, i, dt, t_max, simulation_method, ode_method, show_progress
+            build_colony,
+            i,
+            dt,
+            t_max,
+            simulation_method,
+            ode_method,
+            show_progress,
+            ssa_method,
+            tau_epsilon,
         )
         for i in range(n_replicates)
     )

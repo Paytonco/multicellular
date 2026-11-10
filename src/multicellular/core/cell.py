@@ -4,6 +4,8 @@ import math
 
 import numpy as np
 
+from .reactions import DEFAULT_TAU_EPSILON
+
 SHAPES = ("rod", "sphere")
 
 
@@ -235,7 +237,14 @@ class Cell:
         self.concentrations = {s: n / volume for s, n in copy_numbers.items()}
 
     def step(
-        self, dt, method="ODE", ode_method="RK45", external=None, external_volume=None
+        self,
+        dt,
+        method="ODE",
+        ode_method="RK45",
+        external=None,
+        external_volume=None,
+        ssa_method="direct",
+        tau_epsilon=DEFAULT_TAU_EPSILON,
     ):
         """
         Advance cell internal state (chemical + growth). No-op if dead.
@@ -257,6 +266,9 @@ class Cell:
                 never partitions them).
             external_volume: volume (μm³) of the compartment holding the
                 `external` species. Required if `external` is given.
+            ssa_method: stochastic algorithm used when `method` is "SSA":
+                "direct" (default), "next_reaction", or "tau_leaping".
+            tau_epsilon: tau-leaping error control (default 0.03).
 
         Returns:
             dict of `external` species → updated concentration (empty if
@@ -280,6 +292,8 @@ class Cell:
                 rng=self.rng,
                 ode_method=ode_method,
                 compartment_volumes={s: external_volume for s in external},
+                ssa_method=ssa_method,
+                tau_epsilon=tau_epsilon,
             )
             self.concentrations = {
                 s: c for s, c in new_state.items() if s not in external

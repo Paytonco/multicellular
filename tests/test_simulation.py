@@ -264,3 +264,43 @@ def test_simulation_records_anchored_column():
     host_rows = df[df["cell_id"] == 0]
     assert (host_rows["position_x"] == 10.0).all()
     assert (host_rows["radius"] == 3.0).all()
+
+
+def _ssa_decay_colony():
+    network = ReactionNetwork(
+        "decay", {"R": Reaction({"A": 1}, {}, rate_params={"k": 1.0})}
+    )
+    cell = Cell(
+        id=0,
+        position=[50.0, 50.0],
+        orientation=[1.0, 0.0],
+        network=network,
+        growth_rate=0.0,
+        rng=np.random.default_rng(0),
+    )
+    cell.set_concentration("A", 1.0)
+    return Colony([cell], Environment("env", wall_map=np.zeros((10, 10))))
+
+
+@pytest.mark.parametrize("ssa_method", ["direct", "next_reaction", "tau_leaping"])
+def test_simulation_runs_each_ssa_method(ssa_method):
+    sim = Simulation(
+        _ssa_decay_colony(),
+        dt=0.1,
+        t_max=1.0,
+        simulation_method="SSA",
+        ssa_method=ssa_method,
+    )
+    df = sim.run(show_progress=False)
+    assert df["A"].iloc[-1] < df["A"].iloc[0]
+
+
+def test_simulation_forwards_ssa_method_and_run_overrides_it():
+    sim = Simulation(_ssa_decay_colony(), dt=0.1, t_max=0.5, simulation_method="SSA")
+    sim.run(show_progress=False)
+    assert sim.ssa_method == "direct"
+    with pytest.raises(ValueError, match="Unknown SSA method"):
+        sim.run(show_progress=False, t_max=1.0, ssa_method="bogus")
+    sim.run(show_progress=False, t_max=1.0, ssa_method="tau_leaping", tau_epsilon=0.01)
+    assert (sim.ssa_method, sim.tau_epsilon) == ("tau_leaping", 0.01)
+    assert sim.time == pytest.approx(1.0)

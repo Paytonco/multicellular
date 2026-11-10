@@ -140,7 +140,8 @@ def test_react_excludes_wall_cells():
     assert np.allclose(field.values[wall_map == 0], 2.0 * np.exp(-1.0), rtol=1e-4)
 
 
-def test_react_ssa_conserves_total_copy_number_for_isomerization():
+@pytest.mark.parametrize("ssa_method", ["direct", "next_reaction", "tau_leaping"])
+def test_react_ssa_conserves_total_copy_number_for_isomerization(ssa_method):
     network = _isomerization_network()
     field_a = Field("A", np.full((2, 2), 5.0))
     field_b = Field("B", np.full((2, 2), 1.0))
@@ -160,7 +161,7 @@ def test_react_ssa_conserves_total_copy_number_for_isomerization():
             reactions=network,
             rng=rng,
         )
-        env.react(1.0, method="SSA")
+        env.react(1.0, method="SSA", ssa_method=ssa_method)
         total_after = env.fields["A"].values + env.fields["B"].values
         assert np.allclose(total_after, total_before)
 

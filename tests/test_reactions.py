@@ -715,3 +715,328 @@ def test_simulate_tracks_cumulative_exports():
 def test_simulate_invalid_method_raises():
     with pytest.raises(ValueError, match="Unknown simulation method"):
         _decay().simulate({"A": 1.0}, t_max=1.0, dt=0.1, method="euler")
+
+
+# --- SSA sub-methods: direct, Next Reaction Method, tau-leaping -------------
+
+SSA_METHODS = ["direct", "next_reaction", "tau_leaping"]
+
+
+class _CountingRng:
+    """Wraps a Generator and counts every random draw, to measure work done."""
+
+    def __init__(self, seed):
+        self._rng = np.random.default_rng(seed)
+        self.calls = 0
+
+    def __getattr__(self, name):
+        attr = getattr(self._rng, name)
+
+        def counted(*args, **kwargs):
+            self.calls += 1
+            return attr(*args, **kwargs)
+
+        return counted
+
+
+@pytest.mark.parametrize("ssa_method", SSA_METHODS + ["Next_Reaction"])
+def test_ssa_methods_conserve_integer_counts(ssa_method):
+    net = _linear_ab_network(k=1.0)
+    volume = 10.0
+    for seed in range(10):
+        new_state = net.simulate_step(
+            {"A": 10.0, "B": 0.0},
+            dt=0.5,
+            volume=volume,
+            method="SSA",
+            rng=np.random.default_rng(seed),
+            ssa_method=ssa_method,
+        )
+        count_a, count_b = new_state["A"] * volume, new_state["B"] * volume
+        assert count_a == pytest.approx(round(count_a), abs=1e-9)
+        assert count_b == pytest.approx(round(count_b), abs=1e-9)
+        assert count_a + count_b == pytest.approx(100.0, abs=1e-9)
+
+
+@pytest.mark.parametrize("ssa_method", SSA_METHODS)
+def test_ssa_methods_zero_propensity_is_noop(ssa_method):
+    new_state = _linear_ab_network().simulate_step(
+        {"A": 0.0, "B": 0.0},
+        dt=1.0,
+        volume=1.0,
+        method="SSA",
+        rng=np.random.default_rng(0),
+        ssa_method=ssa_method,
+    )
+    assert new_state == {"A": 0.0, "B": 0.0}
+
+
+@pytest.mark.parametrize("ssa_method", SSA_METHODS)
+def test_ssa_methods_match_analytic_mean_and_variance(ssa_method):
+    # A -> B from 100 copies: B ~ Binomial(100, 1 - exp(-k dt)). At this copy
+    # number tau-leaping falls back to exact firings, so all three are exact.
+    k, volume, dt, a0 = 1.0, 10.0, 0.05, 100.0
+    net = _linear_ab_network(k=k)
+    b = np.array(
+        [
+            net.simulate_step(
+                {"A": a0 / volume, "B": 0.0},
+                dt=dt,
+                volume=volume,
+                method="SSA",
+                rng=np.random.default_rng(i),
+                ssa_method=ssa_method,
+            )["B"]
+            * volume
+            for i in range(3000)
+        ]
+    )
+    p = 1.0 - np.exp(-k * dt)
+    assert b.mean() == pytest.approx(a0 * p, abs=0.5)
+    assert b.var() == pytest.approx(a0 * p * (1 - p), rel=0.1)
+
+
+def test_tau_leaping_matches_analytic_statistics_at_high_copy_number():
+    # Birth-death at steady state (2e4 copies): Poisson-like, mean = var.
+    net = ReactionNetwork(
+        "birth_death",
+        {
+            "birth": Reaction({}, {"X": 1}, rate_params={"k": 2e4}),
+            "death": Reaction({"X": 1}, {}, rate_params={"k": 1.0}),
+        },
+    )
+    rng = np.random.default_rng(0)
+    x = np.array(
+        [
+            net.simulate_step(
+                {"X": 2e4}, 2.0, 1.0, "SSA", rng=rng, ssa_method="tau_leaping"
+            )["X"]
+            for _ in range(400)
+        ]
+    )
+    expected_var = 2e4 * (1 - np.exp(-4.0))  # started exactly at the mean
+    assert x.mean() == pytest.approx(2e4, abs=30)
+    assert x.var() == pytest.approx(expected_var, rel=0.2)
+
+
+def test_tau_leaping_does_far_less_work_than_direct_at_high_copy_number():
+    net = _linear_ab_network(k=1.0)
+    state = {"A": 1e5, "B": 0.0}
+    work = {}
+    for method in ("direct", "tau_leaping"):
+        rng = _CountingRng(0)
+        new = net.simulate_step(state, 0.1, 1.0, "SSA", rng=rng, ssa_method=method)
+        assert new["A"] + new["B"] == pytest.approx(1e5)
+        work[method] = rng.calls
+    assert work["tau_leaping"] * 100 < work["direct"]
+
+
+def test_smaller_tau_epsilon_takes_smaller_leaps():
+    net = _linear_ab_network(k=1.0)
+    calls = {}
+    for eps in (0.03, 0.003):
+        rng = _CountingRng(0)
+        net.simulate_step(
+            {"A": 1e5},
+            0.5,
+            1.0,
+            "SSA",
+            rng=rng,
+            ssa_method="tau_leaping",
+            tau_epsilon=eps,
+        )
+        calls[eps] = rng.calls
+    assert calls[0.003] > 3 * calls[0.03]
+
+
+def test_tau_leaping_never_drives_counts_negative():
+    # Zero-order consumption: its propensity doesn't vanish as A runs out, so
+    # only critical-reaction handling and leap rejection keep A >= 0.
+    rxn = Reaction(
+        {"A": 1},
+        {"B": 1},
+        rate_law_type="custom",
+        custom_rate_law=lambda r, p, c, params: params["k"],
+        rate_params={"k": 1e4},
+    )
+    net = ReactionNetwork("zero_order", {"R": rxn})
+    for seed in range(20):
+        new = net.simulate_step(
+            {"A": 500.0, "B": 0.0},
+            0.1,
+            1.0,
+            "SSA",
+            rng=np.random.default_rng(seed),
+            ssa_method="tau_leaping",
+        )
+        assert new["A"] >= 0.0
+        assert new["A"] == pytest.approx(round(new["A"]))
+        assert new["A"] + new["B"] == pytest.approx(500.0)
+
+
+@pytest.mark.parametrize("ssa_method", SSA_METHODS)
+def test_ssa_methods_efflux_conserves_mass_exactly(ssa_method):
+    net = _efflux_network(k=1.0)
+    volume = 10.0
+    new_state = net.simulate_step(
+        {"X": 10.0},
+        dt=0.5,
+        volume=volume,
+        method="SSA",
+        rng=np.random.default_rng(0),
+        ssa_method=ssa_method,
+    )
+    assert new_state["X"] * volume + net.last_exported["X"] == pytest.approx(100.0)
+    assert net.last_exported["X"] > 0
+
+
+@pytest.mark.parametrize("ssa_method", SSA_METHODS)
+def test_ssa_methods_efflux_stops_once_pool_is_empty(ssa_method):
+    net = _efflux_network(k=1.0)
+    new_state = net.simulate_step(
+        {"X": 0.0},
+        dt=1.0,
+        volume=1.0,
+        method="SSA",
+        rng=np.random.default_rng(0),
+        ssa_method=ssa_method,
+    )
+    assert new_state["X"] == 0.0
+    assert net.last_exported["X"] == 0.0
+
+
+@pytest.mark.parametrize("ssa_method", SSA_METHODS)
+def test_ssa_methods_keep_external_fraction_and_conserve_counts(ssa_method):
+    net = _uptake_network(k=1.0)
+    volume, v_ext = 2.0, 13.7
+    state = {"A_ext": 3.3, "A_int": 1.0}  # 45.21 extracellular molecules
+    initial = state["A_ext"] * v_ext + state["A_int"] * volume
+    for seed in range(10):
+        new = net.simulate_step(
+            state,
+            0.5,
+            volume,
+            "SSA",
+            rng=np.random.default_rng(seed),
+            compartment_volumes={"A_ext": v_ext},
+            ssa_method=ssa_method,
+        )
+        n_int, n_ext = new["A_int"] * volume, new["A_ext"] * v_ext
+        assert n_int == pytest.approx(round(n_int), abs=1e-9)
+        assert n_ext % 1.0 == pytest.approx(0.21, abs=1e-9)
+        assert n_int + n_ext == pytest.approx(initial, abs=1e-9)
+
+
+@pytest.mark.parametrize("ssa_method", SSA_METHODS)
+def test_ssa_methods_reject_overdrawing_external_pool(ssa_method):
+    net = _uptake_network(k=100.0)
+    new = net.simulate_step(
+        {"A_ext": 0.5, "A_int": 0.0},  # half a molecule outside
+        1.0,
+        2.0,
+        "SSA",
+        rng=np.random.default_rng(0),
+        compartment_volumes={"A_ext": 1.0},
+        ssa_method=ssa_method,
+    )
+    assert new == {"A_ext": 0.5, "A_int": 0.0}
+
+
+@pytest.mark.parametrize("ssa_method", SSA_METHODS)
+def test_simulate_with_ssa_method_reproducible_with_seed(ssa_method):
+    kwargs = dict(t_max=5.0, dt=0.5, volume=100.0, method="ssa", ssa_method=ssa_method)
+    df1 = _conversion().simulate({"A": 1.0}, seed=1, **kwargs)
+    df2 = _conversion().simulate({"A": 1.0}, seed=1, **kwargs)
+    df3 = _conversion().simulate({"A": 1.0}, seed=2, **kwargs)
+    assert df1.equals(df2)
+    assert not df1.equals(df3)
+
+
+def test_unknown_ssa_method_raises():
+    with pytest.raises(ValueError, match="Unknown SSA method"):
+        _decay().simulate_step({"A": 1.0}, 1.0, 1.0, "SSA", ssa_method="bogus")
+
+
+@pytest.mark.parametrize("method", ["ODE", "CLE"])
+def test_ssa_method_ignored_by_other_methods(method):
+    net = _decay()
+    kwargs = dict(rng=np.random.default_rng(0))
+    a = net.simulate_step({"A": 1.0}, 0.1, 1.0, method, **kwargs)
+    kwargs = dict(rng=np.random.default_rng(0))
+    b = net.simulate_step({"A": 1.0}, 0.1, 1.0, method, ssa_method="bogus", **kwargs)
+    assert a == b
+
+
+def test_nonpositive_tau_epsilon_raises():
+    with pytest.raises(ValueError, match="tau_epsilon"):
+        _decay().simulate_step(
+            {"A": 1.0}, 1.0, 1.0, "SSA", ssa_method="tau_leaping", tau_epsilon=0.0
+        )
+
+
+def test_dependency_graph_tracks_reactants_catalysts_and_products():
+    reactions = {
+        # Makes P; P is read by "hill" (as activator) and "custom" (as product).
+        "make_p": Reaction({"A": 1}, {"P": 1}, rate_params={"k": 1.0}),
+        "hill": Reaction(
+            {},
+            {"G": 1},
+            catalysts=["E", "P"],
+            rate_law_type="hill_langmuir",
+            rate_params={"alpha": 5, "beta": 1, "C": 1, "n": 2},
+        ),
+        "custom": Reaction(
+            {"Q": 1},
+            {"P": 1},
+            rate_law_type="custom",
+            custom_rate_law=lambda r, p, c, params: r["Q"] / (1 + p["P"]),
+        ),
+        "decay_g": Reaction({"G": 1}, {}, rate_params={"k": 1.0}),
+    }
+    net = ReactionNetwork("deps", reactions)
+    names = net._reaction_names
+
+    def dependents(name):
+        return {names[k] for k in net._dependency_graph[names.index(name)]}
+
+    # make_p changes A (read by itself) and P (read by hill, and by custom
+    # as a product).
+    assert dependents("make_p") == {"make_p", "hill", "custom"}
+    # hill's rate doesn't read its own product G.
+    assert dependents("hill") == {"decay_g"}
+    assert dependents("custom") == {"hill", "custom"}
+    assert dependents("decay_g") == {"decay_g"}
+
+
+def test_rate_sensitivity_orders():
+    mass_action = Reaction({"A": 2, "B": 1}, {"C": 1})
+    assert mass_action.rate_sensitivity_orders() == {"A": 3.0, "B": 3.0}
+    hill = Reaction(
+        {},
+        {"G": 1},
+        catalysts=["E", "z"],
+        rate_law_type="hill_langmuir",
+        rate_params={"alpha": 5, "beta": 1, "C": 1, "n": 2},
+    )
+    assert hill.rate_sensitivity_orders() == {"E": 3.0, "z": 3.0}
+    mm = Reaction({"S": 1}, {"P": 1}, rate_law_type="michaelis_menten")
+    assert mm.rate_sensitivity_orders() == {"S": 1.0}
+    assert Reaction({}, {"X": 1}).rate_sensitivity_orders() == {}
+
+
+def test_indexed_priority_queue():
+    from multicellular.core.reactions import _IndexedPriorityQueue
+
+    rng = np.random.default_rng(0)
+    times = rng.random(50)
+    queue = _IndexedPriorityQueue(times)
+    for _ in range(500):
+        item = int(rng.integers(50))
+        new_time = np.inf if rng.random() < 0.1 else rng.random()
+        queue.update(item, new_time)
+        times[item] = new_time
+        j, t = queue.min()
+        assert t == times.min()
+        assert times[j] == t
+    assert sorted(queue.pos[i] for i in range(50)) == list(range(50))
+    assert all(queue.heap[queue.pos[i]] == i for i in range(50))
