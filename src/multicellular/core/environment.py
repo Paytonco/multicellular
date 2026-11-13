@@ -2,6 +2,7 @@
 
 import numpy as np
 
+from . import _batch, _kernels
 from .reactions import DEFAULT_TAU_EPSILON, RateLawNotVectorizedError
 
 # Diffusivity of water at 37°C in m²/s (physiological temperature).
@@ -148,6 +149,26 @@ class Environment:
         self.rng = rng or np.random.default_rng()
 
     @property
+    def wall_arrays(self):
+        """
+        `wall_faces` and `wall_corners` as float arrays of shape (n, 6) and
+        (n, 2), for the compiled contact kernel. Rebuilt only when either
+        list is replaced or changes length.
+        """
+        key = (
+            id(self.wall_faces),
+            len(self.wall_faces),
+            id(self.wall_corners),
+            len(self.wall_corners),
+        )
+        cached = getattr(self, "_wall_arrays", None)
+        if cached is None or cached[0] != key:
+            faces = np.array(self.wall_faces, dtype=float).reshape(-1, 6)
+            corners = np.array(self.wall_corners, dtype=float).reshape(-1, 2)
+            cached = self._wall_arrays = (key, faces, corners)
+        return cached[1], cached[2]
+
+    @property
     def grid_cell_volume(self):
         """
         Physical volume (μm³) of a single grid cell: dx * dy * depth.
@@ -205,7 +226,18 @@ class Environment:
         i, j = self.grid_indices(np.array([[x, y]]))
         return bool(self.wall_map[i[0], j[0]] != -1)
 
-    def diffuse(self, dt):
+    def in_bounds_many(self, positions):
+        """`in_bounds` for an (n, 2) array of positions at once; returns a bool array."""
+        positions = np.asarray(positions, dtype=float).reshape(-1, 2)
+        x, y = positions[:, 0], positions[:, 1]
+        width, height = self.size
+        inside = (0 <= x) & (x <= width) & (0 <= y) & (y <= height)
+        if inside.any():
+            i, j = self.grid_indices(positions[inside])
+            inside[inside] = self.wall_map[i, j] != -1
+        return inside
+
+    def diffuse(self, dt, backend="numba"):
         """
         Advance every diffusive field by dt under the 2D diffusion equation
         ∂C/∂t = D ∇²C, using an explicit centered-difference (FTCS) scheme
@@ -227,6 +259,11 @@ class Environment:
         FTCS is only stable for dt <= dx²dy² / (2D(dx²+dy²)); rather than
         require the caller to pick a small enough dt, each field is advanced
         in however many equal sub-steps are needed to satisfy that bound.
+
+        With `backend="numba"` (default), every sub-step runs in one
+        compiled, parallel kernel (`_kernels.ftcs_diffuse`) with no
+        temporary arrays; "python" uses the numpy implementation below.
+        Both compute the same stencil, term for term.
         """
         diffusive_fields = [field for field in self.fields.values() if field.diffuses]
         if not diffusive_fields:
@@ -239,6 +276,22 @@ class Environment:
         inv_dy2 = 1.0 / dy**2
 
         is_wall = self.wall_map == 1
+        if backend == "numba":
+            for field in diffusive_fields:
+                D = field.diffusivity
+                stable_dt = 0.5 / (D * (inv_dx2 + inv_dy2))
+                n_steps = max(1, int(np.ceil(dt / stable_dt)))
+                sub_dt = dt / n_steps
+                field.values = _kernels.ftcs_diffuse(
+                    np.asarray(field.values, dtype=float),
+                    is_wall,
+                    D * sub_dt,
+                    inv_dy2,
+                    inv_dx2,
+                    n_steps,
+                )
+            return
+
         wall_padded = np.pad(is_wall, 1, mode="edge")
         up_wall = wall_padded[2:, 1:-1]
         down_wall = wall_padded[:-2, 1:-1]
@@ -272,6 +325,7 @@ class Environment:
         ode_method="RK45",
         ssa_method="direct",
         tau_epsilon=DEFAULT_TAU_EPSILON,
+        backend="numba",
     ):
         """
         Advance `self.reactions` by dt, independently at every non-wall grid
@@ -307,6 +361,11 @@ class Environment:
         "next_reaction", or "tau_leaping") and `tau_epsilon` pick the
         stochastic algorithm used when `method` is "SSA".
 
+        With `backend="numba"` (default), SSA and CLE step every voxel in
+        one parallel compiled kernel call (see `core/_kernels.py`), each
+        voxel from its own seed drawn from `self.rng`; "python" (and any
+        network with a `custom` rate law) steps voxels one at a time.
+
         Raises:
             ValueError: if `self.reactions` references a species with no
                 matching Field in `self.fields`. Checked before any Field is
@@ -341,6 +400,25 @@ class Environment:
             else:
                 for s, arr in new_values.items():
                     self.fields[s].values[medium] = arr
+                return
+
+        if str(method).upper() != "ODE" and backend == "numba":
+            medium = ~is_wall
+            conc = np.stack(
+                [
+                    np.asarray(self.fields[s].values[medium], dtype=float)
+                    for s in species_list
+                ],
+                axis=1,
+            )
+            # One seed per voxel, in a single draw: the voxels then run in
+            # parallel without the result depending on the thread count.
+            seeds = self.rng.integers(0, 2**64, size=len(conc), dtype=np.uint64)
+            if _batch.step_compartments(
+                network, conc, volume, method, dt, ssa_method, tau_epsilon, seeds
+            ):
+                for k, s in enumerate(species_list):
+                    self.fields[s].values[medium] = conc[:, k]
                 return
 
         n_rows, n_cols = self.shape

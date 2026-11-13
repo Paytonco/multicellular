@@ -6,13 +6,18 @@ from collections import Counter
 
 import numpy as np
 
+from . import _batch, _kernels, _mechanics
+from ._mechanics import (
+    _PARALLEL_TOL,
+    _contact_force,
+    _segment_point_closest,
+    _segment_segment_closest,
+)
 from .environment import WATER_DIFFUSIVITY_37C
 from .lineage import Lineage
 from .reactions import DEFAULT_TAU_EPSILON
 
 _kBT = 1.380649e-23 * 310.15  # J  (k_B × 37°C)
-
-_PARALLEL_TOL = 1e-10  # denom threshold for segment-segment parallel detection
 
 # Comparison operators usable in a Colony survival condition, e.g. ("A", ">", 0).
 _COMPARISONS = {
@@ -25,76 +30,33 @@ _COMPARISONS = {
 }
 
 
-def _segment_segment_closest(a1x, a1y, b1x, b1y, a2x, a2y, b2x, b2y):
+# Extra spawn-key entry marking a per-cell stream derived by `_cell_stream`,
+# so it can't collide with a child the user spawns from the same Generator.
+_CELL_STREAM_SALT = 0x6D756C7469
+
+BACKENDS = ("numba", "python")
+
+
+def _cell_stream(rng, cell_id):
     """
-    Closest points between segment [a1, b1] and segment [a2, b2], given as
-    raw x/y floats rather than vectors.
+    A Generator for one founder cell, derived from `rng`'s seed and the
+    cell's id (not from `rng`'s current state or the cell's list position).
 
-    Returns (p1x, p1y, p2x, p2y, d): p1 on seg1, p2 on seg2, d = |p1 - p2|.
-    Operates on plain floats (instead of building/dot-producting small numpy
-    arrays) since this runs once per candidate contact pair, every step.
-
-    When segments are nearly parallel, uses the midpoint of their overlapping
-    axial projection rather than a degenerate endpoint, per the physics spec.
+    Keyed by id so a cell's random stream doesn't change when unrelated
+    cells are added to or removed from the colony, and so every cell owns
+    its stream outright: stepping cells in parallel, in any order, then
+    draws exactly what stepping them one at a time would.
     """
-    d1x, d1y = b1x - a1x, b1y - a1y
-    d2x, d2y = b2x - a2x, b2y - a2y
-    wx, wy = a1x - a2x, a1y - a2y
-
-    a = d1x * d1x + d1y * d1y
-    b = d1x * d2x + d1y * d2y
-    c = d2x * d2x + d2y * d2y
-    e = d1x * wx + d1y * wy
-    f = d2x * wx + d2y * wy
-
-    denom = a * c - b * b  # zero iff segments are parallel
-
-    if denom < _PARALLEL_TOL:
-        # Parallel or degenerate: project seg2 endpoints onto seg1 and use the
-        # midpoint of the overlapping range, or the nearest endpoint pair if
-        # there is no axial overlap.
-        if a < _PARALLEL_TOL:
-            s = 0.0
-        else:
-            t0 = ((a2x - a1x) * d1x + (a2y - a1y) * d1y) / a
-            t1 = ((b2x - a1x) * d1x + (b2y - a1y) * d1y) / a
-            lo = max(0.0, min(t0, t1))
-            hi = min(1.0, max(t0, t1))
-            s = (lo + hi) / 2.0 if lo <= hi else min(max(-e / a, 0.0), 1.0)
-
-        p1x, p1y = a1x + s * d1x, a1y + s * d1y
-        if c > _PARALLEL_TOL:
-            t = min(max(((p1x - a2x) * d2x + (p1y - a2y) * d2y) / c, 0.0), 1.0)
-        else:
-            t = 0.0
-        p2x, p2y = a2x + t * d2x, a2y + t * d2y
-    else:
-        # General (non-parallel) case: closed-form minimum with clamped parameters.
-        # Clamp s, recompute t, clamp t, then recompute s once more.
-        s = min(max((b * f - c * e) / denom, 0.0), 1.0)
-        t = min(max((b * s + f) / c, 0.0), 1.0) if c > _PARALLEL_TOL else 0.0
-        s = min(max((-e + b * t) / a, 0.0), 1.0) if a > _PARALLEL_TOL else 0.0
-        p1x, p1y = a1x + s * d1x, a1y + s * d1y
-        p2x, p2y = a2x + t * d2x, a2y + t * d2y
-
-    d = math.hypot(p1x - p2x, p1y - p2y)
-    return p1x, p1y, p2x, p2y, d
-
-
-def _segment_point_closest(a1x, a1y, b1x, b1y, px, py):
-    """
-    Closest point on segment [a1, b1] to point (px, py).
-
-    Returns (qx, qy, d): q the closest axis point, d = |q - (px, py)|.
-    """
-    dx, dy = b1x - a1x, b1y - a1y
-    len_sq = dx * dx + dy * dy
-    if len_sq < _PARALLEL_TOL:
-        t = 0.0
-    else:
-        t = min(max(((px - a1x) * dx + (py - a1y) * dy) / len_sq, 0.0), 1.0)
-    qx, qy = a1x + t * dx, a1y + t * dy
-    return qx, qy, math.hypot(qx - px, qy - py)
+    seed_seq = getattr(rng.bit_generator, "seed_seq", None)
+    if not isinstance(seed_seq, np.random.SeedSequence):
+        return np.random.default_rng(rng.integers(2**63))
+    child = np.random.SeedSequence(
+        entropy=seed_seq.entropy,
+        # Spawn keys must be non-negative; map any id into uint64 range.
+        spawn_key=(*seed_seq.spawn_key, _CELL_STREAM_SALT, int(cell_id) % 2**64),
+        pool_size=seed_seq.pool_size,
+    )
+    return np.random.Generator(type(rng.bit_generator)(child))
 
 
 def _pair_contact(ci, cj, ep_i, ep_j, k):
@@ -103,29 +65,16 @@ def _pair_contact(ci, cj, ep_i, ep_j, k):
     tuples. Returns None if they don't overlap, else (Fx, Fy, pcx, pcy):
     the force on ci (cj feels its negative) and the contact point.
     """
-    a1x, a1y, b1x, b1y, cix, ciy = ep_i
-    a2x, a2y, b2x, b2y, cjx, cjy = ep_j
-    p1x, p1y, p2x, p2y, d = _segment_segment_closest(
-        a1x, a1y, b1x, b1y, a2x, a2y, b2x, b2y
+    hit, Fx, Fy, pcx, pcy = _contact_force(
+        ep_i,
+        ep_j,
+        ci.radius,
+        cj.radius,
+        float(ci.orientation[0]),
+        float(ci.orientation[1]),
+        k,
     )
-    delta = ci.radius + cj.radius - d
-    if delta <= 0.0:
-        return None
-
-    # Contact normal: unit vector from j toward i. When axes coincide
-    # (d≈0), fall back to center-to-center direction, then to ci's
-    # perpendicular if centers also coincide.
-    if d > 1e-12:
-        Nx, Ny = (p1x - p2x) / d, (p1y - p2y) / d
-    else:
-        sepx, sepy = cix - cjx, ciy - cjy
-        sep_norm = math.hypot(sepx, sepy)
-        if sep_norm > 1e-12:
-            Nx, Ny = sepx / sep_norm, sepy / sep_norm
-        else:
-            Nx, Ny = -float(ci.orientation[1]), float(ci.orientation[0])
-
-    return k * delta * Nx, k * delta * Ny, (p1x + p2x) / 2.0, (p1y + p2y) / 2.0
+    return (Fx, Fy, pcx, pcy) if hit else None
 
 
 class Colony:
@@ -157,6 +106,7 @@ class Colony:
         drag=1.0,
         survival_conditions=None,
         brownian_motion=True,
+        backend="numba",
     ):
         """
         Args:
@@ -190,7 +140,22 @@ class Colony:
                 Set False to disable thermal motion entirely, e.g. for a
                 tightly-confined geometry where only contact forces should
                 move cells.
+            backend: "numba" (default) steps cells in batched, compiled,
+                multi-threaded kernels; "python" uses the original one-cell-
+                at-a-time Python code, kept as a reference implementation.
+                Networks with a `custom` rate law always take the Python
+                path. A plain attribute, so it can be switched between steps.
+
+        Every founder cell (a cell present at construction, or appended to
+        `cells` by hand) is given its own random stream, derived from its
+        `rng`'s seed and its id (see `_cell_stream`); daughters get child
+        streams spawned from their parent's at division. Cells therefore
+        never share a Generator, which is what lets them be stepped in
+        parallel without the results depending on thread count.
         """
+        if backend not in BACKENDS:
+            raise ValueError(f"backend must be one of {BACKENDS}, got {backend!r}.")
+        self.backend = backend
         self.cells = list(cells)
         self.environment = environment
         self.k = k
@@ -227,6 +192,7 @@ class Colony:
                 self._next_id = cell.id + 1
             if cell.id in self.lineage:
                 continue
+            cell.rng = _cell_stream(cell.rng, cell.id)
             if cell.root_id is None:
                 cell.root_id = cell.id
             self.lineage.register_founder(cell, time)
@@ -311,13 +277,22 @@ class Colony:
                 "direct" (default), "next_reaction", or "tau_leaping".
             tau_epsilon: tau-leaping error control (default 0.03).
         """
+        if self.backend == "numba":
+            with _batch.single_threaded_blas():
+                self._step(dt, method, ode_method, ssa_method, tau_epsilon)
+        else:
+            self._step(dt, method, ode_method, ssa_method, tau_epsilon)
+
+    def _step(self, dt, method, ode_method, ssa_method, tau_epsilon):
         t_end = self.time + dt
         # Catch cells added or killed by hand since the last step before
         # this step's events are recorded.
         self._sync_lineage(self.time)
-        self.environment.diffuse(dt)
+        self.environment.diffuse(dt, backend=self.backend)
         stochastic = {"ssa_method": ssa_method, "tau_epsilon": tau_epsilon}
-        self.environment.react(dt, method, ode_method, **stochastic)
+        self.environment.react(
+            dt, method, ode_method, backend=self.backend, **stochastic
+        )
         self._update_growth_rates()
         self._step_cells(dt, method, ode_method, **stochastic)
         self.export_chemical_fields()
@@ -325,11 +300,14 @@ class Colony:
         self.enforce_bounds(t_end)
         self.enforce_survival_conditions(t_end)
         alive = self.living_cells
-        if self.brownian_motion:
-            mobile = [cell for cell in alive if not cell.anchored]
-            noise = self._draw_brownian_noise(mobile)
-            self._apply_brownian_motion(dt, mobile, noise)
-        self._apply_contact_forces(dt, alive)
+        if self.backend == "numba":
+            self._move_cells_numba(dt, alive)
+        else:
+            if self.brownian_motion:
+                mobile = [cell for cell in alive if not cell.anchored]
+                noise = self._draw_brownian_noise(mobile)
+                self._apply_brownian_motion(dt, mobile, noise)
+            self._apply_contact_forces(dt, alive)
         self.handle_divisions(t_end)
         self.time = t_end
         self.lineage.time = t_end
@@ -349,6 +327,46 @@ class Colony:
         """
         Step every cell, exchanging mass with the chemical Fields its
         reaction network references.
+
+        With the "numba" backend, cells are stepped in batches by
+        `_batch.step_cells`: one joint `solve_ivp` for ODE, in which cells
+        sharing a voxel draw from its pool simultaneously, or one parallel
+        kernel call for SSA/CLE, in which they draw from it one after
+        another as described below. Cells whose network has a `custom`
+        rate law are then stepped by the Python path below.
+        """
+        cells = self.cells
+        if self.backend == "numba":
+            cells = _batch.step_cells(
+                cells,
+                self.environment,
+                dt,
+                method,
+                ode_method,
+                ssa_method=ssa_method,
+                tau_epsilon=tau_epsilon,
+            )
+        self._step_cells_python(
+            cells,
+            dt,
+            method,
+            ode_method,
+            ssa_method=ssa_method,
+            tau_epsilon=tau_epsilon,
+        )
+
+    def _step_cells_python(
+        self,
+        cells,
+        dt,
+        method,
+        ode_method,
+        ssa_method="direct",
+        tau_epsilon=DEFAULT_TAU_EPSILON,
+    ):
+        """
+        Step `cells` one at a time (the "python" backend, and the fallback
+        for networks the "numba" backend can't compile).
 
         Any network species sharing a chemical (`is_chemical=True`) Field's
         name is that Field's extracellular species: the cell's reactions
@@ -370,7 +388,7 @@ class Colony:
             if field.is_chemical
         }
         coupled, coupled_species = [], []
-        for cell in self.cells:
+        for cell in cells:
             species = (
                 [s for s in cell.network.species if s in chemical]
                 if cell.alive and cell.network and chemical
@@ -475,14 +493,13 @@ class Colony:
         Draw the 3 standard-normal samples (parallel, perpendicular,
         rotational) each living cell needs for its Brownian kick this step.
 
-        Calls are batched per distinct rng instance (most cells share one
-        Generator, inherited from parent to daughters at division) instead of
-        issuing one Python-level standard_normal(3) call per cell. A Generator
-        only advances its own stream when its own method is called, and
-        requesting N draws in one batched call consumes that stream
-        identically to N separate calls of the same total size, so each
-        cell's draw is bit-for-bit the same as before — this only removes
-        per-call dispatch overhead.
+        Calls are batched per distinct rng instance. A Colony gives every
+        cell its own Generator, but cells stepped outside one (or handed a
+        shared Generator by hand) may share one, and requesting N draws in
+        one batched call consumes a stream identically to N separate calls
+        of the same total size, so batching only removes per-call overhead.
+        (The "numba" backend draws its Brownian noise in a kernel instead;
+        see `_move_cells_numba`.)
         """
         n = len(alive)
         noise = [None] * n
@@ -524,8 +541,24 @@ class Colony:
         radii = np.array([cell.radius for cell in alive])
         orientations = np.array([cell.orientation for cell in alive])
         is_sphere = np.array([cell.shape == "sphere" for cell in alive])
-        xi = np.asarray(noise)
+        dr_x, dr_y, omega = self._brownian_kicks(
+            dt, positions, lengths, radii, orientations, is_sphere, np.asarray(noise)
+        )
 
+        for idx, cell in enumerate(alive):
+            cell.position[0] += dr_x[idx]
+            cell.position[1] += dr_y[idx]
+            cell.apply_torque(omega[idx], dt)
+
+    def _brownian_kicks(
+        self, dt, positions, lengths, radii, orientations, is_sphere, xi
+    ):
+        """
+        The math of `_apply_brownian_motion`: each cell's Brownian
+        displacement (dr_x, dr_y, in μm) and angular velocity omega, from
+        its (parallel, perpendicular, rotational) standard-normal triple in
+        `xi`.
+        """
         i_idx, j_idx = self._field_indices(positions)
         eta = self.environment.eta[i_idx, j_idx]
         D_field = self.environment.diffusivity[i_idx, j_idx]
@@ -569,11 +602,63 @@ class Colony:
 
         # Rotational Brownian kick
         omega = xi_rot * np.sqrt(2.0 * D_rot / dt)
+        return dr_x, dr_y, omega
 
-        for idx, cell in enumerate(alive):
-            cell.position[0] += dr_x[idx]
-            cell.position[1] += dr_y[idx]
-            cell.apply_torque(omega[idx], dt)
+    def _move_cells_numba(self, dt, alive):
+        """
+        Brownian motion then contact forces (the "numba" backend's version
+        of the two `step` calls), on one set of gathered arrays: cells are
+        read once and written back once.
+
+        Each mobile cell's Brownian noise comes from a compiled generator
+        seeded by one raw draw from the cell's own stream, so it is
+        independent of thread count, like every other per-cell draw.
+        """
+        mobile = [cell for cell in alive if not cell.anchored]
+        if not mobile:
+            return
+        anchored = [cell for cell in alive if cell.anchored]
+        n = len(mobile)
+        pos = np.array([cell.position for cell in mobile], dtype=float)
+        ori = np.array([cell.orientation for cell in mobile], dtype=float)
+        lengths = np.array([cell.length for cell in mobile], dtype=float)
+        radii = np.array([cell.radius for cell in mobile], dtype=float)
+        is_sphere = np.array([cell.shape == "sphere" for cell in mobile])
+
+        if self.brownian_motion:
+            seeds = np.fromiter(
+                (cell.rng.bit_generator.random_raw() for cell in mobile),
+                dtype=np.uint64,
+                count=n,
+            )
+            xi = _kernels.normals_from_seeds(seeds, 3)
+            dr_x, dr_y, omega = self._brownian_kicks(
+                dt, pos, lengths, radii, ori, is_sphere, xi
+            )
+            pos[:, 0] += dr_x
+            pos[:, 1] += dr_y
+            # `Cell.apply_torque`, vectorized.
+            angle = omega * dt
+            cos_a, sin_a = np.cos(angle), np.sin(angle)
+            nx = cos_a * ori[:, 0] - sin_a * ori[:, 1]
+            ny = sin_a * ori[:, 0] + cos_a * ori[:, 1]
+            norm = np.hypot(nx, ny)
+            nonzero = norm != 0.0
+            safe = np.where(nonzero, norm, 1.0)
+            ori[:, 0] = np.where(nonzero, nx / safe, 1.0)
+            ori[:, 1] = np.where(nonzero, ny / safe, 0.0)
+
+        px, py = pos[:, 0].copy(), pos[:, 1].copy()
+        ox, oy = ori[:, 0].copy(), ori[:, 1].copy()
+        self._contact_step_arrays(
+            dt, anchored, px, py, ox, oy, lengths, radii, is_sphere
+        )
+        for idx, cell in enumerate(mobile):
+            position, orientation = cell.position, cell.orientation
+            position[0] = px[idx]
+            position[1] = py[idx]
+            orientation[0] = ox[idx]
+            orientation[1] = oy[idx]
 
     def _build_spatial_grid(self, alive, return_bin_size=False):
         """
@@ -635,6 +720,9 @@ class Colony:
         """
         if alive is None:
             alive = self.living_cells
+        if self.backend == "numba":
+            self._apply_contact_forces_numba(dt, alive)
+            return
         mobile = [cell for cell in alive if not cell.anchored]
         n = len(mobile)
         if n == 0:
@@ -746,6 +834,69 @@ class Colony:
             cell.position[1] += forces_y[i] / zeta_t * dt
             cell.apply_torque(torques[i] / zeta_r, dt)
 
+    def _apply_contact_forces_numba(self, dt, alive):
+        """
+        `_apply_contact_forces` via the parallel `_mechanics.contact_step`
+        kernel: gather the cells into arrays, step, and write back.
+        """
+        mobile = [cell for cell in alive if not cell.anchored]
+        if not mobile:
+            return
+        anchored = [cell for cell in alive if cell.anchored]
+        pos = np.array([cell.position for cell in mobile], dtype=float)
+        ori = np.array([cell.orientation for cell in mobile], dtype=float)
+        px, py = pos[:, 0].copy(), pos[:, 1].copy()
+        ox, oy = ori[:, 0].copy(), ori[:, 1].copy()
+        self._contact_step_arrays(
+            dt,
+            anchored,
+            px,
+            py,
+            ox,
+            oy,
+            np.array([cell.length for cell in mobile], dtype=float),
+            np.array([cell.radius for cell in mobile], dtype=float),
+            np.array([cell.shape == "sphere" for cell in mobile]),
+        )
+        for idx, cell in enumerate(mobile):
+            position, orientation = cell.position, cell.orientation
+            position[0] = px[idx]
+            position[1] = py[idx]
+            orientation[0] = ox[idx]
+            orientation[1] = oy[idx]
+
+    def _contact_step_arrays(
+        self, dt, anchored, px, py, ox, oy, lengths, radii, is_sphere
+    ):
+        """Run `_mechanics.contact_step` on mobile-cell arrays (updated in place)."""
+        if anchored:
+            apos = np.array([cell.position for cell in anchored], dtype=float)
+            aori = np.array([cell.orientation for cell in anchored], dtype=float)
+        else:
+            apos = aori = np.zeros((0, 2))
+        faces, corners = self.environment.wall_arrays
+        _mechanics.contact_step(
+            px,
+            py,
+            ox,
+            oy,
+            lengths,
+            radii,
+            is_sphere,
+            np.ascontiguousarray(apos[:, 0]),
+            np.ascontiguousarray(apos[:, 1]),
+            np.ascontiguousarray(aori[:, 0]),
+            np.ascontiguousarray(aori[:, 1]),
+            np.array([cell.length for cell in anchored], dtype=float),
+            np.array([cell.radius for cell in anchored], dtype=float),
+            float(self.k),
+            float(self.k_wall),
+            float(self.drag),
+            float(dt),
+            faces,
+            corners,
+        )
+
     @staticmethod
     def _axis_endpoints(cell):
         """(a_x, a_y, b_x, b_y, c_x, c_y): a cell's axis segment endpoints and center, as floats."""
@@ -854,10 +1005,15 @@ class Colony:
         recording its death in the lineage at `time` (default `self.time`).
         """
         time = self.time if time is None else time
-        for cell in self.cells:
-            if cell.alive and not self.environment.in_bounds(cell.position):
-                cell.kill("out_of_bounds")
-                self.lineage.register_death(cell, time, "out_of_bounds")
+        living = [cell for cell in self.cells if cell.alive]
+        if not living:
+            return
+        inside = self.environment.in_bounds_many(
+            np.array([cell.position for cell in living], dtype=float)
+        )
+        for cell in (c for c, ok in zip(living, inside) if not ok):
+            cell.kill("out_of_bounds")
+            self.lineage.register_death(cell, time, "out_of_bounds")
 
     def enforce_survival_conditions(self, time=None):
         """

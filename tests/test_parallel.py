@@ -98,3 +98,21 @@ def test_run_replicates_forwards_ssa_method():
     assert set(df["replicate_id"]) == {0, 1}
     with pytest.raises(ValueError, match="Unknown SSA method"):
         run_replicates(_build_decay_colony, ssa_method="bogus", **kwargs)
+
+
+def test_run_replicates_limits_inner_threads_when_replicates_run_in_parallel(
+    monkeypatch,
+):
+    from multicellular.utils import parallel
+
+    captured = []
+    original = parallel._run_one
+
+    def spy(*args):
+        captured.append(args[-1])
+        return original(*args)
+
+    monkeypatch.setattr(parallel, "_run_one", spy)
+    parallel.run_replicates(_build_growing_colony, 2, 0.1, 0.2, n_jobs=1)
+    parallel.run_replicates(_build_growing_colony, 2, 0.1, 0.2, n_jobs=1, n_threads=3)
+    assert captured == [None, None, 3, 3]

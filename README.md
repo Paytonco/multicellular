@@ -44,6 +44,9 @@ tested:
   chemical `Field` over time via `Simulation.visualize_field()`, saved as an
   animated GIF or an MP4 video; static heatmaps of one or more `Field`s at a
   point in time via `Simulation.plot_field()`
+- Compiled, multi-threaded stepping within a single run (numba): batched
+  reaction networks, contact mechanics and diffusion; see
+  [Performance and parallelism](#performance-and-parallelism)
 - Running independent simulation replicates across multiple CPU cores via
   `run_replicates()`
 
@@ -62,7 +65,13 @@ pip install -e .
 
 This installs the `multicellular` package (from `src/multicellular`) in
 editable mode, along with its dependencies: `numpy`, `scipy`, `pandas`,
-`matplotlib`, `tqdm`, `pillow`, `joblib`, `imageio`, and `imageio-ffmpeg`.
+`matplotlib`, `tqdm`, `pillow`, `joblib`, `numba`, `threadpoolctl`,
+`imageio`, and `imageio-ffmpeg`.
+
+`numba` compiles the kernels that step a colony in parallel (see
+[Performance and parallelism](#performance-and-parallelism)); the first run
+after installing spends a few seconds compiling them, and later runs load
+them from numba's on-disk cache.
 
 The last two are what let animations be saved as MP4 video; `imageio-ffmpeg`
 bundles its own copy of `ffmpeg`, so there is nothing to install separately.
@@ -1422,13 +1431,68 @@ df = run_replicates(build_colony, n_replicates=50, dt=0.01, t_max=10.0, n_jobs=-
   from different replicates can be told apart (each replicate also numbers
   its own cells from `cell_id` 0 independently, so always group/filter by
   `replicate_id` first when comparing across replicates).
-- This parallelizes *across* independent simulations only — it does not
-  speed up the internal step loop of any single simulation. A single
-  `Simulation.run()` call still runs single-process, exactly as before;
-  parallelism is strictly opt-in via `run_replicates`.
+- Replicates run in separate processes; each one's own step loop is
+  itself multi-threaded (see
+  [Performance and parallelism](#performance-and-parallelism)). To keep the
+  two levels from oversubscribing the cores, `n_threads` (the threads each
+  replicate may use) defaults to 1 whenever `n_jobs != 1`. Pass it
+  explicitly to split cores differently, e.g. `n_jobs=4, n_threads=2` on 8
+  cores.
 - `show_progress` (default `False`) controls whether each individual
   replicate's own `Simulation.run()` shows its tqdm bar; left on, bars from
   different worker processes interleave and are hard to read.
+
+### Performance and parallelism
+
+Within a single run, a `Colony` steps every cell in batches rather than one
+at a time, using compiled (numba) kernels that run across all CPU cores:
+
+- **Reaction networks, ODE:** one `solve_ivp` call integrates every cell
+  at once, together with one copy of each extracellular (chemical `Field`)
+  species per occupied voxel. Cells sharing a voxel draw from that pool
+  *simultaneously*. (The original one-cell-at-a-time path steps them in a
+  random order, each seeing the pool after the previous cell; the two agree
+  as `dt` shrinks.)
+- **Reaction networks, SSA/CLE:** a parallel kernel runs every
+  `ssa_method` and CLE. Cells not coupled to a Field run independently;
+  cells coupled to a Field run voxel by voxel, in random order within each
+  voxel, exactly as on the original path. `Environment.react` steps voxels
+  the same way.
+- **Mechanics:** Brownian motion and cell-cell, cell-anchored and cell-wall
+  contacts run in one parallel pass.
+- **Diffusion:** FTCS sub-steps run in place in a compiled kernel
+  (bit-identical to the numpy version).
+
+Rough speedups per step on 8 cores (`examples/bench_simulation.py`):
+
+| Colony | Before | After |
+| --- | --- | --- |
+| ~500 cells, ODE, chemical Field | 150 ms | 14 ms |
+| ~500 cells, SSA, walls + anchored cells | 92 ms | 12 ms |
+| 3000 cells, SSA, chemical Field | 620 ms | 50 ms |
+| 3000 cells, ODE, chemical Field | 1480 ms | 65 ms |
+
+Most of the gain comes from batching and compiling; extra threads add more
+on top for large colonies (the 3000-cell ODE case is ~90 ms on one thread).
+
+**Reproducibility.** Every cell owns its random stream. A `Colony` derives
+each founder's stream from its `rng`'s seed and the cell's id, and each
+daughter's from its parent's at division. Every compiled kernel seeds its
+per-cell generator from one draw on that stream. Results therefore never
+depend on the thread count, and a cell's stream doesn't change when
+unrelated cells are added. (They do differ from what the same seeds gave
+before this change.)
+
+**Controls.**
+
+- `Simulation(..., n_threads=4)` caps the threads used while that
+  simulation runs (default: numba's setting, i.e. every core).
+- `Colony(..., backend="python")` selects the original pure-Python,
+  one-cell-at-a-time implementation, kept as a reference. Networks with a
+  `custom` rate law always step on that path, since an arbitrary Python
+  function can't be compiled; the rest of the colony is still batched.
+- `examples/bench_simulation.py` times each phase of `Colony.step`, so a
+  change can be measured phase by phase.
 
 ### `Simulation.visualize_colony`
 

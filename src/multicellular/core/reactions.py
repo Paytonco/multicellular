@@ -1233,8 +1233,16 @@ class ReactionNetwork:
         """
         Return a deep copy of the reaction network.
         Useful for passing independent copies to daughter cells.
+
+        Every `Reaction` is cloned, so the copy's rate parameters can be
+        edited independently. Everything derived from the network's
+        structure (species, stoichiometry matrices, dependency graph,
+        compiled-kernel structure), which is identical for the copy and
+        never modified after construction, is shared rather than rebuilt:
+        a colony clones two networks at every division.
         """
-        return ReactionNetwork(
-            name=self.name,
-            reactions={k: v.clone() for k, v in self.reactions.items()},
-        )
+        new = ReactionNetwork.__new__(ReactionNetwork)
+        new.__dict__.update(self.__dict__)
+        new.reactions = {k: v.clone() for k, v in self.reactions.items()}
+        new.last_exported = {s: 0.0 for s in self.exported_species}
+        return new

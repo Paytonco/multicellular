@@ -20,6 +20,7 @@ def _run_one(
     show_progress,
     ssa_method="direct",
     tau_epsilon=DEFAULT_TAU_EPSILON,
+    n_threads=None,
 ):
     colony = build_colony(replicate_id)
     sim = Simulation(
@@ -30,6 +31,7 @@ def _run_one(
         ode_method=ode_method,
         ssa_method=ssa_method,
         tau_epsilon=tau_epsilon,
+        n_threads=n_threads,
     )
     df = sim.run(show_progress=show_progress)
     df = df.copy()
@@ -48,6 +50,7 @@ def run_replicates(
     show_progress: bool = False,
     ssa_method: str = "direct",
     tau_epsilon: float = DEFAULT_TAU_EPSILON,
+    n_threads: int = None,
 ) -> pd.DataFrame:
     """
     Run independent Simulations in parallel worker processes.
@@ -79,12 +82,20 @@ def run_replicates(
             ("direct", "next_reaction", or "tau_leaping").
         tau_epsilon: Forwarded to each replicate's `Simulation`;
             tau-leaping error control (default 0.03).
+        n_threads: Threads each replicate's compiled kernels may use
+            (forwarded to `Simulation`). Defaults to 1 whenever replicates
+            themselves run in parallel (`n_jobs != 1`), so the two levels of
+            parallelism don't oversubscribe the cores, and to numba's
+            default (all cores) when they run one at a time. Results don't
+            depend on it.
 
     Returns:
         A single DataFrame, the concatenation of every replicate's
         `Simulation.run()` output, with an added `replicate_id` column
         identifying which run each row came from.
     """
+    if n_threads is None and n_jobs != 1:
+        n_threads = 1
     results = Parallel(n_jobs=n_jobs)(
         delayed(_run_one)(
             build_colony,
@@ -96,6 +107,7 @@ def run_replicates(
             show_progress,
             ssa_method,
             tau_epsilon,
+            n_threads,
         )
         for i in range(n_replicates)
     )

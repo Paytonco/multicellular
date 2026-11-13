@@ -348,6 +348,11 @@ class Cell:
         else:
             f = 0.5
 
+        # Each daughter gets its own child stream, so cells never share a
+        # Generator: their draws stay independent of how many other cells
+        # exist or the order work on them is scheduled in (see Colony).
+        rng1, rng2 = self._spawn_streams(2)
+
         S_d = self._division_target
         if self.shape == "sphere":
             # Daughter radii from volumes f*V_d and (1-f)*V_d.
@@ -371,7 +376,6 @@ class Cell:
             orientation=self.orientation,
             shape=self.shape,
             species=self.species,
-            rng=self.rng,
             growth_rate=self.growth_rate,
             growth_rate_law=self.growth_rate_law,
             delta_bar=self.delta_bar,
@@ -387,6 +391,7 @@ class Cell:
             position=pos1,
             length=length1,
             radius=radius1,
+            rng=rng1,
             network=self.network.clone() if self.network else None,
             **daughter_kw,
         )
@@ -394,6 +399,7 @@ class Cell:
             position=pos2,
             length=length2,
             radius=radius2,
+            rng=rng2,
             network=self.network.clone() if self.network else None,
             **daughter_kw,
         )
@@ -423,6 +429,22 @@ class Cell:
         daughter2.extracellular = dict(self.extracellular)
 
         return daughter1, daughter2
+
+    def _spawn_streams(self, n):
+        """
+        `n` independent Generators seeded from 128 bits drawn from this
+        cell's own stream (same bit generator type).
+
+        Used instead of `Generator.spawn`, whose spawn key grows by one
+        entry per generation: seeding a deep lineage's streams that way
+        gets steadily slower, while this costs the same at any depth.
+        """
+        entropy = self.rng.integers(0, 2**64, size=(n, 2), dtype=np.uint64)
+        bit_generator = type(self.rng.bit_generator)
+        return [
+            np.random.Generator(bit_generator(np.random.SeedSequence(row.tolist())))
+            for row in entropy
+        ]
 
     def apply_force(self, force_vector, dt):
         """Move the cell based on external forces. No-op if dead or anchored."""

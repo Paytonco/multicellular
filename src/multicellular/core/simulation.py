@@ -1,11 +1,28 @@
 # core/simulation.py
 
+import contextlib
+
+import numba
 import pandas as pd
 from tqdm import tqdm
 
 from .reactions import DEFAULT_TAU_EPSILON
 
 _DEFAULT_FILENAME = "simulation.gif"
+
+
+@contextlib.contextmanager
+def _numba_threads(n_threads):
+    """Use `n_threads` numba threads inside the block (None: leave as is), then restore."""
+    if n_threads is None:
+        yield
+        return
+    previous = numba.get_num_threads()
+    numba.set_num_threads(max(1, min(int(n_threads), numba.config.NUMBA_NUM_THREADS)))
+    try:
+        yield
+    finally:
+        numba.set_num_threads(previous)
 
 
 class Simulation:
@@ -24,6 +41,7 @@ class Simulation:
         ode_method="RK45",
         ssa_method="direct",
         tau_epsilon=DEFAULT_TAU_EPSILON,
+        n_threads=None,
     ):
         """
         Args:
@@ -42,6 +60,11 @@ class Simulation:
                 Case-insensitive.
             tau_epsilon: tau-leaping error control (default 0.03): the
                 largest relative propensity change allowed per leap.
+            n_threads: number of threads the colony's compiled kernels
+                (cell stepping, contact mechanics, diffusion) may use while
+                this Simulation runs. None (default) leaves numba's current
+                setting (all cores unless changed). Results don't depend on
+                it: every cell draws from its own random stream.
         """
         self.colony = colony
         self.dt = dt
@@ -50,6 +73,7 @@ class Simulation:
         self.ode_method = ode_method
         self.ssa_method = ssa_method
         self.tau_epsilon = tau_epsilon
+        self.n_threads = n_threads
         self.time = 0.0
         self.history = []
         self.env_history = []
@@ -133,21 +157,22 @@ class Simulation:
 
         start_step = round(self.time / self.dt)
         n_steps = round(self.t_max / self.dt)
-        for step_index in tqdm(
-            range(start_step + 1, n_steps + 1), disable=not show_progress
-        ):
-            # Keep the colony's clock (which stamps lineage events) exactly
-            # on the recorded times, rather than accumulating `+= dt` drift.
-            self.colony.time = self.time
-            self.colony.step(
-                self.dt,
-                self.simulation_method,
-                self.ode_method,
-                ssa_method=self.ssa_method,
-                tau_epsilon=self.tau_epsilon,
-            )
-            self.time = step_index * self.dt
-            self.record()
+        with _numba_threads(self.n_threads):
+            for step_index in tqdm(
+                range(start_step + 1, n_steps + 1), disable=not show_progress
+            ):
+                # Keep the colony's clock (which stamps lineage events) exactly
+                # on the recorded times, rather than accumulating `+= dt` drift.
+                self.colony.time = self.time
+                self.colony.step(
+                    self.dt,
+                    self.simulation_method,
+                    self.ode_method,
+                    ssa_method=self.ssa_method,
+                    tau_epsilon=self.tau_epsilon,
+                )
+                self.time = step_index * self.dt
+                self.record()
 
         return self.to_dataframe()
 
