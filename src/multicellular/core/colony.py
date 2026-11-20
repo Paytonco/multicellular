@@ -36,6 +36,10 @@ _CELL_STREAM_SALT = 0x6D756C7469
 
 BACKENDS = ("numba", "python")
 
+# Ceiling on automatic contact sub-steps per `step`, so one degenerate cell
+# (a rod of near-zero length has near-zero drag) can't stall a run.
+MAX_MECHANICS_SUBSTEPS = 256
+
 
 def _cell_stream(rng, cell_id):
     """
@@ -107,6 +111,7 @@ class Colony:
         survival_conditions=None,
         brownian_motion=True,
         backend="numba",
+        mechanics_substeps="auto",
     ):
         """
         Args:
@@ -117,9 +122,9 @@ class Colony:
                 Defaults to `10 * k` (walls much stiffer than cells, so a
                 wall behaves close to a rigid boundary rather than yielding
                 like another cell would). Must be tuned alongside `dt`
-                like `k` (see `_apply_wall_forces`/README): explicit-Euler
-                contact dynamics are only stable while
-                `dt < 2 * drag * length / k_wall`.
+                like `k` (see `_apply_wall_forces`/README); see
+                `mechanics_substeps` for how `step` keeps the explicit-Euler
+                contact update stable at stiff `k_wall`.
             drag: isotropic drag constant for contact dynamics.
                   Rods:    ζ_t = drag * length,  ζ_r = (drag / 12) * length³.
                   Spheres: ζ_t = 3 * drag * radius (no contact rotation:
@@ -145,6 +150,12 @@ class Colony:
                 at-a-time Python code, kept as a reference implementation.
                 Networks with a `custom` rate law always take the Python
                 path. A plain attribute, so it can be switched between steps.
+            mechanics_substeps: how many explicit-Euler contact updates
+                `step` splits each `dt` into. "auto" (default) picks the
+                fewest that keep the stiffest contact stable, recomputed
+                every step (see `contact_substeps`); an int fixes the count
+                (1 is a single update per step). Brownian kicks are still
+                applied once per `dt`. A plain attribute.
 
         Every founder cell (a cell present at construction, or appended to
         `cells` by hand) is given its own random stream, derived from its
@@ -165,6 +176,15 @@ class Colony:
             survival_conditions
         )
         self.brownian_motion = brownian_motion
+        if mechanics_substeps != "auto" and (
+            not isinstance(mechanics_substeps, (int, np.integer))
+            or mechanics_substeps < 1
+        ):
+            raise ValueError(
+                "mechanics_substeps must be 'auto' or a positive int, "
+                f"got {mechanics_substeps!r}."
+            )
+        self.mechanics_substeps = mechanics_substeps
         existing_ids = [cell.id for cell in self.cells if cell.id is not None]
         duplicates = sorted(i for i, n in Counter(existing_ids).items() if n > 1)
         if duplicates:
@@ -307,7 +327,9 @@ class Colony:
                 mobile = [cell for cell in alive if not cell.anchored]
                 noise = self._draw_brownian_noise(mobile)
                 self._apply_brownian_motion(dt, mobile, noise)
-            self._apply_contact_forces(dt, alive)
+            n_sub = self.contact_substeps(dt, alive)
+            for _ in range(n_sub):
+                self._apply_contact_forces(dt / n_sub, alive)
         self.handle_divisions(t_end)
         self.time = t_end
         self.lineage.time = t_end
@@ -488,6 +510,51 @@ class Colony:
             field = self.environment.get_field(species)
             field.values = field.values + delta
 
+    def contact_substeps(self, dt, alive=None):
+        """
+        Number of contact updates `step` splits `dt` into.
+
+        The contact update is explicit Euler on an overdamped spring, stable
+        only while `dt < 2 * zeta / k_eff` for every mode of every cell. The
+        slowest-relaxing drag to guard is the smallest of:
+
+          rods, translation: zeta_t = drag * L
+          rods, rotation:    zeta_r / (L/2)^2 = drag * L / 3, since a
+                             contact at an end of the axis acts on a lever
+                             of L/2 -- this is the binding one for rods
+          spheres:           zeta_t = 3 * drag * radius
+
+        and the stiffest contact is `k_wall` when the environment has walls,
+        else `k`. Allowing for two such contacts at once (a rod lying flat
+        on a wall touches it at both ends) gives `dt_max = zeta_min / k_max`.
+        Short newborn rods against a stiff wall set the limit, so this is
+        recomputed every step from the living mobile cells.
+        """
+        if self.mechanics_substeps != "auto":
+            return int(self.mechanics_substeps)
+        if alive is None:
+            alive = self.living_cells
+        zeta_min = math.inf
+        for cell in alive:
+            if cell.anchored:
+                continue
+            if cell.shape == "sphere":
+                zeta = 3.0 * self.drag * cell.radius
+            else:
+                zeta = self.drag * cell.length / 3.0
+            zeta_min = min(zeta_min, zeta)
+        if not math.isfinite(zeta_min):
+            return 1
+        env = self.environment
+        has_walls = len(env.wall_faces) > 0 or len(env.wall_corners) > 0
+        k_max = max(self.k, self.k_wall) if has_walls else self.k
+        if k_max <= 0.0:
+            return 1
+        if zeta_min <= 0.0:
+            return MAX_MECHANICS_SUBSTEPS
+        n = math.ceil(dt * k_max / zeta_min - 1e-9)
+        return int(min(max(n, 1), MAX_MECHANICS_SUBSTEPS))
+
     def _draw_brownian_noise(self, alive):
         """
         Draw the 3 standard-normal samples (parallel, perpendicular,
@@ -650,9 +717,11 @@ class Colony:
 
         px, py = pos[:, 0].copy(), pos[:, 1].copy()
         ox, oy = ori[:, 0].copy(), ori[:, 1].copy()
-        self._contact_step_arrays(
-            dt, anchored, px, py, ox, oy, lengths, radii, is_sphere
-        )
+        n_sub = self.contact_substeps(dt, alive)
+        for _ in range(n_sub):
+            self._contact_step_arrays(
+                dt / n_sub, anchored, px, py, ox, oy, lengths, radii, is_sphere
+            )
         for idx, cell in enumerate(mobile):
             position, orientation = cell.position, cell.orientation
             position[0] = px[idx]

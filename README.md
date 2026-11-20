@@ -1000,21 +1000,30 @@ colony.step(dt=0.1)
 `Colony` accepts three mechanical parameters:
 
 - **`k`** (default `10.0`): Hookean contact stiffness (force / length). Controls
-  how hard cells push against one another when they overlap. Must be tuned
-  alongside `dt`; the explicit integrator is stable when `dt < 2 * ζ_t / k`.
-  That is `dt < 2 * drag * length / k` for rods and
-  `dt < 6 * drag * radius / k` for spheres.
+  how hard cells push against one another when they overlap.
 - **`k_wall`** (default: `10 * k`): Hookean stiffness for cell-wall contacts
   (see [Wall forces](#wall-forces) below). Walls default to much stiffer than
   cells, so they behave close to a rigid boundary rather than yielding like
-  another cell would; pass an explicit value to override. Like `k`, it must
-  be tuned alongside `dt` — the explicit integrator is stable when
-  `dt < 2 * ζ_t / k_wall`, so a much stiffer `k_wall` needs a
-  correspondingly smaller `dt`.
+  another cell would; pass an explicit value to override.
 - **`drag`** (default `1.0`): isotropic drag constant for contact dynamics
   (force · time / length²). Sets the translational drag `ζ_t = drag * length`
   and rotational drag `ζ_r = (drag / 12) * length³` for rods, and
   `ζ_t = 3 * drag * radius` for spheres (which contact forces never rotate).
+- **`mechanics_substeps`** (default `"auto"`): contact forces are integrated
+  with explicit Euler, which is only stable while each update is short next
+  to the stiffest contact's relaxation time. With `"auto"`, `step` splits
+  `dt` into as many contact updates as that requires, recomputed every step,
+  so `dt` can be chosen for the chemistry and Brownian motion alone. The
+  bound is `dt_sub ≤ ζ_min / k_max`, where `k_max` is `k_wall` if the
+  environment has walls (else `k`), and `ζ_min` is the smallest of
+  `drag * length / 3` over rods and `3 * drag * radius` over spheres. For rods,
+  that is the rotational drag `ζ_r / (length/2)²` felt by a contact at one end
+  of the axis, which is tighter than translation. The bound allows for two
+  such contacts at once, e.g. a rod lying flat on a wall. Short newborn rods
+  against a stiff wall set the limit: at `k_wall = 45` and a 1 μm rod it is
+  about 0.0074 s. Above it, cells bounce back and forth by up to a cell width
+  every step. Pass an int to fix the count instead (`1` gives one update per
+  `dt`). Brownian kicks are still applied once per `dt`.
 
 It also accepts **`brownian_motion`** (default `True`): whether `step`
 applies an overdamped-Langevin Brownian kick to living cells each step (see

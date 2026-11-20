@@ -1391,3 +1391,63 @@ def test_adding_anchored_cell_leaves_mobile_brownian_stream_unchanged():
     (p0, o0), (p1, o1) = run(False), run(True)
     assert p1 == pytest.approx(p0, abs=0)
     assert o1 == pytest.approx(o0, abs=0)
+
+
+# ---------------------------------------------------------------------------
+# Contact sub-stepping
+# ---------------------------------------------------------------------------
+
+
+def test_contact_substeps_is_one_when_dt_is_already_stable():
+    # A 2 um rod: zeta_min = drag * L / 3 = 2/3, so dt_max = (2/3) / k = 0.067.
+    colony = Colony([_make_cell([50.0, 50.0])], _open_env(), k=10.0)
+    assert colony.contact_substeps(0.05) == 1
+
+
+def test_contact_substeps_ignores_k_wall_without_walls():
+    colony = Colony([_make_cell([50.0, 50.0])], _open_env(), k=10.0, k_wall=1000.0)
+    assert colony.contact_substeps(0.05) == 1
+
+
+def test_contact_substeps_splits_dt_for_a_stiff_wall():
+    # dt_max = (2/3) / 45 = 0.0148, so dt = 0.06 needs ceil(4.05) = 5.
+    colony = Colony([_make_cell([10.0, 10.0])], _wall_block_env(), k=10.0, k_wall=45.0)
+    assert colony.contact_substeps(0.06) == 5
+
+
+def test_contact_substeps_can_be_fixed():
+    colony = Colony(
+        [_make_cell([10.0, 10.0])], _wall_block_env(), k=10.0, mechanics_substeps=3
+    )
+    assert colony.contact_substeps(0.06) == 3
+
+
+@pytest.mark.parametrize("bad", [0, -1, 1.5, "fast", None])
+def test_mechanics_substeps_rejects_bad_values(bad):
+    with pytest.raises(ValueError, match="mechanics_substeps"):
+        Colony([], _open_env(), mechanics_substeps=bad)
+
+
+@pytest.mark.parametrize("backend", ["numba", "python"])
+def test_auto_substeps_keep_a_rod_from_bouncing_off_a_stiff_wall(backend):
+    # Rod's east end pokes 0.5 um into the block's west face (x=40); it
+    # should come to rest just touching it, center at x=38.5. At dt=0.06
+    # against k_wall=100, a single Euler update per step overshoots to 37.5,
+    # a full micron clear of the wall.
+    for substeps, expected in ((1, 37.5), ("auto", 38.5)):
+        cell = _make_cell([39.0, 50.0])
+        colony = Colony(
+            [cell],
+            _wall_block_env(),
+            k=10.0,
+            brownian_motion=False,
+            mechanics_substeps=substeps,
+            backend=backend,
+        )
+        positions = []
+        for _ in range(20):
+            colony.step(0.06)
+            positions.append(cell.position[0])
+        assert positions[-1] == pytest.approx(expected, abs=1e-3)
+        if substeps == "auto":
+            assert min(positions) >= 38.5 - 1e-3
