@@ -6,7 +6,8 @@ import numpy as np
 import pandas as pd
 from scipy import sparse
 from scipy.integrate import solve_ivp
-from tqdm import tqdm
+
+from .progress import progress
 
 # Every numerical method accepted by scipy.integrate.solve_ivp ("ODE" mode).
 ODE_METHODS = ("RK45", "RK23", "DOP853", "Radau", "BDF", "LSODA")
@@ -572,7 +573,7 @@ class ReactionNetwork:
                 from `seed`, so stochastic runs are reproducible.
             seed: seed for the generator created when `rng` is None.
             compartment_volumes: as in `simulate_step`.
-            show_progress: show a tqdm progress bar.
+            show_progress: show a progress bar.
             ssa_method: "direct", "next_reaction", or "tau_leaping", used
                 when method is "SSA", as in `simulate_step`.
             tau_epsilon: tau-leaping error control, as in `simulate_step`.
@@ -604,7 +605,7 @@ class ReactionNetwork:
 
         records = [record(0.0)]
         n_steps = round(t_max / dt)
-        for k in tqdm(range(1, n_steps + 1), disable=not show_progress):
+        for k in progress(range(1, n_steps + 1), disable=not show_progress):
             state = self.simulate_step(
                 state,
                 dt,

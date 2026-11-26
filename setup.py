@@ -25,5 +25,10 @@ setup(
         "imageio",
         "imageio-ffmpeg",
     ],
+    extras_require={
+        # Single-line widget progress bars in Jupyter; without it, progress
+        # bars are hidden in notebooks.
+        "notebook": ["ipywidgets"],
+    },
     python_requires=">=3.11",
 )

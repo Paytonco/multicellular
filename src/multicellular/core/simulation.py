@@ -4,8 +4,8 @@ import contextlib
 
 import numba
 import pandas as pd
-from tqdm import tqdm
 
+from .progress import progress
 from .reactions import DEFAULT_TAU_EPSILON
 
 _DEFAULT_FILENAME = "simulation.gif"
@@ -158,7 +158,7 @@ class Simulation:
         start_step = round(self.time / self.dt)
         n_steps = round(self.t_max / self.dt)
         with _numba_threads(self.n_threads):
-            for step_index in tqdm(
+            for step_index in progress(
                 range(start_step + 1, n_steps + 1), disable=not show_progress
             ):
                 # Keep the colony's clock (which stamps lineage events) exactly

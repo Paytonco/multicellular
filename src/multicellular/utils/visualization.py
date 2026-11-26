@@ -10,7 +10,8 @@ from matplotlib.collections import LineCollection, PolyCollection
 from matplotlib.image import AxesImage
 from matplotlib.patches import Rectangle
 from PIL import Image
-from tqdm import tqdm
+
+from multicellular.core.progress import progress
 
 # Save filenames ending in one of these are encoded as video (via imageio,
 # which bundles its own ffmpeg through imageio-ffmpeg, so no system ffmpeg is
@@ -421,7 +422,7 @@ def _render_frames(
 
     try:
         for index, t in enumerate(
-            tqdm(times, disable=not show_progress, desc="Rendering frames")
+            progress(times, disable=not show_progress, desc="Rendering frames")
         ):
             if field_image is not None:
                 field_image.set_data(field_snapshots[t])
@@ -475,7 +476,7 @@ def _render_field_frames(
     background, draw_order = _prepare_blitting(fig, ax, dynamic)
 
     try:
-        for t in tqdm(times, disable=not show_progress, desc="Rendering frames"):
+        for t in progress(times, disable=not show_progress, desc="Rendering frames"):
             image.set_data(snapshots[t])
             env = env_by_time.get(t, first_env)
             left_title.set_text(env.name)
